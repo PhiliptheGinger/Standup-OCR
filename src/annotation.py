@@ -129,10 +129,10 @@ class AnnotationApp:
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
-    def _on_confirm(self, event: tk.Event | None) -> None:
+    def _on_confirm(self, event: Optional[tk.Event]) -> None:
         self.confirm()
 
-    def _on_exit(self, event: tk.Event | None = None) -> None:
+    def _on_exit(self, event: Optional[tk.Event] = None) -> None:
         if messagebox.askokcancel("Quit", "Abort annotation and close the window?"):
             self.master.destroy()
 
