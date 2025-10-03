@@ -196,8 +196,17 @@ class AnnotationApp:
         suggestion = self._compose_text_from_tokens(tokens)
         if suggestion:
             self._set_transcription(suggestion)
+            self.status_var.set("Pre-filled transcription using OCR result.")
         else:
-            self._set_transcription(self._suggest_label(path))
+            self._set_transcription("")
+            filename_hint = self._suggest_label(path)
+            if filename_hint:
+                self.status_var.set(
+                    "OCR produced no suggestion; using filename hint: "
+                    f"{filename_hint}"
+                )
+            else:
+                self.status_var.set("OCR produced no suggestion; please transcribe manually.")
 
         self._display_image(image, tokens)
         image.close()
