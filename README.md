@@ -63,6 +63,8 @@ Key behaviour:
   extensions.
 * Confirming an entry copies the image into `--train-dir` with the confirmed
   label embedded in the file name, ready for `train_model`.
+* Images are automatically rotated based on their embedded EXIF orientation so
+  the preview and saved snippet share the correct layout.
 * Use **Skip** to omit an image or **Unsure** to log it without saving a copy.
   The optional `--output-log` CSV records every action.
 * The preview honours EXIF orientation so sideways scans load upright, and the
