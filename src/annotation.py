@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -145,7 +146,11 @@ class AnnotationApp:
             return
 
         item = self.items[self.index]
-        saved_path = self._save_annotation(item.path, label)
+        try:
+            saved_path = self._save_annotation(item.path, label)
+        except OSError as exc:
+            messagebox.showerror("Save failed", f"Could not save annotation: {exc}")
+            return
         self._append_log(item.path, label, "confirmed", saved_path)
         self.status_var.set(f"Saved to {saved_path.name}")
         self._advance()
@@ -431,7 +436,10 @@ class AnnotationApp:
 
     def _slugify(self, value: str) -> str:
         cleaned = [c if c.isalnum() else "-" for c in value.strip().lower()]
-        slug = "".join(cleaned).strip("-")
+        slug = "".join(cleaned)
+        slug = re.sub("-+", "-", slug).strip("-")
+        if len(slug) > 60:
+            slug = slug[:60].rstrip("-")
         return slug or "sample"
 
 
