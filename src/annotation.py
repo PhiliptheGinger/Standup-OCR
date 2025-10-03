@@ -114,6 +114,11 @@ class AnnotationApp:
         buttons = tk.Frame(container)
         buttons.pack(pady=(0, 8))
 
+        back_btn = tk.Button(buttons, text="Back", command=self.back)
+        back_btn.pack(side="left", padx=4)
+        self.back_button = back_btn
+        self.back_button.config(state=tk.DISABLED)
+
         confirm_btn = tk.Button(buttons, text="Confirm", command=self.confirm, default=tk.ACTIVE)
         confirm_btn.pack(side="left", padx=4)
 
@@ -127,6 +132,7 @@ class AnnotationApp:
         self.status_label.pack(anchor="w")
 
         self.master.bind("<Escape>", self._on_exit)
+        self.master.bind("<Alt-Left>", self._on_back)
         self.master.protocol("WM_DELETE_WINDOW", self._on_exit)
 
     # ------------------------------------------------------------------
@@ -134,6 +140,9 @@ class AnnotationApp:
     # ------------------------------------------------------------------
     def _on_confirm(self, event: Optional[tk.Event]) -> None:
         self.confirm()
+
+    def _on_back(self, event: Optional[tk.Event]) -> None:
+        self.back()
 
     def _on_exit(self, event: Optional[tk.Event] = None) -> None:
         if messagebox.askokcancel("Quit", "Abort annotation and close the window?"):
@@ -167,6 +176,15 @@ class AnnotationApp:
         self.status_var.set("Marked as unsure")
         self._advance()
 
+    def back(self) -> None:
+        if self.index == 0:
+            if hasattr(self, "back_button"):
+                self.back_button.config(state=tk.DISABLED)
+            self.status_var.set("Already at the first item.")
+            return
+        self.index -= 1
+        self._show_current(revisit=True)
+
     # ------------------------------------------------------------------
     # Core logic
     # ------------------------------------------------------------------
@@ -178,12 +196,23 @@ class AnnotationApp:
             return
         self._show_current()
 
-    def _show_current(self) -> None:
+    def _show_current(self, *, revisit: bool = False) -> None:
         item = self.items[self.index]
         self.filename_var.set(f"{item.path.name} ({self.index + 1}/{len(self.items)})")
         self._user_modified_transcription = False
+        if hasattr(self, "back_button"):
+            state = tk.NORMAL if self.index > 0 else tk.DISABLED
+            self.back_button.config(state=state)
         self._display_item(item.path)
         self.entry_widget.focus_set()
+        if revisit:
+            reminder = "Returned to previous item; previous response has not been re-recorded."
+            previous_status = ""
+            if hasattr(self.status_var, "get"):
+                previous_status = self.status_var.get() or ""
+            if reminder not in previous_status:
+                message = f"{previous_status} {reminder}".strip()
+                self.status_var.set(message)
 
     def _display_item(self, path: Path) -> None:
         try:
