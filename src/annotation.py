@@ -9,7 +9,13 @@ from typing import Iterable, List, Optional
 import tkinter as tk
 from tkinter import messagebox
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageOps, ImageTk
+
+
+def _prepare_image(image: Image.Image) -> Image.Image:
+    """Return an image with EXIF orientation applied."""
+
+    return ImageOps.exif_transpose(image)
 
 
 @dataclass
@@ -151,6 +157,7 @@ class AnnotationApp:
     def _display_image(self, path: Path) -> None:
         try:
             with Image.open(path) as image:
+                image = _prepare_image(image)
                 image = image.convert("RGBA")
                 image.thumbnail(self.MAX_SIZE, Image.LANCZOS)
                 photo = ImageTk.PhotoImage(image)
@@ -186,6 +193,7 @@ class AnnotationApp:
             counter += 1
 
         with Image.open(path) as image:
+            image = _prepare_image(image)
             if image.mode not in {"RGB", "L"}:
                 image = image.convert("RGB")
             image.save(candidate)
