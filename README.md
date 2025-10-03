@@ -67,6 +67,9 @@ Key behaviour:
   the preview and saved snippet share the correct layout.
 * Use **Skip** to omit an image or **Unsure** to log it without saving a copy.
   The optional `--output-log` CSV records every action.
+* The preview honours EXIF orientation so sideways scans load upright, and the
+  OCR suggestion is rendered as editable overlays directly above each detected
+  word for quick correction before saving.
 
 ### Training a custom model
 

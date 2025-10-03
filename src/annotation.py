@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import csv
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import tkinter as tk
 from tkinter import messagebox
@@ -23,6 +24,24 @@ class AnnotationItem:
     """Represent a single image queued for annotation."""
 
     path: Path
+
+
+@dataclass
+class OcrToken:
+    """Representation of an OCR token used for overlay editing."""
+
+    text: str
+    bbox: Tuple[int, int, int, int]
+    order_key: TokenOrder
+    line_key: LineKey
+
+
+def prepare_image(path: Path) -> Image.Image:
+    """Open ``path`` and apply EXIF-based orientation for consistent display."""
+
+    with Image.open(path) as src:
+        prepared = ImageOps.exif_transpose(src)
+        return prepared.copy()
 
 
 class AnnotationApp:
@@ -50,10 +69,14 @@ class AnnotationApp:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.current_photo: Optional[ImageTk.PhotoImage] = None
+        self.canvas_image_id: Optional[int] = None
+        self.overlay_entries: list[tk.Entry] = []
+        self.current_tokens: list[OcrToken] = []
 
         self.filename_var = tk.StringVar()
-        self.entry_var = tk.StringVar()
         self.status_var = tk.StringVar()
+        self._user_modified_transcription = False
+        self._setting_transcription = False
 
         self._build_ui()
         self._show_current()
@@ -71,17 +94,19 @@ class AnnotationApp:
         header = tk.Label(container, textvariable=self.filename_var, font=("TkDefaultFont", 14, "bold"))
         header.pack(anchor="w")
 
-        self.image_label = tk.Label(container, bd=1, relief="sunken")
-        self.image_label.pack(fill="both", expand=True, pady=12)
+        self.canvas = tk.Canvas(container, bd=1, relief="sunken", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, pady=12)
 
         entry_frame = tk.Frame(container)
         entry_frame.pack(fill="x", pady=(0, 8))
 
         tk.Label(entry_frame, text="Transcription:").pack(side="left")
-        entry = tk.Entry(entry_frame, textvariable=self.entry_var, width=50)
-        entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
-        entry.bind("<Return>", self._on_confirm)
-        self.entry_widget = entry
+        text_widget = tk.Text(entry_frame, height=4, wrap="word")
+        text_widget.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        text_widget.bind("<Control-Return>", self._on_confirm)
+        text_widget.bind("<Command-Return>", self._on_confirm)
+        text_widget.bind("<Key>", self._on_transcription_modified)
+        self.entry_widget = text_widget
 
         buttons = tk.Frame(container)
         buttons.pack(pady=(0, 8))
@@ -112,7 +137,7 @@ class AnnotationApp:
             self.master.destroy()
 
     def confirm(self) -> None:
-        label = self.entry_var.get().strip()
+        label = self._get_transcription_text()
         if not label:
             messagebox.showinfo("Missing text", "Enter a transcription or choose Skip/Unsure.")
             return
@@ -131,7 +156,7 @@ class AnnotationApp:
 
     def unsure(self) -> None:
         item = self.items[self.index]
-        self._append_log(item.path, self.entry_var.get().strip(), "unsure", None)
+        self._append_log(item.path, self._get_transcription_text(), "unsure", None)
         self.status_var.set("Marked as unsure")
         self._advance()
 
@@ -149,12 +174,11 @@ class AnnotationApp:
     def _show_current(self) -> None:
         item = self.items[self.index]
         self.filename_var.set(f"{item.path.name} ({self.index + 1}/{len(self.items)})")
-        self.entry_var.set(self._suggest_label(item.path))
-        self._display_image(item.path)
-        self.entry_widget.selection_range(0, tk.END)
+        self._user_modified_transcription = False
+        self._display_item(item.path)
         self.entry_widget.focus_set()
 
-    def _display_image(self, path: Path) -> None:
+    def _display_item(self, path: Path) -> None:
         try:
             with Image.open(path) as image:
                 image = _prepare_image(image)
@@ -166,9 +190,187 @@ class AnnotationApp:
             self.skip()
             return
 
+        tokens = self._extract_tokens(image)
+        suggestion = self._compose_text_from_tokens(tokens)
+        if suggestion:
+            self._set_transcription(suggestion)
+        else:
+            self._set_transcription(self._suggest_label(path))
+
+        self._display_image(image, tokens)
+        image.close()
+
+    def _display_image(self, image: Image.Image, tokens: Sequence[OcrToken]) -> None:
+        base_width, base_height = image.size
+        display_image = image.copy().convert("RGBA")
+        display_image.thumbnail(self.MAX_SIZE, Image.LANCZOS)
+        scale_x = display_image.width / base_width if base_width else 1.0
+        scale_y = display_image.height / base_height if base_height else 1.0
+
+        photo = ImageTk.PhotoImage(display_image)
         self.current_photo = photo
-        self.image_label.configure(image=photo)
-        self.image_label.image = photo
+
+        self._clear_overlay_entries()
+        self.canvas.delete("all")
+        self.current_tokens = list(tokens)
+        self.canvas_image_id = self.canvas.create_image(0, 0, image=photo, anchor="nw")
+        self.canvas.config(scrollregion=(0, 0, display_image.width, display_image.height))
+
+        for token in tokens:
+            if not token.text:
+                continue
+            left, top, right, bottom = token.bbox
+            disp_left = left * scale_x
+            disp_top = top * scale_y
+            disp_right = right * scale_x
+            disp_bottom = bottom * scale_y
+
+            rect = self.canvas.create_rectangle(
+                disp_left,
+                disp_top,
+                disp_right,
+                disp_bottom,
+                outline="#2F80ED",
+                width=1,
+                tags="overlay",
+            )
+            self.canvas.tag_raise(rect)
+
+            entry_width = max(4, int((disp_right - disp_left) / 8))
+            entry = tk.Entry(self.canvas, width=entry_width)
+            entry.insert(0, token.text)
+            entry.bind("<KeyRelease>", self._on_overlay_modified)
+
+            desired_top = disp_top - 24
+            if desired_top < 0:
+                desired_top = disp_top
+
+            window_id = self.canvas.create_window(
+                disp_left,
+                desired_top,
+                anchor="nw",
+                window=entry,
+                tags="overlay",
+            )
+            self.canvas.tag_raise(window_id)
+            self.overlay_entries.append(entry)
+
+        if tokens:
+            self._update_combined_transcription()
+
+    def _extract_tokens(self, image: Image.Image) -> List[OcrToken]:
+        ocr_image: Optional[Image.Image] = None
+        try:
+            ocr_image = image.copy()
+            if ocr_image.mode not in {"RGB", "L"}:
+                converted = ocr_image.convert("RGB")
+                ocr_image.close()
+                ocr_image = converted
+            data = pytesseract.image_to_data(
+                ocr_image,
+                config="--psm 6",
+                output_type=Output.DICT,
+            )
+        except pytesseract.TesseractNotFoundError as exc:
+            logging.warning("Tesseract not found: %s", exc)
+            return []
+        except pytesseract.TesseractError as exc:
+            logging.warning("Tesseract error: %s", exc)
+            return []
+        finally:
+            if ocr_image is not None:
+                ocr_image.close()
+
+        if not data or "text" not in data:
+            return []
+
+        tokens: List[OcrToken] = []
+        length = len(data.get("text", []))
+        for index in range(length):
+            text = (data["text"][index] or "").strip()
+            if not text:
+                continue
+            try:
+                left = int(data.get("left", [0])[index])
+                top = int(data.get("top", [0])[index])
+                width = int(data.get("width", [0])[index])
+                height = int(data.get("height", [0])[index])
+                page = int(data.get("page_num", [1])[index])
+                block = int(data.get("block_num", [0])[index])
+                paragraph = int(data.get("par_num", [0])[index])
+                line = int(data.get("line_num", [0])[index])
+                word = int(data.get("word_num", [index + 1])[index]) or (index + 1)
+            except (TypeError, ValueError):
+                continue
+
+            bbox = (left, top, left + width, top + height)
+            order_key: TokenOrder = (page, block, paragraph, line, word)
+            line_key: LineKey = (page, block, line)
+            tokens.append(OcrToken(text=text, bbox=bbox, order_key=order_key, line_key=line_key))
+
+        tokens.sort(key=lambda token: token.order_key)
+        return tokens
+
+    def _compose_text_from_tokens(self, tokens: Sequence[OcrToken]) -> str:
+        if not tokens:
+            return ""
+
+        lines: dict[LineKey, list[Tuple[int, str]]] = {}
+        for token in tokens:
+            lines.setdefault(token.line_key, []).append((token.order_key[-1], token.text))
+
+        composed: list[str] = []
+        for line_key in sorted(lines.keys()):
+            words = [word for _, word in sorted(lines[line_key], key=lambda item: item[0])]
+            composed.append(" ".join(words))
+        return "\n".join(composed)
+
+    def _on_overlay_modified(self, event: tk.Event | None) -> None:
+        self._user_modified_transcription = False
+        self._update_combined_transcription()
+
+    def _on_transcription_modified(self, event: tk.Event | None) -> None:
+        if not self._setting_transcription:
+            self._user_modified_transcription = True
+
+    def _update_combined_transcription(self) -> None:
+        if self._user_modified_transcription:
+            return
+        text = self._compose_transcription()
+        self._set_transcription(text)
+
+    def _compose_transcription(self) -> str:
+        lines: dict[LineKey, list[Tuple[int, str]]] = {}
+        for token, entry in zip(self.current_tokens, self.overlay_entries):
+            value = entry.get().strip()
+            if not value:
+                continue
+            lines.setdefault(token.line_key, []).append((token.order_key[-1], value))
+
+        composed: list[str] = []
+        for line_key in sorted(lines.keys()):
+            words = [word for _, word in sorted(lines[line_key], key=lambda item: item[0])]
+            composed.append(" ".join(words))
+        return "\n".join(composed)
+
+    def _set_transcription(self, value: str) -> None:
+        self._setting_transcription = True
+        self.entry_widget.delete("1.0", tk.END)
+        if value:
+            self.entry_widget.insert("1.0", value)
+        self._setting_transcription = False
+        self._user_modified_transcription = False
+
+    def _get_transcription_text(self) -> str:
+        return self.entry_widget.get("1.0", tk.END).strip()
+
+    def _clear_overlay_entries(self) -> None:
+        for entry in self.overlay_entries:
+            try:
+                entry.destroy()
+            except tk.TclError:
+                pass
+        self.overlay_entries.clear()
 
     def _suggest_label(self, path: Path) -> str:
         stem = path.stem
@@ -197,6 +399,8 @@ class AnnotationApp:
             if image.mode not in {"RGB", "L"}:
                 image = image.convert("RGB")
             image.save(candidate)
+        finally:
+            image.close()
         return candidate
 
     def _append_log(self, source: Path, label: str, status: str, saved_path: Optional[Path]) -> None:
