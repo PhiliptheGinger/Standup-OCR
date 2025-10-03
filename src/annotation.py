@@ -11,12 +11,12 @@ import tkinter as tk
 from tkinter import messagebox
 
 from PIL import Image, ImageOps, ImageTk
-import pytesseract
-from pytesseract import Output
 
 
-TokenOrder = Tuple[int, int, int, int, int]
-LineKey = Tuple[int, int, int]
+def _prepare_image(image: Image.Image) -> Image.Image:
+    """Return an image with EXIF orientation applied."""
+
+    return ImageOps.exif_transpose(image)
 
 
 @dataclass
@@ -180,7 +180,11 @@ class AnnotationApp:
 
     def _display_item(self, path: Path) -> None:
         try:
-            image = prepare_image(path)
+            with Image.open(path) as image:
+                image = _prepare_image(image)
+                image = image.convert("RGBA")
+                image.thumbnail(self.MAX_SIZE, Image.LANCZOS)
+                photo = ImageTk.PhotoImage(image)
         except Exception as exc:  # pragma: no cover - GUI feedback only
             messagebox.showerror("Error", f"Could not open {path.name}: {exc}")
             self.skip()
@@ -390,8 +394,8 @@ class AnnotationApp:
                 break
             counter += 1
 
-        image = prepare_image(path)
-        try:
+        with Image.open(path) as image:
+            image = _prepare_image(image)
             if image.mode not in {"RGB", "L"}:
                 image = image.convert("RGB")
             image.save(candidate)
