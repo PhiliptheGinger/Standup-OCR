@@ -9,6 +9,7 @@ from typing import Iterable, List
 import pandas as pd
 
 from src.ocr import ocr_image
+from src.review import ReviewAborted, ReviewConfig, ReviewSession
 from src.training import SUPPORTED_EXTENSIONS, train_model
 
 
@@ -78,6 +79,61 @@ def handle_batch(args: argparse.Namespace) -> None:
     output = Path(args.output)
     df.to_csv(output, index=False)
     logging.info("Batch OCR complete. Results saved to %s", output)
+
+
+def handle_review(args: argparse.Namespace) -> None:
+    source = Path(args.source)
+    if not source.exists():
+        raise FileNotFoundError(f"Source not found: {source}")
+    if args.auto_train is not None and args.auto_train <= 0:
+        raise ValueError("--auto-train must be a positive integer")
+
+    config = ReviewConfig(
+        threshold=args.threshold,
+        model_path=args.model,
+        tessdata_dir=args.tessdata_dir,
+        psm=args.psm,
+        train_dir=args.train_dir,
+        preview=not args.no_preview,
+    )
+    session = ReviewSession(config)
+    last_trained_count = 0
+
+    def maybe_train() -> None:
+        nonlocal last_trained_count
+        if not args.auto_train:
+            return
+        while session.saved_samples - last_trained_count >= args.auto_train:
+            logging.info(
+                "Auto-training triggered after %d new samples.",
+                session.saved_samples,
+            )
+            model_path = train_model(
+                args.train_dir,
+                args.output_model,
+                model_dir=args.model_dir,
+                tessdata_dir=args.tessdata_dir,
+                base_lang=args.base_lang,
+                max_iterations=args.max_iterations,
+            )
+            logging.info("Updated model saved to %s", model_path)
+            last_trained_count += args.auto_train
+
+    try:
+        paths: List[Path]
+        if source.is_dir():
+            paths = list(iter_images(source))
+            if not paths:
+                logging.warning("No images found in %s", source)
+        else:
+            paths = [source]
+
+        for path in paths:
+            session.review_image(path)
+            maybe_train()
+    except ReviewAborted:
+        logging.info("Review aborted by operator.")
+        maybe_train()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -180,6 +236,78 @@ def build_parser() -> argparse.ArgumentParser:
         help="Where to save the CSV summary (default: results.csv).",
     )
     batch_parser.set_defaults(func=handle_batch)
+
+    review_parser = subparsers.add_parser(
+        "review",
+        help="Interactively review low-confidence OCR tokens and capture training data.",
+    )
+    review_parser.add_argument(
+        "--source",
+        type=Path,
+        required=True,
+        help="Image file or directory to review.",
+    )
+    review_parser.add_argument(
+        "--threshold",
+        type=float,
+        default=70.0,
+        help="Confidence threshold below which tokens require review (default: 70).",
+    )
+    review_parser.add_argument(
+        "--model",
+        type=Path,
+        help="Optional custom .traineddata model used during review.",
+    )
+    review_parser.add_argument(
+        "--tessdata-dir",
+        type=Path,
+        help="Directory containing tessdata files (defaults to model's folder).",
+    )
+    review_parser.add_argument(
+        "--psm",
+        type=int,
+        default=6,
+        help="Tesseract page segmentation mode (default: 6).",
+    )
+    review_parser.add_argument(
+        "--train-dir",
+        type=Path,
+        default=DEFAULT_TRAIN_DIR,
+        help="Where to store confirmed snippets (default: train/).",
+    )
+    review_parser.add_argument(
+        "--auto-train",
+        type=int,
+        help="Automatically retrain after collecting N new samples.",
+    )
+    review_parser.add_argument(
+        "--output-model",
+        default="handwriting",
+        help="Base name of the output model when auto-training (default: handwriting).",
+    )
+    review_parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=DEFAULT_MODEL_DIR,
+        help="Where to store trained models (default: models/).",
+    )
+    review_parser.add_argument(
+        "--base-lang",
+        default="eng",
+        help="Base language code to fine-tune during auto-training (default: eng).",
+    )
+    review_parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=1000,
+        help="Training iterations to run when auto-training (default: 1000).",
+    )
+    review_parser.add_argument(
+        "--no-preview",
+        action="store_true",
+        help="Disable snippet previews (useful on headless systems).",
+    )
+    review_parser.set_defaults(func=handle_review)
 
     return parser
 
