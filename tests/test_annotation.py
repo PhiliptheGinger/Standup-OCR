@@ -2,6 +2,7 @@
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from PIL import Image
@@ -46,6 +47,11 @@ def test_confirm_handles_oserror(monkeypatch):
     app.items = [AnnotationItem(Path("image.png"))]
     app.index = 0
     app._get_transcription_text = lambda: "transcription"
+    app.overlay_entries = []
+    app.overlay_items = []
+    app.rect_to_overlay = {}
+    app.selected_rects = set()
+    app.current_tokens = []
 
     def failing_save(*_args, **_kwargs):
         raise OSError("disk full")
@@ -179,6 +185,9 @@ def test_confirm_revisit_uses_persisted_metadata(tmp_path):
     app.train_dir = tmp_path
     app.log_path = None
     app.overlay_entries = []
+    app.overlay_items = []
+    app.rect_to_overlay = {}
+    app.selected_rects = set()
     app.current_tokens = []
 
     class DummyVar:
@@ -252,3 +261,176 @@ def test_confirm_revisit_uses_persisted_metadata(tmp_path):
     status_message = app.status_var.get()
     assert "Previously saved to saved.png" in status_message
     assert not extract_called
+
+
+def test_draw_select_delete_interactions(monkeypatch):
+    """Drawing and selecting overlays should update the tracked structures."""
+
+    class FakeEntry:
+        def __init__(self, *_args, **_kwargs):
+            self.text = ""
+            self.focused = False
+            self.destroyed = False
+            self.bindings: dict[str, object] = {}
+
+        def insert(self, _index, value):
+            self.text = f"{value}{self.text}"
+
+        def bind(self, sequence, callback):
+            self.bindings[sequence] = callback
+
+        def get(self):
+            return self.text
+
+        def focus_set(self):
+            self.focused = True
+
+        def destroy(self):
+            self.destroyed = True
+
+        def delete(self, *_args, **_kwargs):  # pragma: no cover - kept for interface parity
+            self.text = ""
+
+    class FakeCanvas:
+        def __init__(self):
+            self.next_id = 1
+            self.rectangles: dict[int, list[float]] = {}
+            self.windows: dict[int, list[float]] = {}
+            self.focus_calls = 0
+
+        def create_rectangle(self, x1, y1, x2, y2, **_kwargs):
+            item_id = self.next_id
+            self.next_id += 1
+            self.rectangles[item_id] = [x1, y1, x2, y2]
+            return item_id
+
+        def create_window(self, x, y, **_kwargs):
+            item_id = self.next_id
+            self.next_id += 1
+            self.windows[item_id] = [x, y]
+            return item_id
+
+        def coords(self, item_id, *coords):
+            if coords:
+                if item_id in self.rectangles:
+                    self.rectangles[item_id] = list(coords)
+                elif item_id in self.windows:
+                    self.windows[item_id] = list(coords)
+            else:
+                if item_id in self.rectangles:
+                    return self.rectangles[item_id]
+                if item_id in self.windows:
+                    return self.windows[item_id]
+                return []
+
+        def delete(self, item_id):
+            if item_id == "all":
+                self.rectangles.clear()
+                self.windows.clear()
+                return
+            if isinstance(item_id, str):
+                return
+            self.rectangles.pop(item_id, None)
+            self.windows.pop(item_id, None)
+
+        def tag_raise(self, _item):
+            pass
+
+        def itemconfigure(self, _item, **_kwargs):
+            pass
+
+        def focus_set(self):
+            self.focus_calls += 1
+
+        def config(self, **_kwargs):  # pragma: no cover - not used in this test
+            pass
+
+    class DummyButton:
+        def __init__(self):
+            self.state = annotation.tk.DISABLED
+
+        def config(self, **kwargs):
+            if "state" in kwargs:
+                self.state = kwargs["state"]
+
+    class FakeEvent:
+        def __init__(self, x, y, state=0):
+            self.x = x
+            self.y = y
+            self.state = state
+
+    monkeypatch.setattr(annotation.tk, "Entry", FakeEntry)
+
+    app = AnnotationApp.__new__(AnnotationApp)
+    app.canvas = FakeCanvas()
+    app.overlay_items = []
+    app.overlay_entries = []
+    app.rect_to_overlay = {}
+    app.selected_rects = set()
+    app.current_tokens = []
+    app.display_scale = (1.0, 1.0)
+    app.manual_token_counter = 0
+    app.mode_var = SimpleNamespace(get=lambda: "select")
+    app.delete_button = DummyButton()
+    updates: list[str] = []
+    app._update_combined_transcription = lambda: updates.append("update")
+
+    token_one = annotation.OcrToken(
+        text="one",
+        bbox=(0, 0, 10, 10),
+        order_key=(0, 0, 0, 0, 0),
+        line_key=(0, 0, 0),
+    )
+    token_two = annotation.OcrToken(
+        text="two",
+        bbox=(30, 0, 50, 10),
+        order_key=(0, 0, 0, 0, 1),
+        line_key=(0, 0, 0),
+    )
+
+    overlay_one = app._create_overlay_widget(token_one, 0, 0, 20, 20, preset_text="one", is_manual=False)
+    overlay_two = app._create_overlay_widget(token_two, 40, 0, 70, 20, preset_text="two", is_manual=False)
+
+    app._on_canvas_button_press(FakeEvent(5, 5))
+    app._on_canvas_release(FakeEvent(5, 5))
+    assert app.selected_rects == {overlay_one.rect_id}
+    assert overlay_one.entry.focused
+    assert app.delete_button.state == annotation.tk.NORMAL
+
+    app._on_canvas_button_press(FakeEvent(60, 5, annotation.CONTROL_MASK))
+    app._on_canvas_release(FakeEvent(60, 5, annotation.CONTROL_MASK))
+    assert app.selected_rects == {overlay_one.rect_id, overlay_two.rect_id}
+
+    app._clear_selection()
+    app._on_canvas_button_press(FakeEvent(0, 0, annotation.SHIFT_MASK))
+    app._on_canvas_drag(FakeEvent(80, 40, annotation.SHIFT_MASK))
+    app._on_canvas_release(FakeEvent(80, 40, annotation.SHIFT_MASK))
+    assert app.selected_rects == {overlay_one.rect_id, overlay_two.rect_id}
+
+    app.mode_var = SimpleNamespace(get=lambda: "draw")
+    app._on_canvas_button_press(FakeEvent(100, 100))
+    app._on_canvas_drag(FakeEvent(140, 140))
+    app._on_canvas_release(FakeEvent(140, 140))
+
+    manual_overlay = app.overlay_items[-1]
+    assert manual_overlay.is_manual
+    assert manual_overlay.rect_id in app.selected_rects
+    assert manual_overlay.entry.focused
+    assert updates == ["update"]
+
+    overlay_one.entry.text = "first"
+    overlay_two.entry.text = "second"
+    manual_overlay.entry.text = "manual"
+
+    combined = app._compose_transcription()
+    assert combined.splitlines() == ["first second", "manual"]
+
+    app._delete_selected()
+    assert manual_overlay.rect_id not in app.rect_to_overlay
+    assert len(app.overlay_items) == 2
+    assert len(app.current_tokens) == 2
+    assert updates == ["update", "update"]
+    assert manual_overlay.entry.destroyed
+    assert app.delete_button.state == annotation.tk.DISABLED
+
+    assert app._compose_transcription() == "first second"
