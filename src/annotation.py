@@ -796,6 +796,32 @@ class AnnotationApp:
     def _on_transcription_modified(self, event: tk.Event | None) -> None:
         if not self._setting_transcription:
             self._user_modified_transcription = True
+            self._apply_transcription_to_overlays()
+
+    def _apply_transcription_to_overlays(self) -> None:
+        if self._setting_transcription:
+            return
+
+        text = self.entry_widget.get("1.0", tk.END)
+        tokens = re.findall(r"\S+", text)
+
+        self._setting_transcription = True
+        try:
+            for index, entry in enumerate(self.overlay_entries):
+                value = tokens[index] if index < len(tokens) else ""
+                try:
+                    entry.delete(0, tk.END)
+                    if value:
+                        entry.insert(0, value)
+                except tk.TclError:
+                    continue
+        finally:
+            self._setting_transcription = False
+
+        previous_flag = self._user_modified_transcription
+        self._user_modified_transcription = False
+        self._update_combined_transcription()
+        self._user_modified_transcription = previous_flag
 
     def _update_combined_transcription(self) -> None:
         if self._user_modified_transcription:
