@@ -45,6 +45,27 @@ During review you can:
 Each confirmed snippet is recorded in `train/review_log.jsonl`, preventing the
 same bounding box from being queued again in future sessions.
 
+### Annotating full-page images
+
+Use the `annotate` subcommand when you already have a folder of scans that need
+verified transcriptions. The tool opens a small Tkinter window, displays each
+image, and lets you enter the ground-truth text before saving a copy into your
+training directory using the `<prefix>_<label>.png` naming convention.
+
+```bash
+python main.py annotate --source path/to/folder --train-dir train \
+    --output-log train/annotation_log.csv
+```
+
+Key behaviour:
+
+* `--source` accepts a single image or a directory of images with supported
+  extensions.
+* Confirming an entry copies the image into `--train-dir` with the confirmed
+  label embedded in the file name, ready for `train_model`.
+* Use **Skip** to omit an image or **Unsure** to log it without saving a copy.
+  The optional `--output-log` CSV records every action.
+
 ### Training a custom model
 
 Once you have collected a set of labelled snippets run:
@@ -55,3 +76,7 @@ python main.py train --train-dir train --output-model handwriting
 
 Use the `--model` flag on the `test`, `batch`, or `review` subcommands to
 evaluate the updated model.
+
+> **Note:** The annotation interface relies on Tkinter, which ships with most
+> standard Python installers. On some Linux distributions you may need to
+> install an additional package such as `python3-tk` to enable the GUI.
