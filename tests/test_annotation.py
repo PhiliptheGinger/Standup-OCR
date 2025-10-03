@@ -311,105 +311,153 @@ def test_confirm_revisit_uses_persisted_metadata(tmp_path):
 
 
 def test_draw_select_delete_interactions(monkeypatch):
-    """Drawing and selecting overlays should update the tracked structures."""
+    """Selecting, drawing, and deleting overlays keeps the state consistent."""
 
-    class FakeEntry:
-        def __init__(self, *_args, **_kwargs):
-            self.text = ""
+    class DummyEntry:
+        def __init__(self, *_args, width: int = 0, **_kwargs):  # pragma: no cover - width unused
+            self.value = ""
             self.focused = False
             self.destroyed = False
             self.bindings: dict[str, object] = {}
 
-        def insert(self, _index, value):
-            self.text = f"{value}{self.text}"
+        def insert(self, _index: int, value: str) -> None:
+            self.value = value
 
-        def bind(self, sequence, callback):
-            self.bindings[sequence] = callback
+        def delete(self, *_args, **_kwargs) -> None:
+            self.value = ""
 
-        def get(self):
-            return self.text
+        def bind(self, sequence: str, handler) -> None:  # pragma: no cover - handler unused
+            self.bindings[sequence] = handler
 
-        def focus_set(self):
+        def get(self) -> str:
+            return self.value
+
+        def focus_set(self) -> None:
             self.focused = True
 
-        def destroy(self):
+        def destroy(self) -> None:
             self.destroyed = True
 
-        def delete(self, *_args, **_kwargs):  # pragma: no cover - kept for interface parity
-            self.text = ""
+    class DummyText:
+        def __init__(self) -> None:
+            self.value = ""
+            self.bindings: dict[str, object] = {}
 
-    class FakeCanvas:
-        def __init__(self):
-            self.next_id = 1
-            self.rectangles: dict[int, list[float]] = {}
-            self.windows: dict[int, list[float]] = {}
-            self.focus_calls = 0
+        def delete(self, *_args, **_kwargs) -> None:
+            self.value = ""
 
-        def create_rectangle(self, x1, y1, x2, y2, **_kwargs):
-            item_id = self.next_id
-            self.next_id += 1
-            self.rectangles[item_id] = [x1, y1, x2, y2]
-            return item_id
+        def insert(self, *args, **kwargs) -> None:
+            if args:
+                self.value = args[-1]
+            elif "value" in kwargs:
+                self.value = kwargs["value"]
+            else:  # pragma: no cover - default branch
+                self.value = ""
 
-        def create_window(self, x, y, **_kwargs):
-            item_id = self.next_id
-            self.next_id += 1
-            self.windows[item_id] = [x, y]
-            return item_id
+        def get(self, *_args, **_kwargs) -> str:
+            return self.value
 
-        def coords(self, item_id, *coords):
-            if coords:
-                if item_id in self.rectangles:
-                    self.rectangles[item_id] = list(coords)
-                elif item_id in self.windows:
-                    self.windows[item_id] = list(coords)
-            else:
-                if item_id in self.rectangles:
-                    return self.rectangles[item_id]
-                if item_id in self.windows:
-                    return self.windows[item_id]
-                return []
-
-        def delete(self, item_id):
-            if item_id == "all":
-                self.rectangles.clear()
-                self.windows.clear()
-                return
-            if isinstance(item_id, str):
-                return
-            self.rectangles.pop(item_id, None)
-            self.windows.pop(item_id, None)
-
-        def tag_raise(self, _item):
-            pass
-
-        def itemconfigure(self, _item, **_kwargs):
-            pass
-
-        def focus_set(self):
-            self.focus_calls += 1
-
-        def config(self, **_kwargs):  # pragma: no cover - not used in this test
-            pass
+        def bind(self, sequence: str, handler) -> None:  # pragma: no cover - handler unused
+            self.bindings[sequence] = handler
 
     class DummyButton:
-        def __init__(self):
+        def __init__(self) -> None:
             self.state = annotation.tk.DISABLED
 
-        def config(self, **kwargs):
+        def config(self, **kwargs) -> None:
             if "state" in kwargs:
                 self.state = kwargs["state"]
 
-    class FakeEvent:
-        def __init__(self, x, y, state=0):
-            self.x = x
-            self.y = y
-            self.state = state
+    class ModeVar:
+        def __init__(self, value: str) -> None:
+            self.value = value
 
-    monkeypatch.setattr(annotation.tk, "Entry", FakeEntry)
+        def get(self) -> str:
+            return self.value
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    class StubCanvas:
+        def __init__(self) -> None:
+            self._next_id = 1
+            self.objects: dict[int, dict[str, object]] = {}
+            self.bindings: dict[str, object] = {}
+            self.config_values: dict[str, object] = {}
+
+        def _allocate_id(self) -> int:
+            obj_id = self._next_id
+            self._next_id += 1
+            return obj_id
+
+        def bind(self, sequence: str, handler) -> None:  # pragma: no cover - not inspected
+            self.bindings[sequence] = handler
+
+        def create_image(self, x: float, y: float, **kwargs) -> int:
+            obj_id = self._allocate_id()
+            self.objects[obj_id] = {"coords": [x, y], "kwargs": kwargs}
+            return obj_id
+
+        def create_rectangle(self, x1: float, y1: float, x2: float, y2: float, **kwargs) -> int:
+            obj_id = self._allocate_id()
+            self.objects[obj_id] = {"coords": [x1, y1, x2, y2], "kwargs": kwargs}
+            return obj_id
+
+        def create_window(self, x: float, y: float, **kwargs) -> int:
+            obj_id = self._allocate_id()
+            self.objects[obj_id] = {"coords": [x, y], "kwargs": kwargs}
+            return obj_id
+
+        def tag_raise(self, *_args, **_kwargs) -> None:  # pragma: no cover - no ordering
+            pass
+
+        def coords(self, obj_id: int, *values: float) -> list[float]:
+            if obj_id not in self.objects:
+                return []
+            if values:
+                self.objects[obj_id]["coords"] = list(values)
+            return list(self.objects[obj_id]["coords"])
+
+        def delete(self, target) -> None:
+            if target == "all":
+                self.objects.clear()
+                return
+            if isinstance(target, str):
+                for obj_id, data in list(self.objects.items()):
+                    tags = data.get("kwargs", {}).get("tags")
+                    if tags is None:
+                        continue
+                    if isinstance(tags, (tuple, list, set)):
+                        tag_values = tuple(tags)
+                    else:
+                        tag_values = (tags,)
+                    if target in tag_values:
+                        self.objects.pop(obj_id, None)
+                return
+            self.objects.pop(target, None)
+
+        def itemconfigure(self, obj_id: int, **kwargs) -> None:
+            if obj_id in self.objects:
+                self.objects[obj_id].setdefault("config", {}).update(kwargs)
+
+        def focus_set(self) -> None:  # pragma: no cover - no focus behaviour
+            pass
+
+        def config(self, **kwargs) -> None:
+            self.config_values.update(kwargs)
+
+    class DummyPhotoImage:
+        def __init__(self, image) -> None:
+            self.image = image
+
+    monkeypatch.setattr(annotation.tk, "Entry", DummyEntry)
+    monkeypatch.setattr(annotation.ImageTk, "PhotoImage", DummyPhotoImage)
 
     app = AnnotationApp.__new__(AnnotationApp)
-    app.canvas = FakeCanvas()
+    app.canvas = StubCanvas()
+    app.entry_widget = DummyText()
+    app.delete_button = DummyButton()
+    app.mode_var = ModeVar("select")
     app.overlay_items = []
     app.overlay_entries = []
     app.rect_to_overlay = {}
@@ -417,67 +465,86 @@ def test_draw_select_delete_interactions(monkeypatch):
     app.current_tokens = []
     app.display_scale = (1.0, 1.0)
     app.manual_token_counter = 0
-    app.mode_var = SimpleNamespace(get=lambda: "select")
-    app.delete_button = DummyButton()
-    updates: list[str] = []
-    app._update_combined_transcription = lambda: updates.append("update")
+    app._drag_start = None
+    app._active_temp_rect = None
+    app._marquee_rect = None
+    app._modifier_drag = False
+    app._pressed_overlay = None
+    app._user_modified_transcription = False
+    app._setting_transcription = False
 
-    token_one = annotation.OcrToken(
-        text="one",
-        bbox=(0, 0, 10, 10),
-        order_key=(0, 0, 0, 0, 0),
-        line_key=(0, 0, 0),
-    )
-    token_two = annotation.OcrToken(
-        text="two",
-        bbox=(30, 0, 50, 10),
-        order_key=(0, 0, 0, 0, 1),
-        line_key=(0, 0, 0),
-    )
+    image = Image.new("RGB", (100, 40), "white")
+    tokens = [
+        annotation.OcrToken("alpha", (0, 0, 20, 10), (1, 1, 1, 1, 1), (1, 1, 1)),
+        annotation.OcrToken("beta", (25, 0, 45, 10), (1, 1, 1, 1, 2), (1, 1, 1)),
+    ]
 
-    overlay_one = app._create_overlay_widget(token_one, 0, 0, 20, 20, preset_text="one", is_manual=False)
-    overlay_two = app._create_overlay_widget(token_two, 40, 0, 70, 20, preset_text="two", is_manual=False)
+    AnnotationApp._display_image(app, image, tokens)
 
-    app._on_canvas_button_press(FakeEvent(5, 5))
-    app._on_canvas_release(FakeEvent(5, 5))
-    assert app.selected_rects == {overlay_one.rect_id}
-    assert overlay_one.entry.focused
+    assert len(app.overlay_items) == 2
+    assert [overlay.entry.get() for overlay in app.overlay_items] == ["alpha", "beta"]
+    assert app.current_tokens and len(app.current_tokens) == 2
+    assert app.entry_widget.get("1.0", annotation.tk.END) == "alpha beta"
+
+    first_overlay = app.overlay_items[0]
+    left, top, right, bottom = app.canvas.coords(first_overlay.rect_id)
+    click_event = SimpleNamespace(x=(left + right) / 2, y=(top + bottom) / 2, state=0)
+
+    AnnotationApp._on_canvas_button_press(app, click_event)
+    AnnotationApp._on_canvas_release(app, click_event)
+
+    assert app.selected_rects == {first_overlay.rect_id}
+    assert first_overlay.selected is True
     assert app.delete_button.state == annotation.tk.NORMAL
 
-    app._on_canvas_button_press(FakeEvent(60, 5, annotation.CONTROL_MASK))
-    app._on_canvas_release(FakeEvent(60, 5, annotation.CONTROL_MASK))
-    assert app.selected_rects == {overlay_one.rect_id, overlay_two.rect_id}
+    app.mode_var.set("draw")
+    draw_start = SimpleNamespace(x=70, y=15, state=0)
+    draw_end = SimpleNamespace(x=95, y=30, state=0)
 
-    app._clear_selection()
-    app._on_canvas_button_press(FakeEvent(0, 0, annotation.SHIFT_MASK))
-    app._on_canvas_drag(FakeEvent(80, 40, annotation.SHIFT_MASK))
-    app._on_canvas_release(FakeEvent(80, 40, annotation.SHIFT_MASK))
-    assert app.selected_rects == {overlay_one.rect_id, overlay_two.rect_id}
+    AnnotationApp._on_canvas_button_press(app, draw_start)
+    AnnotationApp._on_canvas_drag(app, draw_end)
+    AnnotationApp._on_canvas_release(app, draw_end)
 
-    app.mode_var = SimpleNamespace(get=lambda: "draw")
-    app._on_canvas_button_press(FakeEvent(100, 100))
-    app._on_canvas_drag(FakeEvent(140, 140))
-    app._on_canvas_release(FakeEvent(140, 140))
-
+    assert len(app.overlay_items) == 3
     manual_overlay = app.overlay_items[-1]
-    assert manual_overlay.is_manual
-    assert manual_overlay.rect_id in app.selected_rects
-    assert manual_overlay.entry.focused
-    assert updates == ["update"]
+    assert manual_overlay.is_manual is True
+    assert manual_overlay.selected is True
 
-    overlay_one.entry.text = "first"
-    overlay_two.entry.text = "second"
-    manual_overlay.entry.text = "manual"
+    manual_overlay.entry.insert(0, "gamma")
+    AnnotationApp._on_overlay_modified(app, None)
+    assert "gamma" in app.entry_widget.get("1.0", annotation.tk.END)
 
-    combined = app._compose_transcription()
-    assert combined.splitlines() == ["first second", "manual"]
+    app.mode_var.set("select")
+    AnnotationApp._delete_selected(app)
 
-    app._delete_selected()
-    assert manual_overlay.rect_id not in app.rect_to_overlay
     assert len(app.overlay_items) == 2
-    assert len(app.current_tokens) == 2
-    assert updates == ["update", "update"]
+    assert all(not overlay.is_manual for overlay in app.overlay_items)
+    assert app.current_tokens and len(app.current_tokens) == 2
+    assert app.entry_widget.get("1.0", annotation.tk.END) == "alpha beta"
+    assert not app.selected_rects
     assert manual_overlay.entry.destroyed
     assert app.delete_button.state == annotation.tk.DISABLED
 
-    assert app._compose_transcription() == "first second"
+    second_overlay = app.overlay_items[1]
+    s_left, s_top, s_right, s_bottom = app.canvas.coords(second_overlay.rect_id)
+    ctrl_event = SimpleNamespace(
+        x=(s_left + s_right) / 2,
+        y=(s_top + s_bottom) / 2,
+        state=annotation.CONTROL_MASK,
+    )
+
+    AnnotationApp._on_canvas_button_press(app, click_event)
+    AnnotationApp._on_canvas_release(app, click_event)
+    AnnotationApp._on_canvas_button_press(app, ctrl_event)
+    AnnotationApp._on_canvas_release(app, ctrl_event)
+
+    assert app.selected_rects == {first_overlay.rect_id, second_overlay.rect_id}
+
+    AnnotationApp._delete_selected(app)
+
+    assert not app.overlay_items
+    assert not app.rect_to_overlay
+    assert not app.current_tokens
+    assert not app.selected_rects
+    assert app.entry_widget.get("1.0", annotation.tk.END) == ""
+    assert app.delete_button.state == annotation.tk.DISABLED
