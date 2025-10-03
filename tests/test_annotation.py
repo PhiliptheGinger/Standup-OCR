@@ -174,6 +174,53 @@ def test_back_rewinds_without_reappending_logs():
     assert app.status_var.get() == "Already at the first item."
 
 
+def test_apply_transcription_clears_overlay_entries():
+    app = AnnotationApp.__new__(AnnotationApp)
+
+    class DummyEntry:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def delete(self, *_args, **_kwargs) -> None:
+            self.value = ""
+
+        def insert(self, _index: int, value: str) -> None:  # pragma: no cover - not used
+            self.value = value
+
+    class DummyText:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def get(self, *_args, **_kwargs) -> str:
+            return self.value
+
+        def delete(self, *_args, **_kwargs) -> None:
+            self.value = ""
+
+        def insert(self, *_args, **_kwargs) -> None:
+            if len(_args) >= 2:
+                self.value = _args[1]
+            elif "chars" in _kwargs:
+                self.value = _kwargs["chars"]
+
+    entries = [DummyEntry("first"), DummyEntry("second")]
+    app.overlay_entries = entries
+    app.overlay_items = []
+    app.rect_to_overlay = {}
+    app.selected_rects = set()
+    app.current_tokens = [
+        annotation.OcrToken("first", (0, 0, 0, 0), (0, 0, 0, 0, 0), (0, 0, 0)),
+        annotation.OcrToken("second", (0, 0, 0, 0), (0, 0, 0, 0, 1), (0, 0, 0)),
+    ]
+    app.entry_widget = DummyText("")
+    app._setting_transcription = False
+    app._user_modified_transcription = False
+
+    AnnotationApp._apply_transcription_to_overlays(app)
+
+    assert all(entry.value == "" for entry in entries)
+
+
 def test_confirm_revisit_uses_persisted_metadata(tmp_path):
     app = AnnotationApp.__new__(AnnotationApp)
     image_path = tmp_path / "sample.png"
