@@ -8,6 +8,7 @@ from typing import Iterable, List
 
 import pandas as pd
 
+from src.annotation import annotate_images
 from src.ocr import ocr_image
 from src.review import ReviewAborted, ReviewConfig, ReviewSession
 from src.training import SUPPORTED_EXTENSIONS, train_model
@@ -134,6 +135,25 @@ def handle_review(args: argparse.Namespace) -> None:
     except ReviewAborted:
         logging.info("Review aborted by operator.")
         maybe_train()
+
+
+def handle_annotate(args: argparse.Namespace) -> None:
+    source = Path(args.source)
+    if not source.exists():
+        raise FileNotFoundError(f"Source not found: {source}")
+
+    if source.is_dir():
+        paths = list(iter_images(source))
+        if not paths:
+            raise FileNotFoundError(f"No supported images found in {source}")
+    else:
+        if source.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported image type: {source.suffix}. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+            )
+        paths = [source]
+
+    annotate_images(paths, args.train_dir, log_path=args.output_log)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -308,6 +328,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable snippet previews (useful on headless systems).",
     )
     review_parser.set_defaults(func=handle_review)
+
+    annotate_parser = subparsers.add_parser(
+        "annotate",
+        help="Manually confirm transcriptions for a set of images using a GUI tool.",
+    )
+    annotate_parser.add_argument(
+        "--source",
+        type=Path,
+        required=True,
+        help="Image file or directory to annotate.",
+    )
+    annotate_parser.add_argument(
+        "--train-dir",
+        type=Path,
+        default=DEFAULT_TRAIN_DIR,
+        help="Directory where confirmed annotations will be stored (default: train/).",
+    )
+    annotate_parser.add_argument(
+        "--output-log",
+        type=Path,
+        help="Optional CSV file to append annotation metadata (image, status, label).",
+    )
+    annotate_parser.set_defaults(func=handle_annotate)
 
     return parser
 
