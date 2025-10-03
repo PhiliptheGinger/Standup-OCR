@@ -5,18 +5,18 @@ import csv
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import tkinter as tk
 from tkinter import messagebox
 
 from PIL import Image, ImageOps, ImageTk
-import pytesseract
-from pytesseract import Output
 
 
-TokenOrder = Tuple[int, int, int, int, int]
-LineKey = Tuple[int, int, int]
+def _prepare_image(image: Image.Image) -> Image.Image:
+    """Return an image with EXIF orientation applied."""
+
+    return ImageOps.exif_transpose(image)
 
 
 @dataclass
@@ -70,8 +70,8 @@ class AnnotationApp:
 
         self.current_photo: Optional[ImageTk.PhotoImage] = None
         self.canvas_image_id: Optional[int] = None
-        self.overlay_entries: List[tk.Entry] = []
-        self.current_tokens: List[OcrToken] = []
+        self.overlay_entries: list[tk.Entry] = []
+        self.current_tokens: list[OcrToken] = []
 
         self.filename_var = tk.StringVar()
         self.status_var = tk.StringVar()
@@ -180,7 +180,11 @@ class AnnotationApp:
 
     def _display_item(self, path: Path) -> None:
         try:
-            image = prepare_image(path)
+            with Image.open(path) as image:
+                image = _prepare_image(image)
+                image = image.convert("RGBA")
+                image.thumbnail(self.MAX_SIZE, Image.LANCZOS)
+                photo = ImageTk.PhotoImage(image)
         except Exception as exc:  # pragma: no cover - GUI feedback only
             messagebox.showerror("Error", f"Could not open {path.name}: {exc}")
             self.skip()
@@ -311,21 +315,21 @@ class AnnotationApp:
         if not tokens:
             return ""
 
-        lines: Dict[LineKey, List[Tuple[int, str]]] = {}
+        lines: dict[LineKey, list[Tuple[int, str]]] = {}
         for token in tokens:
             lines.setdefault(token.line_key, []).append((token.order_key[-1], token.text))
 
-        composed: List[str] = []
+        composed: list[str] = []
         for line_key in sorted(lines.keys()):
             words = [word for _, word in sorted(lines[line_key], key=lambda item: item[0])]
             composed.append(" ".join(words))
         return "\n".join(composed)
 
-    def _on_overlay_modified(self, event: Optional[tk.Event]) -> None:
+    def _on_overlay_modified(self, event: tk.Event | None) -> None:
         self._user_modified_transcription = False
         self._update_combined_transcription()
 
-    def _on_transcription_modified(self, event: Optional[tk.Event]) -> None:
+    def _on_transcription_modified(self, event: tk.Event | None) -> None:
         if not self._setting_transcription:
             self._user_modified_transcription = True
 
@@ -336,14 +340,14 @@ class AnnotationApp:
         self._set_transcription(text)
 
     def _compose_transcription(self) -> str:
-        lines: Dict[LineKey, List[Tuple[int, str]]] = {}
+        lines: dict[LineKey, list[Tuple[int, str]]] = {}
         for token, entry in zip(self.current_tokens, self.overlay_entries):
             value = entry.get().strip()
             if not value:
                 continue
             lines.setdefault(token.line_key, []).append((token.order_key[-1], value))
 
-        composed: List[str] = []
+        composed: list[str] = []
         for line_key in sorted(lines.keys()):
             words = [word for _, word in sorted(lines[line_key], key=lambda item: item[0])]
             composed.append(" ".join(words))
@@ -390,8 +394,8 @@ class AnnotationApp:
                 break
             counter += 1
 
-        image = prepare_image(path)
-        try:
+        with Image.open(path) as image:
+            image = _prepare_image(image)
             if image.mode not in {"RGB", "L"}:
                 image = image.convert("RGB")
             image.save(candidate)

@@ -1,32 +1,23 @@
-from pathlib import Path
-from unittest import mock
+"""Tests for the annotation helpers."""
+
 import sys
-import types
+from pathlib import Path
 
 from PIL import Image
 
-if "cv2" not in sys.modules:  # pragma: no cover - shim when OpenCV is unavailable.
-    sys.modules["cv2"] = types.SimpleNamespace()
+sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from src.annotation import prepare_image  # noqa: E402  (import after path tweak)
+from annotation import _prepare_image
 
 
-def test_prepare_image_applies_exif_transpose(tmp_path):
-    source = tmp_path / "sample.png"
-    Image.new("RGB", (10, 20), "white").save(source)
+def test_prepare_image_applies_exif_orientation():
+    """Images should be rotated according to their EXIF orientation."""
 
-    def fake_transpose(image: Image.Image) -> Image.Image:
-        return image.transpose(Image.ROTATE_90)
+    image = Image.new("RGB", (10, 20), "red")
+    exif = image.getexif()
+    exif[274] = 6  # Orientation tag: rotate 270 degrees
+    image.info["exif"] = exif.tobytes()
 
-    with mock.patch("src.annotation.ImageOps.exif_transpose", side_effect=fake_transpose) as transpose:
-        result = prepare_image(Path(source))
-    try:
-        assert result.size == (20, 10)
-    finally:
-        result.close()
+    prepared = _prepare_image(image)
 
-    transpose.assert_called_once()
+    assert prepared.size == (20, 10)
