@@ -27,6 +27,9 @@ class AnnotationItem:
     """Represent a single image queued for annotation."""
 
     path: Path
+    label: Optional[str] = None
+    status: Optional[str] = None
+    saved_path: Optional[Path] = None
 
 
 @dataclass
@@ -160,19 +163,29 @@ class AnnotationApp:
         except OSError as exc:
             messagebox.showerror("Save failed", f"Could not save annotation: {exc}")
             return
+        item.label = label
+        item.status = "confirmed"
+        item.saved_path = saved_path
         self._append_log(item.path, label, "confirmed", saved_path)
         self.status_var.set(f"Saved to {saved_path.name}")
         self._advance()
 
     def skip(self) -> None:
         item = self.items[self.index]
-        self._append_log(item.path, "", "skipped", None)
+        item.label = ""
+        item.status = "skipped"
+        item.saved_path = None
+        self._append_log(item.path, item.label, "skipped", None)
         self.status_var.set("Skipped")
         self._advance()
 
     def unsure(self) -> None:
         item = self.items[self.index]
-        self._append_log(item.path, self._get_transcription_text(), "unsure", None)
+        label = self._get_transcription_text()
+        item.label = label
+        item.status = "unsure"
+        item.saved_path = None
+        self._append_log(item.path, label, "unsure", None)
         self.status_var.set("Marked as unsure")
         self._advance()
 
@@ -203,7 +216,7 @@ class AnnotationApp:
         if hasattr(self, "back_button"):
             state = tk.NORMAL if self.index > 0 else tk.DISABLED
             self.back_button.config(state=state)
-        self._display_item(item.path)
+        self._display_item(item)
         self.entry_widget.focus_set()
         if revisit:
             reminder = "Returned to previous item; previous response has not been re-recorded."
@@ -214,36 +227,61 @@ class AnnotationApp:
                 message = f"{previous_status} {reminder}".strip()
                 self.status_var.set(message)
 
-    def _display_item(self, path: Path) -> None:
+    def _display_item(self, item: AnnotationItem) -> None:
+        path = item.path
         try:
             with Image.open(path) as image:
                 image = _prepare_image(image)
                 image = image.convert("RGBA")
                 image.thumbnail(self.MAX_SIZE, Image.LANCZOS)
-                photo = ImageTk.PhotoImage(image)
+                prepared_image = image.copy()
         except Exception as exc:  # pragma: no cover - GUI feedback only
             messagebox.showerror("Error", f"Could not open {path.name}: {exc}")
             self.skip()
             return
 
-        tokens = self._extract_tokens(image)
-        suggestion = self._compose_text_from_tokens(tokens)
-        if suggestion:
-            self._set_transcription(suggestion)
-            self.status_var.set("Pre-filled transcription using OCR result.")
-        else:
-            self._set_transcription("")
-            filename_hint = self._suggest_label(path)
-            if filename_hint:
-                self.status_var.set(
-                    "OCR produced no suggestion; using filename hint: "
-                    f"{filename_hint}"
-                )
+        tokens: list[OcrToken] = []
+        prefilled = False
+        if item.status == "confirmed" and item.label:
+            self._set_transcription(item.label)
+            if item.saved_path:
+                saved_name = Path(item.saved_path).name or str(item.saved_path)
+                self.status_var.set(f"Previously saved to {saved_name}")
             else:
-                self.status_var.set("OCR produced no suggestion; please transcribe manually.")
+                self.status_var.set("Previously confirmed.")
+            prefilled = True
+        elif item.status == "unsure":
+            self._set_transcription(item.label or "")
+            self.status_var.set("Previously marked as unsure.")
+            prefilled = True
+        elif item.status == "skipped":
+            self._set_transcription("")
+            self.status_var.set("Previously skipped.")
+            prefilled = True
+        elif item.label:
+            self._set_transcription(item.label)
+            self.status_var.set("Previously annotated.")
+            prefilled = True
 
-        self._display_image(image, tokens)
-        image.close()
+        if not prefilled:
+            tokens = self._extract_tokens(prepared_image)
+            suggestion = self._compose_text_from_tokens(tokens)
+            if suggestion:
+                self._set_transcription(suggestion)
+                self.status_var.set("Pre-filled transcription using OCR result.")
+            else:
+                self._set_transcription("")
+                filename_hint = self._suggest_label(path)
+                if filename_hint:
+                    self.status_var.set(
+                        "OCR produced no suggestion; using filename hint: "
+                        f"{filename_hint}"
+                    )
+                else:
+                    self.status_var.set("OCR produced no suggestion; please transcribe manually.")
+
+        self._display_image(prepared_image, tokens)
+        prepared_image.close()
 
     def _display_image(self, image: Image.Image, tokens: Sequence[OcrToken]) -> None:
         base_width, base_height = image.size
