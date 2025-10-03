@@ -310,6 +310,80 @@ def test_confirm_revisit_uses_persisted_metadata(tmp_path):
     assert not extract_called
 
 
+def test_confirm_triggers_background_training(monkeypatch, tmp_path):
+    master_calls: list[tuple[int, object]] = []
+
+    class StubMaster:
+        def after(self, delay: int, callback):
+            master_calls.append((delay, callback))
+            callback()
+
+    class ImmediateThread:
+        def __init__(self, target, daemon: bool = False):
+            self._target = target
+            self.daemon = daemon
+
+        def start(self) -> None:
+            self._target()
+
+    saved_dir = tmp_path / "train"
+    saved_dir.mkdir()
+    saved_one = saved_dir / "sample-one.png"
+    saved_two = saved_dir / "sample-two.png"
+    saved_one.touch()
+    saved_two.touch()
+
+    calls: list[tuple[Path, str, dict]] = []
+
+    def fake_train(train_dir, output_model, **kwargs):
+        calls.append((Path(train_dir), output_model, kwargs))
+        return tmp_path / "models" / f"{output_model}.traineddata"
+
+    monkeypatch.setattr(annotation, "_train_model", fake_train)
+    monkeypatch.setattr(annotation.threading, "Thread", ImmediateThread)
+
+    trainer = annotation.AnnotationTrainer(
+        StubMaster(),
+        train_dir=saved_dir,
+        config=annotation.AnnotationAutoTrainConfig(
+            auto_train=1,
+            output_model="handwriting",
+            model_dir=tmp_path / "models",
+            base_lang="eng",
+            max_iterations=100,
+        ),
+    )
+
+    app = AnnotationApp.__new__(AnnotationApp)
+    app.items = [
+        AnnotationItem(Path("first.png")),
+        AnnotationItem(Path("second.png")),
+    ]
+    app.index = 0
+    app.train_dir = saved_dir
+    app._get_transcription_text = lambda: "label"
+    app._append_log = lambda *_args, **_kwargs: None
+    app._advance = lambda: None
+    app._save_annotation = lambda *_args, **_kwargs: saved_one
+    app.status_var = SimpleNamespace(set=lambda _value: None)
+    app.overlay_entries = []
+    app.overlay_items = []
+    app.rect_to_overlay = {}
+    app.selected_rects = set()
+    app.current_tokens = []
+    app._on_sample_saved = trainer
+
+    AnnotationApp.confirm(app)
+    assert trainer.seen_samples == [saved_one]
+    assert calls and calls[0][0] == saved_dir
+
+    app._save_annotation = lambda *_args, **_kwargs: saved_two
+    AnnotationApp.confirm(app)
+    assert trainer.seen_samples == [saved_one, saved_two]
+    assert len(calls) == 2
+    assert len(master_calls) >= 2
+
+
 def test_draw_select_delete_interactions(monkeypatch):
     """Selecting, drawing, and deleting overlays keeps the state consistent."""
 

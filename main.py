@@ -8,7 +8,7 @@ from typing import Iterable, List
 
 import pandas as pd
 
-from src.annotation import annotate_images
+from src.annotation import annotate_images, AnnotationAutoTrainConfig
 from src.ocr import ocr_image
 from src.review import ReviewAborted, ReviewConfig, ReviewSession
 from src.training import SUPPORTED_EXTENSIONS, train_model
@@ -142,6 +142,9 @@ def handle_annotate(args: argparse.Namespace) -> None:
     if not source.exists():
         raise FileNotFoundError(f"Source not found: {source}")
 
+    if args.auto_train is not None and args.auto_train <= 0:
+        raise ValueError("--auto-train must be a positive integer")
+
     if source.is_dir():
         paths = list(iter_images(source))
         if not paths:
@@ -153,7 +156,23 @@ def handle_annotate(args: argparse.Namespace) -> None:
             )
         paths = [source]
 
-    annotate_images(paths, args.train_dir, log_path=args.output_log)
+    auto_train_config = None
+    if args.auto_train:
+        auto_train_config = AnnotationAutoTrainConfig(
+            auto_train=args.auto_train,
+            output_model=args.output_model,
+            model_dir=args.model_dir,
+            base_lang=args.base_lang,
+            max_iterations=args.max_iterations,
+            tessdata_dir=args.tessdata_dir,
+        )
+
+    annotate_images(
+        paths,
+        args.train_dir,
+        log_path=args.output_log,
+        auto_train_config=auto_train_config,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -344,6 +363,38 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_TRAIN_DIR,
         help="Directory where confirmed annotations will be stored (default: train/).",
+    )
+    annotate_parser.add_argument(
+        "--auto-train",
+        type=int,
+        help="Automatically retrain after collecting N new annotations.",
+    )
+    annotate_parser.add_argument(
+        "--output-model",
+        default="handwriting",
+        help="Base name of the output model when auto-training (default: handwriting).",
+    )
+    annotate_parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=DEFAULT_MODEL_DIR,
+        help="Where to store trained models (default: models/).",
+    )
+    annotate_parser.add_argument(
+        "--base-lang",
+        default="eng",
+        help="Base language code to fine-tune during auto-training (default: eng).",
+    )
+    annotate_parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=1000,
+        help="Training iterations to run when auto-training (default: 1000).",
+    )
+    annotate_parser.add_argument(
+        "--tessdata-dir",
+        type=Path,
+        help="Path to tessdata directory containing base traineddata files.",
     )
     annotate_parser.add_argument(
         "--output-log",

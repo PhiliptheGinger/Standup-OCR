@@ -4,9 +4,11 @@ from __future__ import annotations
 import csv
 import logging
 import re
+import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import tkinter as tk
 from tkinter import messagebox
@@ -81,6 +83,7 @@ class AnnotationApp:
         items: Iterable[AnnotationItem],
         train_dir: Path,
         log_path: Optional[Path] = None,
+        on_sample_saved: Optional[Callable[[Path], None]] = None,
     ) -> None:
         self.master = master
         self.items: List[AnnotationItem] = list(items)
@@ -93,6 +96,7 @@ class AnnotationApp:
         if self.log_path is not None:
             self.log_path = Path(self.log_path)
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._on_sample_saved = on_sample_saved
 
         self.current_photo: Optional[ImageTk.PhotoImage] = None
         self.canvas_image_id: Optional[int] = None
@@ -241,6 +245,9 @@ class AnnotationApp:
         item.saved_path = saved_path
         self._append_log(item.path, label, "confirmed", saved_path)
         self.status_var.set(f"Saved to {saved_path.name}")
+        callback = getattr(self, "_on_sample_saved", None)
+        if callback is not None and saved_path is not None:
+            callback(saved_path)
         self._advance()
 
     def skip(self) -> None:
@@ -948,11 +955,93 @@ class AnnotationApp:
         return slug or "sample"
 
 
+def _train_model(*args, **kwargs):
+    if __package__:
+        from .training import train_model as _impl
+    else:  # pragma: no cover - fallback for test imports
+        from training import train_model as _impl
+    return _impl(*args, **kwargs)
+
+
+@dataclass
+class AnnotationAutoTrainConfig:
+    auto_train: int
+    output_model: str
+    model_dir: Path
+    base_lang: str
+    max_iterations: int
+    tessdata_dir: Optional[Path] = None
+
+
+class AnnotationTrainer:
+    """Schedule background training runs as annotations are confirmed."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        train_dir: Path,
+        config: AnnotationAutoTrainConfig,
+    ) -> None:
+        if config.auto_train <= 0:
+            raise ValueError("auto_train must be a positive integer")
+        self.master = master
+        self.train_dir = Path(train_dir)
+        self.config = config
+        self._pending: deque[Path] = deque()
+        self._seen_samples: List[Path] = []
+        self._running = False
+
+    @property
+    def seen_samples(self) -> List[Path]:
+        return list(self._seen_samples)
+
+    def __call__(self, sample_path: Path) -> None:
+        path = Path(sample_path)
+        self._pending.append(path)
+        self._seen_samples.append(path)
+        self.master.after(0, self._maybe_train)
+
+    def _maybe_train(self) -> None:
+        if self._running:
+            return
+        if len(self._pending) < self.config.auto_train:
+            return
+
+        batch = [self._pending.popleft() for _ in range(self.config.auto_train)]
+        self._running = True
+
+        def worker() -> None:
+            try:
+                logging.info(
+                    "Auto-training triggered by %d new annotations.",
+                    len(batch),
+                )
+                model_path = _train_model(
+                    self.train_dir,
+                    self.config.output_model,
+                    model_dir=self.config.model_dir,
+                    tessdata_dir=self.config.tessdata_dir,
+                    base_lang=self.config.base_lang,
+                    max_iterations=self.config.max_iterations,
+                )
+                logging.info("Updated model saved to %s", model_path)
+            except Exception:  # pragma: no cover - logging side effects
+                logging.exception("Auto-training failed.")
+            finally:
+                self._running = False
+                self.master.after(0, self._maybe_train)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+
 def annotate_images(
     sources: Iterable[Path],
     train_dir: Path,
     *,
     log_path: Optional[Path] = None,
+    auto_train_config: Optional[AnnotationAutoTrainConfig] = None,
 ) -> None:
     """Launch the annotation UI for the provided image paths."""
 
@@ -968,5 +1057,13 @@ def annotate_images(
             "use a system package such as python3-tk."
         ) from exc
 
-    app = AnnotationApp(root, items, train_dir, log_path)
+    callback = None
+    if auto_train_config is not None:
+        callback = AnnotationTrainer(
+            root,
+            train_dir=train_dir,
+            config=auto_train_config,
+        )
+
+    app = AnnotationApp(root, items, train_dir, log_path, on_sample_saved=callback)
     root.mainloop()
