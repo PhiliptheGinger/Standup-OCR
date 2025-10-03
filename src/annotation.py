@@ -11,6 +11,8 @@ import tkinter as tk
 from tkinter import messagebox
 
 from PIL import Image, ImageOps, ImageTk
+import pytesseract
+from pytesseract import Output
 
 
 def _prepare_image(image: Image.Image) -> Image.Image:
