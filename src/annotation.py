@@ -133,9 +133,30 @@ class AnnotationApp:
 
         self.canvas = tk.Canvas(container, bd=1, relief="sunken", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, pady=12)
-        self.canvas.bind("<ButtonPress-1>", self._on_canvas_button_press)
-        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+        button_sequences = (
+            "<ButtonPress-1>",
+            "<Shift-ButtonPress-1>",
+            "<Control-ButtonPress-1>",
+            "<Control-Shift-ButtonPress-1>",
+        )
+        for sequence in button_sequences:
+            self.canvas.bind(sequence, self._on_canvas_button_press)
+        motion_sequences = (
+            "<B1-Motion>",
+            "<Shift-B1-Motion>",
+            "<Control-B1-Motion>",
+            "<Control-Shift-B1-Motion>",
+        )
+        for sequence in motion_sequences:
+            self.canvas.bind(sequence, self._on_canvas_drag)
+        release_sequences = (
+            "<ButtonRelease-1>",
+            "<Shift-ButtonRelease-1>",
+            "<Control-ButtonRelease-1>",
+            "<Control-Shift-ButtonRelease-1>",
+        )
+        for sequence in release_sequences:
+            self.canvas.bind(sequence, self._on_canvas_release)
 
         toolbar = tk.Frame(container)
         toolbar.pack(anchor="w", pady=(0, 8))
@@ -353,6 +374,7 @@ class AnnotationApp:
         self.overlay_entries = []
         self.rect_to_overlay = {}
         self.selected_rects.clear()
+        self._refresh_delete_button()
         self.current_tokens = []
         self.canvas_image_id = self.canvas.create_image(0, 0, image=photo, anchor="nw")
         self.canvas.config(scrollregion=(0, 0, display_image.width, display_image.height))
@@ -375,9 +397,9 @@ class AnnotationApp:
                 preset_text=token.text,
                 is_manual=False,
             )
-            self.current_tokens.append(overlay.token)
 
         if tokens:
+            self._update_tokens_snapshot()
             self._update_combined_transcription()
 
     def _create_overlay_widget(
@@ -537,6 +559,8 @@ class AnnotationApp:
             pass
         self.canvas.delete(overlay.rect_id)
         self.canvas.delete(overlay.window_id)
+        overlay.selected = False
+        self.selected_rects.discard(overlay.rect_id)
         if overlay.rect_id in self.rect_to_overlay:
             del self.rect_to_overlay[overlay.rect_id]
         try:
@@ -866,6 +890,7 @@ class AnnotationApp:
         self.overlay_items = []
         self.rect_to_overlay = {}
         self.selected_rects.clear()
+        self._refresh_delete_button()
         self.current_tokens = []
 
     def _suggest_label(self, path: Path) -> str:
