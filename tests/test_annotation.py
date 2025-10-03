@@ -142,8 +142,8 @@ def test_back_rewinds_without_reappending_logs():
 
     displayed_paths: list[Path] = []
 
-    def fake_display_item(path: Path) -> None:
-        displayed_paths.append(path)
+    def fake_display_item(item: AnnotationItem) -> None:
+        displayed_paths.append(item.path)
         app.status_var.set("Pre-filled transcription using OCR result.")
 
     app._display_item = fake_display_item
@@ -166,3 +166,89 @@ def test_back_rewinds_without_reappending_logs():
     assert displayed_paths == []
     assert app.back_button.state == annotation.tk.DISABLED
     assert app.status_var.get() == "Already at the first item."
+
+
+def test_confirm_revisit_uses_persisted_metadata(tmp_path):
+    app = AnnotationApp.__new__(AnnotationApp)
+    image_path = tmp_path / "sample.png"
+    Image.new("RGB", (10, 10), "white").save(image_path)
+
+    item = AnnotationItem(image_path)
+    app.items = [item]
+    app.index = 0
+    app.train_dir = tmp_path
+    app.log_path = None
+    app.overlay_entries = []
+    app.current_tokens = []
+
+    class DummyVar:
+        def __init__(self, value: str = "") -> None:
+            self.value = value
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+    class DummyEntry:
+        def __init__(self, text: str = "") -> None:
+            self.text = text
+
+        def focus_set(self) -> None:
+            pass
+
+        def delete(self, *_args, **_kwargs) -> None:
+            self.text = ""
+
+        def insert(self, *_args, **_kwargs) -> None:
+            self.text = _args[1] if len(_args) > 1 else ""
+
+        def get(self, *_args, **_kwargs) -> str:
+            return self.text
+
+    class DummyButton:
+        def __init__(self) -> None:
+            self.state = None
+
+        def config(self, **kwargs) -> None:
+            if "state" in kwargs:
+                self.state = kwargs["state"]
+
+    app.filename_var = DummyVar()
+    app.status_var = DummyVar()
+    app.entry_widget = DummyEntry("confirmed text")
+    app.back_button = DummyButton()
+    app._display_image = lambda *_args, **_kwargs: None
+    app._clear_overlay_entries = lambda: None
+
+    extract_called = False
+
+    def fake_extract(_image):
+        nonlocal extract_called
+        extract_called = True
+        return []
+
+    app._extract_tokens = fake_extract
+    app._compose_text_from_tokens = lambda _tokens: ""
+    app._suggest_label = lambda _path: ""
+
+    saved_destination = tmp_path / "train" / "saved.png"
+    app._save_annotation = lambda *_args, **_kwargs: saved_destination
+    app._append_log = lambda *_args, **_kwargs: None
+    app._advance = lambda: None
+
+    AnnotationApp.confirm(app)
+
+    assert item.label == "confirmed text"
+    assert item.status == "confirmed"
+    assert item.saved_path == saved_destination
+
+    app.entry_widget.text = ""
+
+    AnnotationApp._show_current(app, revisit=True)
+
+    assert AnnotationApp._get_transcription_text(app) == "confirmed text"
+    status_message = app.status_var.get()
+    assert "Previously saved to saved.png" in status_message
+    assert not extract_called
