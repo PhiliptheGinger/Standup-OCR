@@ -975,13 +975,30 @@ class AnnotationApp:
                 handle_target = self.handle_to_overlay.get(current[0])
         if handle_target is not None:
             overlay, corner = handle_target
+            if overlay is None:
+                return
             if overlay.rect_id not in self.selected_rects:
                 self._apply_single_selection(overlay, additive=False)
+            self._start_overlay_interaction(overlay, event)
+            return
+
+        additive = self._event_has_ctrl(event) or self._event_has_shift(event)
+        canvasx = getattr(self.canvas, "canvasx", None)
+        canvasy = getattr(self.canvas, "canvasy", None)
+        canvas_x = canvasx(event.x) if callable(canvasx) else event.x
+        canvas_y = canvasy(event.y) if callable(canvasy) else event.y
+        overlay = self._find_overlay_at(canvas_x, canvas_y)
+        if overlay is not None:
+            self._pressed_overlay = overlay
+            if not additive and overlay.rect_id in self.selected_rects:
                 self._start_overlay_interaction(overlay, event)
-            elif overlay is None:
-                self._marquee_dragging = True
-                if not additive:
-                    self._clear_selection()
+            return
+
+        self._pressed_overlay = None
+        self._marquee_dragging = True
+        self._marquee_additive = additive
+        if not additive:
+            self._clear_selection()
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
         if self._drag_start is None:
