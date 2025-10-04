@@ -72,6 +72,7 @@ class RemovedOverlay:
     token: OcrToken
     text: str
     index: int
+    scale: Tuple[float, float]
 
 
 def prepare_image(path: Path) -> Image.Image:
@@ -767,12 +768,19 @@ class AnnotationApp:
         self._marquee_rect = None
         self._modifier_drag = False
 
-    def _add_overlay_item(self, token: OcrToken, text: str, index: Optional[int] = None) -> None:
+    def _add_overlay_item(
+        self,
+        token: OcrToken,
+        text: str,
+        index: Optional[int] = None,
+        scale: Optional[Tuple[float, float]] = None,
+    ) -> None:
         left, top, right, bottom = token.bbox
-        disp_left = left * self._scale_x
-        disp_top = top * self._scale_y
-        disp_right = right * self._scale_x
-        disp_bottom = bottom * self._scale_y
+        scale_x, scale_y = scale if scale is not None else self.display_scale
+        disp_left = left * scale_x
+        disp_top = top * scale_y
+        disp_right = right * scale_x
+        disp_bottom = bottom * scale_y
 
         rect = self.canvas.create_rectangle(
             disp_left,
@@ -877,7 +885,7 @@ class AnnotationApp:
             item = self.overlay_items[index]
             if not item.selected:
                 continue
-            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index))
+            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index, scale=self.display_scale))
             if item.fade_job is not None:
                 try:
                     self.master.after_cancel(item.fade_job)
@@ -910,7 +918,7 @@ class AnnotationApp:
             return ""
         overlays = self._undo_stack.pop()
         for overlay in overlays:
-            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index, scale=overlay.scale)
         self._update_combined_transcription()
         return "break"
 
@@ -948,12 +956,19 @@ class AnnotationApp:
         if visible and item.fade_job is not None:
             item.fade_job = None
 
-    def _add_overlay_item(self, token: OcrToken, text: str, index: Optional[int] = None) -> None:
+    def _add_overlay_item(
+        self,
+        token: OcrToken,
+        text: str,
+        index: Optional[int] = None,
+        scale: Optional[Tuple[float, float]] = None,
+    ) -> None:
         left, top, right, bottom = token.bbox
-        disp_left = left * self._scale_x
-        disp_top = top * self._scale_y
-        disp_right = right * self._scale_x
-        disp_bottom = bottom * self._scale_y
+        scale_x, scale_y = scale if scale is not None else self.display_scale
+        disp_left = left * scale_x
+        disp_top = top * scale_y
+        disp_right = right * scale_x
+        disp_bottom = bottom * scale_y
 
         rect = self.canvas.create_rectangle(
             disp_left,
@@ -1058,7 +1073,7 @@ class AnnotationApp:
             item = self.overlay_items[index]
             if not item.selected:
                 continue
-            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index))
+            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index, scale=self.display_scale))
             if item.fade_job is not None:
                 try:
                     self.master.after_cancel(item.fade_job)
@@ -1091,7 +1106,7 @@ class AnnotationApp:
             return ""
         overlays = self._undo_stack.pop()
         for overlay in overlays:
-            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index, scale=overlay.scale)
         self._update_combined_transcription()
         return "break"
 
@@ -1129,12 +1144,19 @@ class AnnotationApp:
         if visible and item.fade_job is not None:
             item.fade_job = None
 
-    def _add_overlay_item(self, token: OcrToken, text: str, index: Optional[int] = None) -> None:
+    def _add_overlay_item(
+        self,
+        token: OcrToken,
+        text: str,
+        index: Optional[int] = None,
+        scale: Optional[Tuple[float, float]] = None,
+    ) -> None:
         left, top, right, bottom = token.bbox
-        disp_left = left * self._scale_x
-        disp_top = top * self._scale_y
-        disp_right = right * self._scale_x
-        disp_bottom = bottom * self._scale_y
+        scale_x, scale_y = scale if scale is not None else self.display_scale
+        disp_left = left * scale_x
+        disp_top = top * scale_y
+        disp_right = right * scale_x
+        disp_bottom = bottom * scale_y
 
         rect = self.canvas.create_rectangle(
             disp_left,
@@ -1239,7 +1261,7 @@ class AnnotationApp:
             item = self.overlay_items[index]
             if not item.selected:
                 continue
-            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index))
+            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index, scale=self.display_scale))
             if item.fade_job is not None:
                 try:
                     self.master.after_cancel(item.fade_job)
@@ -1272,7 +1294,7 @@ class AnnotationApp:
             return ""
         overlays = self._undo_stack.pop()
         for overlay in overlays:
-            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index, scale=overlay.scale)
         self._update_combined_transcription()
         return "break"
 
@@ -1310,12 +1332,19 @@ class AnnotationApp:
         if visible and item.fade_job is not None:
             item.fade_job = None
 
-    def _add_overlay_item(self, token: OcrToken, text: str, index: Optional[int] = None) -> None:
+    def _add_overlay_item(
+        self,
+        token: OcrToken,
+        text: str,
+        index: Optional[int] = None,
+        scale: Optional[Tuple[float, float]] = None,
+    ) -> None:
         left, top, right, bottom = token.bbox
-        disp_left = left * self._scale_x
-        disp_top = top * self._scale_y
-        disp_right = right * self._scale_x
-        disp_bottom = bottom * self._scale_y
+        scale_x, scale_y = scale if scale is not None else self.display_scale
+        disp_left = left * scale_x
+        disp_top = top * scale_y
+        disp_right = right * scale_x
+        disp_bottom = bottom * scale_y
 
         rect = self.canvas.create_rectangle(
             disp_left,
@@ -1420,7 +1449,7 @@ class AnnotationApp:
             item = self.overlay_items[index]
             if not item.selected:
                 continue
-            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index))
+            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index, scale=self.display_scale))
             if item.fade_job is not None:
                 try:
                     self.master.after_cancel(item.fade_job)
@@ -1453,7 +1482,7 @@ class AnnotationApp:
             return ""
         overlays = self._undo_stack.pop()
         for overlay in overlays:
-            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index, scale=overlay.scale)
         self._update_combined_transcription()
         return "break"
 
@@ -1491,12 +1520,19 @@ class AnnotationApp:
         if visible and item.fade_job is not None:
             item.fade_job = None
 
-    def _add_overlay_item(self, token: OcrToken, text: str, index: Optional[int] = None) -> None:
+    def _add_overlay_item(
+        self,
+        token: OcrToken,
+        text: str,
+        index: Optional[int] = None,
+        scale: Optional[Tuple[float, float]] = None,
+    ) -> None:
         left, top, right, bottom = token.bbox
-        disp_left = left * self._scale_x
-        disp_top = top * self._scale_y
-        disp_right = right * self._scale_x
-        disp_bottom = bottom * self._scale_y
+        scale_x, scale_y = scale if scale is not None else self.display_scale
+        disp_left = left * scale_x
+        disp_top = top * scale_y
+        disp_right = right * scale_x
+        disp_bottom = bottom * scale_y
 
         rect = self.canvas.create_rectangle(
             disp_left,
@@ -1601,7 +1637,7 @@ class AnnotationApp:
             item = self.overlay_items[index]
             if not item.selected:
                 continue
-            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index))
+            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index, scale=self.display_scale))
             if item.fade_job is not None:
                 try:
                     self.master.after_cancel(item.fade_job)
@@ -1634,7 +1670,7 @@ class AnnotationApp:
             return ""
         overlays = self._undo_stack.pop()
         for overlay in overlays:
-            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index, scale=overlay.scale)
         self._update_combined_transcription()
         return "break"
 
