@@ -660,16 +660,18 @@ class AnnotationApp:
             else:
                 self.store.select_click(overlay_id, additive=True)
             return
-        base_bbox = self._to_base(bbox)
-        overlay_id = self.store.add_manual(base_bbox)
-        self.store.set_status("Added manual overlay")
-        self.store.request_focus(overlay_id)
 
-        if additive:
-            self._drag_mode = "marquee"
-            self._marquee_additive = True
-            self._marquee_rect = self.canvas.create_rectangle(x, y, x, y, outline="#F2994A", dash=(4, 2))
-        else:
+        self._drag_mode = "marquee"
+        self._marquee_additive = additive
+        self._marquee_rect = self.canvas.create_rectangle(
+            x,
+            y,
+            x,
+            y,
+            outline="#F2994A" if additive else "#2F80ED",
+            dash=(4, 2),
+        )
+        if not additive:
             self.store.clear_selection()
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
