@@ -636,8 +636,17 @@ class AnnotationApp:
 
     def _on_canvas_button_press(self, event: tk.Event) -> None:
         if self.mode_var.get() == "zoom":
+            focus = self._canvas_coords(event.x, event.y)
+            zoom_out = (
+                getattr(event, "num", 0) == 3
+                or self._event_has_ctrl(event)
+                or self._event_has_shift(event)
+            )
+            step = self.ZOOM_STEP if not zoom_out else 1 / self.ZOOM_STEP
             self._drag_mode = "zoom"
-            self._drag_start = (event.x, event.y)
+            self._drag_start = focus
+            self._pending_click_id = None
+            self._apply_zoom(self.zoom_factor * step, focus=focus)
             return
 
         x, y = self._canvas_coords(event.x, event.y)
@@ -694,9 +703,7 @@ class AnnotationApp:
         if self._drag_mode == "zoom":
             self._drag_start = None
             self._drag_mode = None
-            return
-
-        if self._drag_mode == "draw":
+        elif self._drag_mode == "draw":
             self._finalize_draw()
         elif self._drag_mode == "marquee":
             self._finalize_marquee()
