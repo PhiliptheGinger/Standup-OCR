@@ -91,6 +91,8 @@ class AnnotationApp:
     MIN_ZOOM = 0.5
     MAX_ZOOM = 3.0
     ZOOM_STEP = 1.1
+    RESIZE_HANDLE = 6
+    MIN_DISPLAY_BOX = 8
 
     def __init__(
         self,
@@ -132,6 +134,12 @@ class AnnotationApp:
         self._marquee_dragging = False
         self._marquee_additive = False
         self._pressed_overlay: Optional[OverlayItem] = None
+        self._dragging_overlay: Optional[OverlayItem] = None
+        self._dragging_mode: Optional[str] = None
+        self._drag_offset: Tuple[float, float] = (0.0, 0.0)
+        self._drag_initial_bbox: Optional[Tuple[float, float, float, float]] = None
+        self._resize_anchor: Optional[Tuple[float, float]] = None
+        self._resize_corner: Optional[str] = None
 
         self.filename_var = tk.StringVar()
         self.status_var = tk.StringVar()
@@ -415,7 +423,10 @@ class AnnotationApp:
         self.current_photo = photo
 
         self._clear_overlay_entries()
-        self._undo_stack.clear()
+        if not hasattr(self, "_undo_stack"):
+            self._undo_stack = []
+        else:
+            self._undo_stack.clear()
         self.canvas.delete("all")
         self.overlay_items = []
         self.overlay_entries = []
@@ -427,8 +438,10 @@ class AnnotationApp:
         self.canvas.config(
             scrollregion=(0, 0, self._base_display_image.width, self._base_display_image.height)
         )
-        self.canvas.xview_moveto(0)
-        self.canvas.yview_moveto(0)
+        if hasattr(self.canvas, "xview_moveto"):
+            self.canvas.xview_moveto(0)
+        if hasattr(self.canvas, "yview_moveto"):
+            self.canvas.yview_moveto(0)
         self.canvas.focus_set()
 
         for token in tokens:
@@ -518,6 +531,160 @@ class AnnotationApp:
             int(round(right * inv_x)),
             int(round(bottom * inv_y)),
         )
+
+    def _get_display_bounds(self) -> Tuple[float, float]:
+        if self._base_display_image is None:
+            return (0.0, 0.0)
+        width, height = self._base_display_image.size
+        return (width * self.zoom_factor, height * self.zoom_factor)
+
+    def _update_overlay_display(
+        self, overlay: OverlayItem, bbox: Tuple[float, float, float, float]
+    ) -> None:
+        left, top, right, bottom = bbox
+        try:
+            self.canvas.coords(overlay.rect_id, left, top, right, bottom)
+        except tk.TclError:
+            return
+        width = max(4, int(max(1, abs(right - left)) / 8))
+        try:
+            overlay.entry.configure(width=width)
+        except tk.TclError:
+            pass
+        desired_top = top - 24
+        if desired_top < 0:
+            desired_top = top
+        try:
+            self.canvas.coords(overlay.window_id, left, desired_top)
+        except tk.TclError:
+            pass
+
+    def _determine_resize_corner(
+        self, bbox: Tuple[float, float, float, float], x: float, y: float
+    ) -> Optional[str]:
+        left, top, right, bottom = bbox
+        handle = self.RESIZE_HANDLE
+        if abs(x - left) <= handle and abs(y - top) <= handle:
+            return "nw"
+        if abs(x - right) <= handle and abs(y - top) <= handle:
+            return "ne"
+        if abs(x - left) <= handle and abs(y - bottom) <= handle:
+            return "sw"
+        if abs(x - right) <= handle and abs(y - bottom) <= handle:
+            return "se"
+        return None
+
+    def _start_overlay_interaction(self, overlay: OverlayItem, event: tk.Event) -> None:
+        coords = self.canvas.coords(overlay.rect_id)
+        if len(coords) != 4:
+            return
+        left, top, right, bottom = coords
+        corner = self._determine_resize_corner((left, top, right, bottom), event.x, event.y)
+        if corner is not None:
+            self._dragging_mode = "resize"
+            self._resize_corner = corner
+            if corner == "nw":
+                self._resize_anchor = (right, bottom)
+            elif corner == "ne":
+                self._resize_anchor = (left, bottom)
+            elif corner == "sw":
+                self._resize_anchor = (right, top)
+            else:
+                self._resize_anchor = (left, top)
+        else:
+            self._dragging_mode = "move"
+            self._drag_offset = (event.x - left, event.y - top)
+            self._resize_anchor = None
+            self._resize_corner = None
+        self._dragging_overlay = overlay
+        self._drag_initial_bbox = (left, top, right, bottom)
+        self._pressed_overlay = None
+
+    def _drag_overlay(self, event: tk.Event) -> None:
+        if self._dragging_overlay is None or self._dragging_mode is None:
+            return
+        overlay = self._dragging_overlay
+        if self._drag_initial_bbox is None:
+            return
+        left, top, right, bottom = self._drag_initial_bbox
+        max_width, max_height = self._get_display_bounds()
+        min_size = self.MIN_DISPLAY_BOX
+        if self._dragging_mode == "move":
+            width = right - left
+            height = bottom - top
+            new_left = event.x - self._drag_offset[0]
+            new_top = event.y - self._drag_offset[1]
+            if max_width > 0:
+                new_left = max(0.0, min(new_left, max_width - width))
+            if max_height > 0:
+                new_top = max(0.0, min(new_top, max_height - height))
+            new_right = new_left + width
+            new_bottom = new_top + height
+        else:
+            if self._resize_anchor is None or self._resize_corner is None:
+                return
+            anchor_x, anchor_y = self._resize_anchor
+            new_right = right
+            new_left = left
+            new_top = top
+            new_bottom = bottom
+            if self._resize_corner == "nw":
+                new_right = anchor_x
+                new_bottom = anchor_y
+                new_left = min(event.x, new_right - min_size)
+                new_top = min(event.y, new_bottom - min_size)
+            elif self._resize_corner == "ne":
+                new_left = anchor_x
+                new_bottom = anchor_y
+                new_right = max(event.x, new_left + min_size)
+                new_top = min(event.y, new_bottom - min_size)
+            elif self._resize_corner == "sw":
+                new_right = anchor_x
+                new_top = anchor_y
+                new_left = min(event.x, new_right - min_size)
+                new_bottom = max(event.y, new_top + min_size)
+            else:  # "se"
+                new_left = anchor_x
+                new_top = anchor_y
+                new_right = max(event.x, new_left + min_size)
+                new_bottom = max(event.y, new_top + min_size)
+            if max_width > 0:
+                new_left = max(0.0, new_left)
+                new_right = min(max_width, new_right)
+                if new_right - new_left < min_size:
+                    if self._resize_corner in ("nw", "sw"):
+                        new_left = new_right - min_size
+                    else:
+                        new_right = new_left + min_size
+                    new_left = max(0.0, new_left)
+                    new_right = min(max_width, new_right)
+            if max_height > 0:
+                new_top = max(0.0, new_top)
+                new_bottom = min(max_height, new_bottom)
+                if new_bottom - new_top < min_size:
+                    if self._resize_corner in ("nw", "ne"):
+                        new_top = new_bottom - min_size
+                    else:
+                        new_bottom = new_top + min_size
+                    new_top = max(0.0, new_top)
+                    new_bottom = min(max_height, new_bottom)
+        self._update_overlay_display(overlay, (new_left, new_top, new_right, new_bottom))
+
+    def _finalize_overlay_drag(self) -> None:
+        if self._dragging_overlay is None:
+            return
+        overlay = self._dragging_overlay
+        coords = self.canvas.coords(overlay.rect_id)
+        if len(coords) == 4:
+            left, top, right, bottom = coords
+            base_bbox = self._display_to_base_bbox((left, top, right, bottom))
+            overlay.token.bbox = base_bbox
+        self._dragging_overlay = None
+        self._dragging_mode = None
+        self._drag_initial_bbox = None
+        self._drag_offset = (0.0, 0.0)
+        self._resize_anchor = None
+        self._resize_corner = None
 
     def _next_manual_keys(self) -> Tuple[TokenOrder, LineKey]:
         self.manual_token_counter += 1
@@ -694,6 +861,11 @@ class AnnotationApp:
         self._marquee_rect = None
         self._marquee_dragging = False
         self._marquee_additive = False
+        self._dragging_overlay = None
+        self._dragging_mode = None
+        self._drag_initial_bbox = None
+        self._resize_anchor = None
+        self._resize_corner = None
         mode = self._get_mode()
         if mode == "draw":
             self._active_temp_rect = self.canvas.create_rectangle(
@@ -712,6 +884,7 @@ class AnnotationApp:
             self._pressed_overlay = overlay
             if overlay is not None and not additive:
                 self._apply_single_selection(overlay, additive=False)
+                self._start_overlay_interaction(overlay, event)
             elif overlay is None:
                 self._marquee_dragging = True
                 if not additive:
@@ -741,6 +914,9 @@ class AnnotationApp:
                     event.y,
                 )
         else:
+            if self._dragging_overlay is not None:
+                self._drag_overlay(event)
+                return
             if not self._marquee_dragging:
                 return
             if self._marquee_rect is None:
@@ -778,7 +954,9 @@ class AnnotationApp:
                         self._update_combined_transcription()
             self._active_temp_rect = None
         else:
-            if self._marquee_rect is not None:
+            if self._dragging_overlay is not None:
+                self._finalize_overlay_drag()
+            elif self._marquee_rect is not None:
                 coords = self.canvas.coords(self._marquee_rect)
                 self.canvas.delete(self._marquee_rect)
                 if len(coords) == 4:
