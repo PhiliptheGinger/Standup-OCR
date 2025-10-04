@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover - fallback when running as script
 
 
 TokenOrder = Tuple[int, int, int, int, int]
-LineKey = Tuple[int, int, int]
+LineKey = Tuple[int, int, int, int]
 
 CONTROL_MASK = 0x0004
 SHIFT_MASK = 0x0001
@@ -1199,7 +1199,7 @@ class AnnotationApp:
 
             bbox = (left, top, left + width, top + height)
             order_key: TokenOrder = (page, block, paragraph, line, word)
-            line_key: LineKey = (page, block, line)
+            line_key: LineKey = (page, block, paragraph, line)
             tokens.append(OcrToken(text=text, bbox=bbox, order_key=order_key, line_key=line_key))
 
         tokens.sort(key=lambda token: token.order_key)
