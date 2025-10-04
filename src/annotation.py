@@ -956,6 +956,186 @@ class AnnotationApp:
         if visible and item.fade_job is not None:
             item.fade_job = None
 
+    def _add_overlay_item(self, token: OcrToken, text: str, index: Optional[int] = None) -> None:
+        left, top, right, bottom = token.bbox
+        disp_left = left * self._scale_x
+        disp_top = top * self._scale_y
+        disp_right = right * self._scale_x
+        disp_bottom = bottom * self._scale_y
+
+        rect = self.canvas.create_rectangle(
+            disp_left,
+            disp_top,
+            disp_right,
+            disp_bottom,
+            outline="#2F80ED",
+            width=1,
+            tags="overlay",
+        )
+        self.canvas.tag_raise(rect)
+
+        entry_width = max(4, int((disp_right - disp_left) / 8))
+        entry = tk.Entry(self.canvas, width=entry_width)
+        if text:
+            entry.insert(0, text)
+        entry.bind("<KeyRelease>", self._on_overlay_modified)
+        entry.bind("<Button-1>", lambda event, item_token=token: self._focus_overlay_by_token(item_token))
+        entry.bind("<FocusIn>", lambda event, token=token: self._focus_overlay_by_token(token))
+        entry.bind("<Enter>", lambda event, token=token: self._on_overlay_enter(token))
+        entry.bind("<Leave>", lambda event, token=token: self._on_overlay_leave(token))
+
+        desired_top = disp_top - 24
+        if desired_top < 0:
+            desired_top = disp_top
+
+        window_id = self.canvas.create_window(
+            disp_left,
+            desired_top,
+            anchor="nw",
+            window=entry,
+            tags="overlay",
+        )
+        self.canvas.tag_raise(window_id)
+
+        item = OverlayItem(token=token, rect_id=rect, window_id=window_id, entry=entry)
+        self.canvas.tag_bind(rect, "<Button-1>", lambda event, token=token: self._on_overlay_click(event, token))
+        self.canvas.tag_bind(rect, "<Enter>", lambda event, token=token: self._on_overlay_enter(token))
+        self.canvas.tag_bind(rect, "<Leave>", lambda event, token=token: self._on_overlay_leave(token))
+
+        if index is None or index >= len(self.overlay_items):
+            self.overlay_items.append(item)
+            self.current_tokens.append(token)
+        else:
+            self.overlay_items.insert(index, item)
+            self.current_tokens.insert(index, token)
+
+    def _focus_overlay_by_token(self, token: OcrToken) -> None:
+        item = self._find_overlay(token)
+        if item is None:
+            return
+        self._select_overlay(item, additive=False)
+        self._set_entry_visibility(item, True)
+
+    def _find_overlay(self, token: OcrToken) -> Optional[OverlayItem]:
+        for item in self.overlay_items:
+            if item.token is token:
+                return item
+        return None
+
+    def _on_overlay_click(self, event: tk.Event, token: OcrToken) -> None:
+        item = self._find_overlay(token)
+        if item is None:
+            return
+        ctrl = bool(event.state & 0x0004)
+        shift = bool(event.state & 0x0001)
+        additive = ctrl or shift
+        if additive and item.selected:
+            self._set_overlay_selected(item, False)
+        else:
+            self._select_overlay(item, additive=additive)
+        self._set_entry_visibility(item, True)
+        item.entry.focus_set()
+
+    def _select_overlay(self, target: OverlayItem, additive: bool = False) -> None:
+        if not additive:
+            for item in self.overlay_items:
+                if item.selected:
+                    self._set_overlay_selected(item, False)
+        self._set_overlay_selected(target, True)
+
+    def _set_overlay_selected(self, item: OverlayItem, value: bool) -> None:
+        item.selected = value
+        outline = "#F2994A" if value else "#2F80ED"
+        width = 2 if value else 1
+        try:
+            self.canvas.itemconfigure(item.rect_id, outline=outline, width=width)
+        except tk.TclError:
+            pass
+        if value:
+            self._set_entry_visibility(item, True)
+
+    def _on_delete_selected(self, event: Optional[tk.Event]) -> str:
+        if self._delete_selected_overlays():
+            return "break"
+        return ""
+
+    def _delete_selected_overlays(self) -> bool:
+        removed: list[RemovedOverlay] = []
+        for index in reversed(range(len(self.overlay_items))):
+            item = self.overlay_items[index]
+            if not item.selected:
+                continue
+            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index))
+            if item.fade_job is not None:
+                try:
+                    self.master.after_cancel(item.fade_job)
+                except tk.TclError:
+                    pass
+                item.fade_job = None
+            try:
+                self.canvas.delete(item.rect_id)
+                self.canvas.delete(item.window_id)
+            except tk.TclError:
+                pass
+            try:
+                item.entry.destroy()
+            except tk.TclError:
+                pass
+            del self.overlay_items[index]
+            del self.current_tokens[index]
+
+        if not removed:
+            return False
+
+        # Maintain original order for undo restoration.
+        removed.sort(key=lambda overlay: overlay.index)
+        self._undo_stack.append(removed)
+        self._update_combined_transcription()
+        return True
+
+    def _on_undo(self, event: Optional[tk.Event]) -> str:
+        if not self._undo_stack:
+            return ""
+        overlays = self._undo_stack.pop()
+        for overlay in overlays:
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
+        self._update_combined_transcription()
+        return "break"
+
+    def _on_overlay_enter(self, token: OcrToken) -> None:
+        item = self._find_overlay(token)
+        if item is None or item.selected:
+            return
+        if item.fade_job is not None:
+            try:
+                self.master.after_cancel(item.fade_job)
+            except tk.TclError:
+                pass
+        item.fade_job = self.master.after(
+            self.FADE_DELAY_MS, lambda item=item: self._set_entry_visibility(item, False)
+        )
+
+    def _on_overlay_leave(self, token: OcrToken) -> None:
+        item = self._find_overlay(token)
+        if item is None:
+            return
+        if item.fade_job is not None:
+            try:
+                self.master.after_cancel(item.fade_job)
+            except tk.TclError:
+                pass
+            item.fade_job = None
+        self._set_entry_visibility(item, True)
+
+    def _set_entry_visibility(self, item: OverlayItem, visible: bool) -> None:
+        try:
+            state = "normal" if visible else "hidden"
+            self.canvas.itemconfigure(item.window_id, state=state)
+        except tk.TclError:
+            pass
+        if visible and item.fade_job is not None:
+            item.fade_job = None
+
     def _extract_tokens(self, image: Image.Image) -> List[OcrToken]:
         ocr_image: Optional[Image.Image] = None
         try:
