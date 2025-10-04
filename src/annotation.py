@@ -126,6 +126,7 @@ class AnnotationApp:
         self.overlay_items: list[OverlayBox] = []
         self.rect_to_overlay: Dict[int, OverlayBox] = {}
         self.selected_rects: Set[int] = set()
+        self._undo_stack: list[list[RemovedOverlay]] = []
         self.current_tokens: list[OcrToken] = []
         self.display_scale: Tuple[float, float] = (1.0, 1.0)
         self.manual_token_counter = 0
