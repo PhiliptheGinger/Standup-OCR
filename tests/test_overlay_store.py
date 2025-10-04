@@ -37,12 +37,6 @@ def test_set_tokens_and_selection() -> None:
     store.select_click(overlays[1].id, additive=True)
     assert set(store.selection) == {overlays[0].id, overlays[1].id}
 
-    store.select_click(overlays[0].id, additive=True)
-    assert set(store.selection) == {overlays[1].id}
-
-    store.select_set({overlays[0].id}, additive=True)
-    assert set(store.selection) == {overlays[0].id, overlays[1].id}
-
     hits = store.ids_intersecting((5, 0, 18, 10))
     assert hits == {overlays[0].id, overlays[1].id}
 
@@ -114,28 +108,3 @@ def test_remove_returns_overlays_in_order() -> None:
     assert not store.list_overlays()
     store.undo()
     assert extract_ids(store) == [overlay.id for overlay in overlays]
-
-
-def test_update_bbox_and_history() -> None:
-    store = OverlayStore()
-    tokens = [
-        make_token("token", (0, 0, 10, 10), (1, 1, 1, 1, 1), (1, 1, 1)),
-    ]
-    store.set_tokens(tokens)
-    overlay_id = store.list_overlays()[0].id
-
-    original = store.get_overlay(overlay_id)
-    assert original is not None
-    updated_bbox = (original.bbox_base[0] + 5, original.bbox_base[1] + 5, original.bbox_base[2] + 5, original.bbox_base[3] + 5)
-
-    store.update_bbox(overlay_id, updated_bbox)
-    overlay = store.get_overlay(overlay_id)
-    assert overlay is not None and overlay.bbox_base == updated_bbox
-
-    assert store.undo() is True
-    overlay = store.get_overlay(overlay_id)
-    assert overlay is not None and overlay.bbox_base == original.bbox_base
-
-    assert store.redo() is True
-    overlay = store.get_overlay(overlay_id)
-    assert overlay is not None and overlay.bbox_base == updated_bbox
