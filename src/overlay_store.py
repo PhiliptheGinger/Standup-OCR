@@ -432,4 +432,5 @@ __all__ = [
     "RemoveOverlays",
     "UpdateOverlayText",
     "SetSelection",
+    "UpdateOverlayBounds",
 ]

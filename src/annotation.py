@@ -656,6 +656,10 @@ class AnnotationApp:
             else:
                 self.store.select_click(overlay_id, additive=True)
             return
+        base_bbox = self._to_base(bbox)
+        overlay_id = self.store.add_manual(base_bbox)
+        self.store.set_status("Added manual overlay")
+        self.store.request_focus(overlay_id)
 
         if additive:
             self._drag_mode = "marquee"
