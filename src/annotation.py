@@ -76,6 +76,15 @@ class RemovedOverlay:
     scale: Tuple[float, float]
 
 
+@dataclass
+class UndoAction:
+    """Describe an undoable change that can be replayed."""
+
+    kind: str
+    overlays: list[RemovedOverlay] = field(default_factory=list)
+    transforms: list[Tuple[OcrToken, Tuple[int, int, int, int]]] = field(default_factory=list)
+
+
 def prepare_image(path: Path) -> Image.Image:
     """Open ``path`` and apply EXIF-based orientation for consistent display."""
 
@@ -123,7 +132,7 @@ class AnnotationApp:
         self.rect_to_overlay: Dict[int, OverlayItem] = {}
         self.selected_rects: Set[int] = set()
         self.handle_to_overlay: Dict[int, Tuple[OverlayItem, str]] = {}
-        self._undo_stack: list[list[RemovedOverlay]] = []
+        self._undo_stack: list[UndoAction] = []
         self.current_tokens: list[OcrToken] = []
         self.display_scale: Tuple[float, float] = (1.0, 1.0)
         self._base_display_image: Optional[Image.Image] = None
@@ -142,6 +151,7 @@ class AnnotationApp:
         self._drag_initial_bbox: Optional[Tuple[float, float, float, float]] = None
         self._resize_anchor: Optional[Tuple[float, float]] = None
         self._resize_corner: Optional[str] = None
+        self._drag_original_bbox: Optional[Tuple[int, int, int, int]] = None
 
         self.filename_var = tk.StringVar()
         self.status_var = tk.StringVar()
@@ -536,6 +546,16 @@ class AnnotationApp:
             int(round(bottom * inv_y)),
         )
 
+    def _base_to_display_bbox(self, bbox: Tuple[int, int, int, int]) -> Tuple[float, float, float, float]:
+        scale_x, scale_y = self.display_scale
+        left, top, right, bottom = bbox
+        return (
+            left * scale_x,
+            top * scale_y,
+            right * scale_x,
+            bottom * scale_y,
+        )
+
     def _get_display_bounds(self) -> Tuple[float, float]:
         if self._base_display_image is None:
             return (0.0, 0.0)
@@ -562,6 +582,7 @@ class AnnotationApp:
             self.canvas.coords(overlay.window_id, left, desired_top)
         except tk.TclError:
             pass
+        self._position_overlay_handles(overlay, (left, top, right, bottom))
 
     def _determine_resize_corner(
         self, bbox: Tuple[float, float, float, float], x: float, y: float
@@ -602,6 +623,7 @@ class AnnotationApp:
             self._resize_corner = None
         self._dragging_overlay = overlay
         self._drag_initial_bbox = (left, top, right, bottom)
+        self._drag_original_bbox = overlay.token.bbox
         self._pressed_overlay = None
 
     def _drag_overlay(self, event: tk.Event) -> None:
@@ -679,16 +701,22 @@ class AnnotationApp:
             return
         overlay = self._dragging_overlay
         coords = self.canvas.coords(overlay.rect_id)
+        original_bbox = self._drag_original_bbox
         if len(coords) == 4:
             left, top, right, bottom = coords
             base_bbox = self._display_to_base_bbox((left, top, right, bottom))
+            if original_bbox is not None and base_bbox != original_bbox:
+                action = UndoAction(kind="transform", transforms=[(overlay.token, original_bbox)])
+                self._undo_stack.append(action)
             overlay.token.bbox = base_bbox
+            self._position_overlay_handles(overlay, (left, top, right, bottom))
         self._dragging_overlay = None
         self._dragging_mode = None
         self._drag_initial_bbox = None
         self._drag_offset = (0.0, 0.0)
         self._resize_anchor = None
         self._resize_corner = None
+        self._drag_original_bbox = None
 
     def _next_manual_keys(self) -> Tuple[TokenOrder, LineKey]:
         self.manual_token_counter += 1
@@ -947,6 +975,7 @@ class AnnotationApp:
         self._drag_initial_bbox = None
         self._resize_anchor = None
         self._resize_corner = None
+        self._drag_original_bbox = None
         mode = self._get_mode()
         if mode == "zoom":
             step = self.ZOOM_STEP
@@ -1319,6 +1348,7 @@ class AnnotationApp:
                 except tk.TclError:
                     pass
                 item.fade_job = None
+            self._hide_overlay_handles(item)
             try:
                 self.canvas.delete(item.rect_id)
                 self.canvas.delete(item.window_id)
@@ -1328,6 +1358,7 @@ class AnnotationApp:
                 item.entry.destroy()
             except tk.TclError:
                 pass
+            self.rect_to_overlay.pop(item.rect_id, None)
             del self.overlay_items[index]
             del self.current_tokens[index]
 
@@ -1336,16 +1367,28 @@ class AnnotationApp:
 
         # Maintain original order for undo restoration.
         removed.sort(key=lambda overlay: overlay.index)
-        self._undo_stack.append(removed)
+        self._undo_stack.append(UndoAction(kind="delete", overlays=removed))
         self._update_combined_transcription()
         return True
 
     def _on_undo(self, event: Optional[tk.Event]) -> str:
         if not self._undo_stack:
             return ""
-        overlays = self._undo_stack.pop()
-        for overlay in overlays:
-            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
+        action = self._undo_stack.pop()
+        if action.kind == "delete":
+            for overlay in action.overlays:
+                self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
+        elif action.kind == "transform":
+            for token, bbox in action.transforms:
+                token.bbox = bbox
+                overlay = self._find_overlay(token)
+                if overlay is None:
+                    continue
+                disp_left, disp_top, disp_right, disp_bottom = self._base_to_display_bbox(bbox)
+                self._update_overlay_display(
+                    overlay,
+                    (disp_left, disp_top, disp_right, disp_bottom),
+                )
         self._update_combined_transcription()
         return "break"
 
