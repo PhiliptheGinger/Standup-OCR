@@ -6,7 +6,7 @@ import logging
 import re
 import threading
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -63,6 +63,7 @@ class OverlayItem:
     is_manual: bool = False
     selected: bool = False
     fade_job: Optional[str] = None
+    handles: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -91,6 +92,8 @@ class AnnotationApp:
     MIN_ZOOM = 0.5
     MAX_ZOOM = 3.0
     ZOOM_STEP = 1.1
+    RESIZE_HANDLE = 6
+    MIN_DISPLAY_BOX = 8
 
     def __init__(
         self,
@@ -119,6 +122,7 @@ class AnnotationApp:
         self.overlay_items: list[OverlayItem] = []
         self.rect_to_overlay: Dict[int, OverlayItem] = {}
         self.selected_rects: Set[int] = set()
+        self.handle_to_overlay: Dict[int, Tuple[OverlayItem, str]] = {}
         self._undo_stack: list[list[RemovedOverlay]] = []
         self.current_tokens: list[OcrToken] = []
         self.display_scale: Tuple[float, float] = (1.0, 1.0)
@@ -132,6 +136,12 @@ class AnnotationApp:
         self._marquee_dragging = False
         self._marquee_additive = False
         self._pressed_overlay: Optional[OverlayItem] = None
+        self._dragging_overlay: Optional[OverlayItem] = None
+        self._dragging_mode: Optional[str] = None
+        self._drag_offset: Tuple[float, float] = (0.0, 0.0)
+        self._drag_initial_bbox: Optional[Tuple[float, float, float, float]] = None
+        self._resize_anchor: Optional[Tuple[float, float]] = None
+        self._resize_corner: Optional[str] = None
 
         self.filename_var = tk.StringVar()
         self.status_var = tk.StringVar()
@@ -204,6 +214,8 @@ class AnnotationApp:
         select_btn.pack(side="left")
         draw_btn = tk.Radiobutton(toolbar, text="Draw", variable=self.mode_var, value="draw")
         draw_btn.pack(side="left", padx=(8, 0))
+        zoom_btn = tk.Radiobutton(toolbar, text="Zoom", variable=self.mode_var, value="zoom")
+        zoom_btn.pack(side="left", padx=(8, 0))
 
         delete_btn = tk.Button(toolbar, text="Delete Selected", command=self._delete_selected, state=tk.DISABLED)
         delete_btn.pack(side="left", padx=(16, 0))
@@ -415,7 +427,10 @@ class AnnotationApp:
         self.current_photo = photo
 
         self._clear_overlay_entries()
-        self._undo_stack.clear()
+        if not hasattr(self, "_undo_stack"):
+            self._undo_stack = []
+        else:
+            self._undo_stack.clear()
         self.canvas.delete("all")
         self.overlay_items = []
         self.overlay_entries = []
@@ -427,8 +442,10 @@ class AnnotationApp:
         self.canvas.config(
             scrollregion=(0, 0, self._base_display_image.width, self._base_display_image.height)
         )
-        self.canvas.xview_moveto(0)
-        self.canvas.yview_moveto(0)
+        if hasattr(self.canvas, "xview_moveto"):
+            self.canvas.xview_moveto(0)
+        if hasattr(self.canvas, "yview_moveto"):
+            self.canvas.yview_moveto(0)
         self.canvas.focus_set()
 
         for token in tokens:
@@ -519,6 +536,166 @@ class AnnotationApp:
             int(round(bottom * inv_y)),
         )
 
+    def _get_display_bounds(self) -> Tuple[float, float]:
+        if self._base_display_image is None:
+            return (0.0, 0.0)
+        width, height = self._base_display_image.size
+        return (width * self.zoom_factor, height * self.zoom_factor)
+
+    def _update_overlay_display(
+        self, overlay: OverlayItem, bbox: Tuple[float, float, float, float]
+    ) -> None:
+        left, top, right, bottom = bbox
+        try:
+            self.canvas.coords(overlay.rect_id, left, top, right, bottom)
+        except tk.TclError:
+            return
+        width = max(4, int(max(1, abs(right - left)) / 8))
+        try:
+            overlay.entry.configure(width=width)
+        except tk.TclError:
+            pass
+        desired_top = top - 24
+        if desired_top < 0:
+            desired_top = top
+        try:
+            self.canvas.coords(overlay.window_id, left, desired_top)
+        except tk.TclError:
+            pass
+        self._position_overlay_handles(overlay, (left, top, right, bottom))
+
+    def _determine_resize_corner(
+        self, bbox: Tuple[float, float, float, float], x: float, y: float
+    ) -> Optional[str]:
+        left, top, right, bottom = bbox
+        handle = self.RESIZE_HANDLE
+        if abs(x - left) <= handle and abs(y - top) <= handle:
+            return "nw"
+        if abs(x - right) <= handle and abs(y - top) <= handle:
+            return "ne"
+        if abs(x - left) <= handle and abs(y - bottom) <= handle:
+            return "sw"
+        if abs(x - right) <= handle and abs(y - bottom) <= handle:
+            return "se"
+        return None
+
+    def _start_overlay_interaction(
+        self, overlay: OverlayItem, event: tk.Event, corner_override: Optional[str] = None
+    ) -> None:
+        coords = self.canvas.coords(overlay.rect_id)
+        if len(coords) != 4:
+            return
+        left, top, right, bottom = coords
+        if corner_override is not None:
+            corner = corner_override
+        else:
+            corner = self._determine_resize_corner((left, top, right, bottom), event.x, event.y)
+        if corner is not None:
+            self._dragging_mode = "resize"
+            self._resize_corner = corner
+            if corner == "nw":
+                self._resize_anchor = (right, bottom)
+            elif corner == "ne":
+                self._resize_anchor = (left, bottom)
+            elif corner == "sw":
+                self._resize_anchor = (right, top)
+            else:
+                self._resize_anchor = (left, top)
+        else:
+            self._dragging_mode = "move"
+            self._drag_offset = (event.x - left, event.y - top)
+            self._resize_anchor = None
+            self._resize_corner = None
+        self._dragging_overlay = overlay
+        self._drag_initial_bbox = (left, top, right, bottom)
+        self._pressed_overlay = None
+
+    def _drag_overlay(self, event: tk.Event) -> None:
+        if self._dragging_overlay is None or self._dragging_mode is None:
+            return
+        overlay = self._dragging_overlay
+        if self._drag_initial_bbox is None:
+            return
+        left, top, right, bottom = self._drag_initial_bbox
+        max_width, max_height = self._get_display_bounds()
+        min_size = self.MIN_DISPLAY_BOX
+        if self._dragging_mode == "move":
+            width = right - left
+            height = bottom - top
+            new_left = event.x - self._drag_offset[0]
+            new_top = event.y - self._drag_offset[1]
+            if max_width > 0:
+                new_left = max(0.0, min(new_left, max_width - width))
+            if max_height > 0:
+                new_top = max(0.0, min(new_top, max_height - height))
+            new_right = new_left + width
+            new_bottom = new_top + height
+        else:
+            if self._resize_anchor is None or self._resize_corner is None:
+                return
+            anchor_x, anchor_y = self._resize_anchor
+            new_right = right
+            new_left = left
+            new_top = top
+            new_bottom = bottom
+            if self._resize_corner == "nw":
+                new_right = anchor_x
+                new_bottom = anchor_y
+                new_left = min(event.x, new_right - min_size)
+                new_top = min(event.y, new_bottom - min_size)
+            elif self._resize_corner == "ne":
+                new_left = anchor_x
+                new_bottom = anchor_y
+                new_right = max(event.x, new_left + min_size)
+                new_top = min(event.y, new_bottom - min_size)
+            elif self._resize_corner == "sw":
+                new_right = anchor_x
+                new_top = anchor_y
+                new_left = min(event.x, new_right - min_size)
+                new_bottom = max(event.y, new_top + min_size)
+            else:  # "se"
+                new_left = anchor_x
+                new_top = anchor_y
+                new_right = max(event.x, new_left + min_size)
+                new_bottom = max(event.y, new_top + min_size)
+            if max_width > 0:
+                new_left = max(0.0, new_left)
+                new_right = min(max_width, new_right)
+                if new_right - new_left < min_size:
+                    if self._resize_corner in ("nw", "sw"):
+                        new_left = new_right - min_size
+                    else:
+                        new_right = new_left + min_size
+                    new_left = max(0.0, new_left)
+                    new_right = min(max_width, new_right)
+            if max_height > 0:
+                new_top = max(0.0, new_top)
+                new_bottom = min(max_height, new_bottom)
+                if new_bottom - new_top < min_size:
+                    if self._resize_corner in ("nw", "ne"):
+                        new_top = new_bottom - min_size
+                    else:
+                        new_bottom = new_top + min_size
+                    new_top = max(0.0, new_top)
+                    new_bottom = min(max_height, new_bottom)
+        self._update_overlay_display(overlay, (new_left, new_top, new_right, new_bottom))
+
+    def _finalize_overlay_drag(self) -> None:
+        if self._dragging_overlay is None:
+            return
+        overlay = self._dragging_overlay
+        coords = self.canvas.coords(overlay.rect_id)
+        if len(coords) == 4:
+            left, top, right, bottom = coords
+            base_bbox = self._display_to_base_bbox((left, top, right, bottom))
+            overlay.token.bbox = base_bbox
+        self._dragging_overlay = None
+        self._dragging_mode = None
+        self._drag_initial_bbox = None
+        self._drag_offset = (0.0, 0.0)
+        self._resize_anchor = None
+        self._resize_corner = None
+
     def _next_manual_keys(self) -> Tuple[TokenOrder, LineKey]:
         self.manual_token_counter += 1
         index = self.manual_token_counter
@@ -561,6 +738,81 @@ class AnnotationApp:
             self.canvas.itemconfigure(overlay.rect_id, outline=outline, width=width)
         except tk.TclError:
             return
+        if selected:
+            self._show_overlay_handles(overlay)
+        else:
+            self._hide_overlay_handles(overlay)
+
+    def _show_overlay_handles(self, overlay: OverlayItem) -> None:
+        if not hasattr(self, "handle_to_overlay"):
+            self.handle_to_overlay = {}
+        coords = self.canvas.coords(overlay.rect_id)
+        if len(coords) != 4:
+            return
+        left, top, right, bottom = coords
+        if not overlay.handles:
+            overlay.handles = {}
+            for corner in ("nw", "ne", "sw", "se"):
+                try:
+                    handle_id = self.canvas.create_rectangle(
+                        0,
+                        0,
+                        0,
+                        0,
+                        outline="white",
+                        fill="#F2994A",
+                        width=1,
+                        tags=("overlay-handle",),
+                    )
+                except tk.TclError:
+                    return
+                overlay.handles[corner] = handle_id
+                self.handle_to_overlay[handle_id] = (overlay, corner)
+        self._position_overlay_handles(overlay, (left, top, right, bottom))
+        for handle_id in overlay.handles.values():
+            try:
+                self.canvas.itemconfigure(handle_id, state="normal")
+                self.canvas.tag_raise(handle_id)
+            except tk.TclError:
+                continue
+
+    def _hide_overlay_handles(self, overlay: OverlayItem) -> None:
+        mapping = getattr(self, "handle_to_overlay", None)
+        for handle_id in overlay.handles.values():
+            try:
+                self.canvas.delete(handle_id)
+            except tk.TclError:
+                pass
+            if mapping is not None:
+                mapping.pop(handle_id, None)
+        overlay.handles.clear()
+
+    def _position_overlay_handles(
+        self, overlay: OverlayItem, coords: Optional[Tuple[float, float, float, float]] = None
+    ) -> None:
+        if not overlay.handles:
+            return
+        if coords is None:
+            coords = self.canvas.coords(overlay.rect_id)
+        if len(coords) != 4:
+            return
+        left, top, right, bottom = coords
+        radius = max(4, int(self.RESIZE_HANDLE))
+        positions = {
+            "nw": (left, top),
+            "ne": (right, top),
+            "sw": (left, bottom),
+            "se": (right, bottom),
+        }
+        for corner, (x, y) in positions.items():
+            handle_id = overlay.handles.get(corner)
+            if handle_id is None:
+                continue
+            try:
+                self.canvas.coords(handle_id, x - radius, y - radius, x + radius, y + radius)
+                self.canvas.tag_raise(handle_id)
+            except tk.TclError:
+                continue
 
     def _clear_selection(self) -> None:
         for rect in list(self.selected_rects):
@@ -604,6 +856,7 @@ class AnnotationApp:
         self._update_combined_transcription()
 
     def _remove_overlay(self, overlay: OverlayItem) -> None:
+        self._hide_overlay_handles(overlay)
         try:
             overlay.entry.destroy()
         except tk.TclError:
@@ -691,10 +944,26 @@ class AnnotationApp:
         self.canvas.focus_set()
         self._drag_start = (event.x, event.y)
         self._active_temp_rect = None
+        self._pressed_overlay = None
         self._marquee_rect = None
         self._marquee_dragging = False
         self._marquee_additive = False
+        self._dragging_overlay = None
+        self._dragging_mode = None
+        self._drag_initial_bbox = None
+        self._resize_anchor = None
+        self._resize_corner = None
+        if not hasattr(self, "handle_to_overlay"):
+            self.handle_to_overlay = {}
         mode = self._get_mode()
+        if mode == "zoom":
+            step = self.ZOOM_STEP
+            if self._event_has_ctrl(event) or self._event_has_shift(event):
+                step = 1 / self.ZOOM_STEP
+            focus = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+            self._apply_zoom(self.zoom_factor * step, focus=focus)
+            self._drag_start = None
+            return
         if mode == "draw":
             self._active_temp_rect = self.canvas.create_rectangle(
                 event.x,
@@ -705,17 +974,30 @@ class AnnotationApp:
                 dash=(4, 2),
                 tags="overlay-temp",
             )
-        else:
-            additive = self._event_has_ctrl(event) or self._event_has_shift(event)
-            self._marquee_additive = additive
-            overlay = self._find_overlay_at(event.x, event.y)
-            self._pressed_overlay = overlay
-            if overlay is not None and not additive:
+            return
+        handle_target: Optional[Tuple[OverlayItem, str]] = None
+        find_withtag = getattr(self.canvas, "find_withtag", None)
+        if callable(find_withtag):
+            current = find_withtag("current")
+            if current:
+                handle_target = self.handle_to_overlay.get(current[0])
+        if handle_target is not None:
+            overlay, corner = handle_target
+            if overlay.rect_id not in self.selected_rects:
                 self._apply_single_selection(overlay, additive=False)
-            elif overlay is None:
-                self._marquee_dragging = True
-                if not additive:
-                    self._clear_selection()
+            self._start_overlay_interaction(overlay, event, corner_override=corner)
+            return
+        additive = self._event_has_ctrl(event) or self._event_has_shift(event)
+        self._marquee_additive = additive
+        overlay = self._find_overlay_at(event.x, event.y)
+        self._pressed_overlay = overlay
+        if overlay is not None and not additive:
+            self._apply_single_selection(overlay, additive=False)
+            self._start_overlay_interaction(overlay, event)
+        elif overlay is None:
+            self._marquee_dragging = True
+            if not additive:
+                self._clear_selection()
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
         if self._drag_start is None:
@@ -741,6 +1023,9 @@ class AnnotationApp:
                     event.y,
                 )
         else:
+            if self._dragging_overlay is not None:
+                self._drag_overlay(event)
+                return
             if not self._marquee_dragging:
                 return
             if self._marquee_rect is None:
@@ -778,7 +1063,9 @@ class AnnotationApp:
                         self._update_combined_transcription()
             self._active_temp_rect = None
         else:
-            if self._marquee_rect is not None:
+            if self._dragging_overlay is not None:
+                self._finalize_overlay_drag()
+            elif self._marquee_rect is not None:
                 coords = self.canvas.coords(self._marquee_rect)
                 self.canvas.delete(self._marquee_rect)
                 if len(coords) == 4:
@@ -905,6 +1192,7 @@ class AnnotationApp:
                 self.canvas.coords(overlay.window_id, disp_left, desired_top)
             except tk.TclError:
                 continue
+            self._position_overlay_handles(overlay, (disp_left, disp_top, disp_right, disp_bottom))
 
     def _add_overlay_item(
         self,
