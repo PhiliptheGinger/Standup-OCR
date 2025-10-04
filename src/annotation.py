@@ -562,7 +562,6 @@ class AnnotationApp:
             self.canvas.coords(overlay.window_id, left, desired_top)
         except tk.TclError:
             pass
-        self._position_overlay_handles(overlay, (left, top, right, bottom))
 
     def _determine_resize_corner(
         self, bbox: Tuple[float, float, float, float], x: float, y: float
@@ -579,17 +578,12 @@ class AnnotationApp:
             return "se"
         return None
 
-    def _start_overlay_interaction(
-        self, overlay: OverlayItem, event: tk.Event, corner_override: Optional[str] = None
-    ) -> None:
+    def _start_overlay_interaction(self, overlay: OverlayItem, event: tk.Event) -> None:
         coords = self.canvas.coords(overlay.rect_id)
         if len(coords) != 4:
             return
         left, top, right, bottom = coords
-        if corner_override is not None:
-            corner = corner_override
-        else:
-            corner = self._determine_resize_corner((left, top, right, bottom), event.x, event.y)
+        corner = self._determine_resize_corner((left, top, right, bottom), event.x, event.y)
         if corner is not None:
             self._dragging_mode = "resize"
             self._resize_corner = corner
@@ -953,8 +947,6 @@ class AnnotationApp:
         self._drag_initial_bbox = None
         self._resize_anchor = None
         self._resize_corner = None
-        if not hasattr(self, "handle_to_overlay"):
-            self.handle_to_overlay = {}
         mode = self._get_mode()
         if mode == "zoom":
             step = self.ZOOM_STEP
@@ -985,19 +977,11 @@ class AnnotationApp:
             overlay, corner = handle_target
             if overlay.rect_id not in self.selected_rects:
                 self._apply_single_selection(overlay, additive=False)
-            self._start_overlay_interaction(overlay, event, corner_override=corner)
-            return
-        additive = self._event_has_ctrl(event) or self._event_has_shift(event)
-        self._marquee_additive = additive
-        overlay = self._find_overlay_at(event.x, event.y)
-        self._pressed_overlay = overlay
-        if overlay is not None and not additive:
-            self._apply_single_selection(overlay, additive=False)
-            self._start_overlay_interaction(overlay, event)
-        elif overlay is None:
-            self._marquee_dragging = True
-            if not additive:
-                self._clear_selection()
+                self._start_overlay_interaction(overlay, event)
+            elif overlay is None:
+                self._marquee_dragging = True
+                if not additive:
+                    self._clear_selection()
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
         if self._drag_start is None:
