@@ -22,18 +22,6 @@ TokenOrder = Tuple[int, int, int, int, int]
 LineKey = Tuple[int, int, int]
 
 
-@dataclass
-class OverlayBox:
-    """Track an editable overlay rectangle and its associated widgets."""
-
-    rect_id: int
-    entry: tk.Entry
-    window_id: int
-    token: OcrToken
-    is_manual: bool = False
-    selected: bool = False
-
-
 CONTROL_MASK = 0x0004
 SHIFT_MASK = 0x0001
 
@@ -72,6 +60,7 @@ class OverlayItem:
     rect_id: int
     window_id: int
     entry: tk.Entry
+    is_manual: bool = False
     selected: bool = False
     fade_job: Optional[str] = None
 
@@ -123,8 +112,8 @@ class AnnotationApp:
         self.current_photo: Optional[ImageTk.PhotoImage] = None
         self.canvas_image_id: Optional[int] = None
         self.overlay_entries: list[tk.Entry] = []
-        self.overlay_items: list[OverlayBox] = []
-        self.rect_to_overlay: Dict[int, OverlayBox] = {}
+        self.overlay_items: list[OverlayItem] = []
+        self.rect_to_overlay: Dict[int, OverlayItem] = {}
         self.selected_rects: Set[int] = set()
         self._undo_stack: list[list[RemovedOverlay]] = []
         self.current_tokens: list[OcrToken] = []
@@ -134,7 +123,7 @@ class AnnotationApp:
         self._active_temp_rect: Optional[int] = None
         self._marquee_rect: Optional[int] = None
         self._modifier_drag = False
-        self._pressed_overlay: Optional[OverlayBox] = None
+        self._pressed_overlay: Optional[OverlayItem] = None
 
         self.filename_var = tk.StringVar()
         self.status_var = tk.StringVar()
@@ -444,7 +433,7 @@ class AnnotationApp:
         *,
         preset_text: str = "",
         is_manual: bool,
-    ) -> OverlayBox:
+    ) -> OverlayItem:
         rect = self.canvas.create_rectangle(
             disp_left,
             disp_top,
@@ -475,11 +464,11 @@ class AnnotationApp:
         )
         self.canvas.tag_raise(window_id)
 
-        overlay = OverlayBox(
-            rect_id=rect,
-            entry=entry,
-            window_id=window_id,
+        overlay = OverlayItem(
             token=token,
+            rect_id=rect,
+            window_id=window_id,
+            entry=entry,
             is_manual=is_manual,
         )
         self.overlay_items.append(overlay)
@@ -507,7 +496,7 @@ class AnnotationApp:
         line_key: LineKey = (9999, 0, index)
         return order_key, line_key
 
-    def _create_manual_overlay(self, bbox: Tuple[float, float, float, float]) -> Optional[OverlayBox]:
+    def _create_manual_overlay(self, bbox: Tuple[float, float, float, float]) -> Optional[OverlayItem]:
         left, top, right, bottom = bbox
         if abs(right - left) < 4 or abs(bottom - top) < 4:
             return None
@@ -534,7 +523,7 @@ class AnnotationApp:
     def _update_tokens_snapshot(self) -> None:
         self.current_tokens = [item.token for item in self.overlay_items]
 
-    def _set_box_selected(self, overlay: OverlayBox, selected: bool) -> None:
+    def _set_box_selected(self, overlay: OverlayItem, selected: bool) -> None:
         overlay.selected = selected
         outline = "#F2994A" if selected else "#2F80ED"
         width = 2 if selected else 1
@@ -584,7 +573,7 @@ class AnnotationApp:
         self._update_tokens_snapshot()
         self._update_combined_transcription()
 
-    def _remove_overlay(self, overlay: OverlayBox) -> None:
+    def _remove_overlay(self, overlay: OverlayItem) -> None:
         try:
             overlay.entry.destroy()
         except tk.TclError:
@@ -618,7 +607,7 @@ class AnnotationApp:
     def _event_has_shift(self, event: tk.Event) -> bool:
         return bool(getattr(event, "state", 0) & SHIFT_MASK)
 
-    def _find_overlay_at(self, x: float, y: float) -> Optional[OverlayBox]:
+    def _find_overlay_at(self, x: float, y: float) -> Optional[OverlayItem]:
         for overlay in reversed(self.overlay_items):
             coords = self.canvas.coords(overlay.rect_id)
             if len(coords) != 4:
@@ -628,9 +617,9 @@ class AnnotationApp:
                 return overlay
         return None
 
-    def _overlays_in_rect(self, bbox: Tuple[float, float, float, float]) -> List[OverlayBox]:
+    def _overlays_in_rect(self, bbox: Tuple[float, float, float, float]) -> List[OverlayItem]:
         left, top, right, bottom = bbox
-        selected: list[OverlayBox] = []
+        selected: list[OverlayItem] = []
         for overlay in self.overlay_items:
             coords = self.canvas.coords(overlay.rect_id)
             if len(coords) != 4:
@@ -641,7 +630,7 @@ class AnnotationApp:
             selected.append(overlay)
         return selected
 
-    def _apply_single_selection(self, overlay: OverlayBox, additive: bool) -> None:
+    def _apply_single_selection(self, overlay: OverlayItem, additive: bool) -> None:
         if additive:
             if overlay.rect_id in self.selected_rects:
                 self.selected_rects.remove(overlay.rect_id)
@@ -659,7 +648,7 @@ class AnnotationApp:
         self._refresh_delete_button()
         self._update_entry_focus()
 
-    def _apply_marquee_selection(self, overlays: Sequence[OverlayBox], additive: bool) -> None:
+    def _apply_marquee_selection(self, overlays: Sequence[OverlayItem], additive: bool) -> None:
         if not additive:
             self._clear_selection()
         for overlay in overlays:
@@ -824,6 +813,7 @@ class AnnotationApp:
         self.canvas.tag_bind(rect, "<Enter>", lambda event, token=token: self._on_overlay_enter(token))
         self.canvas.tag_bind(rect, "<Leave>", lambda event, token=token: self._on_overlay_leave(token))
 
+        self.rect_to_overlay[rect] = item
         if index is None or index >= len(self.overlay_items):
             self.overlay_items.append(item)
             self.current_tokens.append(token)
@@ -1004,6 +994,7 @@ class AnnotationApp:
         self.canvas.tag_bind(rect, "<Enter>", lambda event, token=token: self._on_overlay_enter(token))
         self.canvas.tag_bind(rect, "<Leave>", lambda event, token=token: self._on_overlay_leave(token))
 
+        self.rect_to_overlay[rect] = item
         if index is None or index >= len(self.overlay_items):
             self.overlay_items.append(item)
             self.current_tokens.append(token)
@@ -1184,6 +1175,7 @@ class AnnotationApp:
         self.canvas.tag_bind(rect, "<Enter>", lambda event, token=token: self._on_overlay_enter(token))
         self.canvas.tag_bind(rect, "<Leave>", lambda event, token=token: self._on_overlay_leave(token))
 
+        self.rect_to_overlay[rect] = item
         if index is None or index >= len(self.overlay_items):
             self.overlay_items.append(item)
             self.current_tokens.append(token)
@@ -1364,6 +1356,7 @@ class AnnotationApp:
         self.canvas.tag_bind(rect, "<Enter>", lambda event, token=token: self._on_overlay_enter(token))
         self.canvas.tag_bind(rect, "<Leave>", lambda event, token=token: self._on_overlay_leave(token))
 
+        self.rect_to_overlay[rect] = item
         if index is None or index >= len(self.overlay_items):
             self.overlay_items.append(item)
             self.current_tokens.append(token)
@@ -1544,6 +1537,7 @@ class AnnotationApp:
         self.canvas.tag_bind(rect, "<Enter>", lambda event, token=token: self._on_overlay_enter(token))
         self.canvas.tag_bind(rect, "<Leave>", lambda event, token=token: self._on_overlay_leave(token))
 
+        self.rect_to_overlay[rect] = item
         if index is None or index >= len(self.overlay_items):
             self.overlay_items.append(item)
             self.current_tokens.append(token)
