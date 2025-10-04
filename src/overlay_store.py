@@ -106,6 +106,27 @@ class UpdateOverlayText(Command):
 
 
 @dataclass
+class UpdateOverlayBounds(Command):
+    overlay_id: int
+    new_bbox: BBox
+    previous_bbox: Optional[BBox] = None
+
+    def do(self, store: "OverlayStore") -> None:
+        if self.previous_bbox is None:
+            overlay = store.get_overlay(self.overlay_id)
+            if overlay is not None:
+                self.previous_bbox = overlay.bbox_base
+        store._set_overlay_bbox(self.overlay_id, self.new_bbox)
+        store._emit_overlays()
+
+    def undo(self, store: "OverlayStore") -> None:
+        if self.previous_bbox is None:
+            return
+        store._set_overlay_bbox(self.overlay_id, self.previous_bbox)
+        store._emit_overlays()
+
+
+@dataclass
 class SetSelection(Command):
     selection: Sequence[int]
     _previous: Set[int] = field(default_factory=set, init=False)
@@ -273,6 +294,25 @@ class OverlayStore:
         command = UpdateOverlayText(overlay_id, text)
         self.do(command)
 
+    def update_bbox(
+        self,
+        overlay_id: int,
+        bbox_base: BBox,
+        *,
+        commit: bool = False,
+        previous_bbox: Optional[BBox] = None,
+    ) -> None:
+        if commit:
+            command = UpdateOverlayBounds(
+                overlay_id,
+                bbox_base,
+                previous_bbox=previous_bbox,
+            )
+            self.do(command)
+        else:
+            self._set_overlay_bbox(overlay_id, bbox_base)
+            self._emit_overlays()
+
     def remove_by_ids(self, ids: Sequence[int]) -> List[Overlay]:
         if not ids:
             return []
@@ -385,6 +425,16 @@ class OverlayStore:
         if previous == text:
             return previous
         overlay.text = text
+        return previous
+
+    def _set_overlay_bbox(self, overlay_id: int, bbox_base: BBox) -> BBox:
+        overlay = self._overlays.get(overlay_id)
+        if overlay is None:
+            raise KeyError(f"Overlay {overlay_id} not found")
+        previous = overlay.bbox_base
+        if previous == bbox_base:
+            return previous
+        overlay.bbox_base = bbox_base
         return previous
 
     def _apply_selection(self, selection: Set[int]) -> None:

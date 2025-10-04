@@ -141,6 +141,12 @@ class AnnotationApp:
         self._active_draw_rect: Optional[int] = None
         self._marquee_rect: Optional[int] = None
         self._marquee_additive = False
+        self._resize_overlay_id: Optional[int] = None
+        self._resize_original_bbox: Optional[Tuple[float, float, float, float]] = None
+        self._resize_original_base_bbox: Optional[Tuple[int, int, int, int]] = None
+        self._resize_anchor: Optional[Tuple[str, str]] = None
+        self._resize_press_point: Optional[Tuple[float, float]] = None
+        self._resize_changed = False
 
         self.filename_var = tk.StringVar()
         self.status_var = tk.StringVar()
@@ -526,7 +532,21 @@ class AnnotationApp:
             tags="overlay",
         )
         if hasattr(self.canvas, "tag_bind"):
-            self.canvas.tag_bind(rect_id, "<Button-1>", lambda event, oid=overlay.id: self._on_rect_click(event, oid))
+            self.canvas.tag_bind(
+                rect_id,
+                "<ButtonPress-1>",
+                lambda event, oid=overlay.id: self._on_overlay_press(event, oid),
+            )
+            self.canvas.tag_bind(
+                rect_id,
+                "<B1-Motion>",
+                lambda event, oid=overlay.id: self._on_overlay_drag(event, oid),
+            )
+            self.canvas.tag_bind(
+                rect_id,
+                "<ButtonRelease-1>",
+                lambda event, oid=overlay.id: self._on_overlay_release(event, oid),
+            )
         return OverlayView(overlay.id, rect_id, window_id, entry)
 
     def _update_overlay_view(
@@ -733,6 +753,7 @@ class AnnotationApp:
         self._drag_mode = None
         self._pending_click_id = None
         self._marquee_additive = False
+        self._reset_resize_state()
 
     def _finalize_draw(self) -> None:
         if self._active_draw_rect is None:
@@ -850,6 +871,141 @@ class AnnotationApp:
     # ------------------------------------------------------------------
     # Overlay entry handling
     # ------------------------------------------------------------------
+    def _reset_resize_state(self) -> None:
+        self._resize_overlay_id = None
+        self._resize_original_bbox = None
+        self._resize_original_base_bbox = None
+        self._resize_anchor = None
+        self._resize_press_point = None
+        self._resize_changed = False
+        self._drag_mode = None
+        self._drag_start = None
+        self._pending_click_id = None
+
+    def _determine_resize_anchor(
+        self,
+        bbox: Tuple[float, float, float, float],
+        x: float,
+        y: float,
+    ) -> Tuple[str, str]:
+        left, top, right, bottom = bbox
+        threshold = 12.0
+        if abs(x - left) <= threshold:
+            anchor_x = "left"
+        elif abs(x - right) <= threshold:
+            anchor_x = "right"
+        else:
+            anchor_x = "center"
+
+        if abs(y - top) <= threshold:
+            anchor_y = "top"
+        elif abs(y - bottom) <= threshold:
+            anchor_y = "bottom"
+        else:
+            anchor_y = "center"
+        return anchor_x, anchor_y
+
+    def _on_overlay_press(self, event: tk.Event, overlay_id: int) -> str:
+        if self.mode_var.get() != "select":
+            return ""
+        overlay = self.store.get_overlay(overlay_id)
+        bbox = self._overlay_positions.get(overlay_id)
+        if overlay is None or bbox is None:
+            return ""
+        x, y = self._canvas_coords(event.x, event.y)
+        self._resize_overlay_id = overlay_id
+        self._resize_original_bbox = bbox
+        self._resize_original_base_bbox = overlay.bbox_base
+        self._resize_press_point = (x, y)
+        self._resize_anchor = self._determine_resize_anchor(bbox, x, y)
+        self._resize_changed = False
+        self._drag_mode = "resize"
+        self._drag_start = (x, y)
+        additive = self._event_has_ctrl(event) or self._event_has_shift(event)
+        self.store.select_click(overlay_id, additive=additive)
+        self._pending_click_id = overlay_id
+        return "break"
+
+    def _on_overlay_drag(self, event: tk.Event, overlay_id: int) -> str:
+        if self.mode_var.get() != "select":
+            return ""
+        if self._resize_overlay_id != overlay_id:
+            return ""
+        if self._resize_original_bbox is None or self._resize_anchor is None:
+            return ""
+        x, y = self._canvas_coords(event.x, event.y)
+        left, top, right, bottom = self._resize_original_bbox
+        anchor_x, anchor_y = self._resize_anchor
+        min_size = 4.0
+
+        if anchor_x == "left":
+            new_left = min(x, right - min_size)
+            new_right = right
+        elif anchor_x == "right":
+            new_left = left
+            new_right = max(x, left + min_size)
+        else:
+            press_x = self._resize_press_point[0] if self._resize_press_point else left
+            dx = x - press_x
+            new_left = left + dx
+            new_right = right + dx
+
+        if anchor_y == "top":
+            new_top = min(y, bottom - min_size)
+            new_bottom = bottom
+        elif anchor_y == "bottom":
+            new_top = top
+            new_bottom = max(y, top + min_size)
+        else:
+            press_y = self._resize_press_point[1] if self._resize_press_point else top
+            dy = y - press_y
+            new_top = top + dy
+            new_bottom = bottom + dy
+
+        if anchor_x == "center":
+            width = right - left
+            new_right = new_left + width
+        if anchor_y == "center":
+            height = bottom - top
+            new_bottom = new_top + height
+
+        if new_left > new_right:
+            new_left, new_right = new_right, new_left
+        if new_top > new_bottom:
+            new_top, new_bottom = new_bottom, new_top
+
+        base_bbox = self._to_base((new_left, new_top, new_right, new_bottom))
+        if (
+            self._resize_original_base_bbox is not None
+            and base_bbox == self._resize_original_base_bbox
+        ):
+            return "break"
+        overlay = self.store.get_overlay(overlay_id)
+        if overlay is not None and overlay.bbox_base == base_bbox:
+            return "break"
+        self.store.update_bbox(overlay_id, base_bbox)
+        self._resize_changed = True
+        return "break"
+
+    def _on_overlay_release(self, event: tk.Event, overlay_id: int) -> str:
+        if self.mode_var.get() != "select":
+            self._reset_resize_state()
+            return ""
+        if self._resize_overlay_id != overlay_id:
+            self._reset_resize_state()
+            return ""
+        if self._resize_changed and self._resize_original_base_bbox is not None:
+            overlay = self.store.get_overlay(overlay_id)
+            if overlay is not None:
+                self.store.update_bbox(
+                    overlay_id,
+                    overlay.bbox_base,
+                    commit=True,
+                    previous_bbox=self._resize_original_base_bbox,
+                )
+        self._reset_resize_state()
+        return "break"
+
     def _on_rect_click(self, event: tk.Event, overlay_id: int) -> None:
         additive = self._event_has_ctrl(event) or self._event_has_shift(event)
         self.store.select_click(overlay_id, additive=additive)
