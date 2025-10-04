@@ -7,7 +7,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence,
 
 BBox = Tuple[int, int, int, int]
 TokenOrder = Tuple[int, int, int, int, int]
-LineKey = Tuple[int, int, int]
+LineKey = Tuple[int, int, int, int]
 Listener = Callable[[object], None]
 
 
@@ -282,7 +282,7 @@ class OverlayStore:
             text="",
             is_manual=True,
             order_key=(9999, 0, 0, overlay_id, overlay_id),
-            line_key=(9999, 0, overlay_id),
+            line_key=(9999, 0, 0, overlay_id),
         )
         command = AddOverlay([overlay], index=index)
         self.do(command)
