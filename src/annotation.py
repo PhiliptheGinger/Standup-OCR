@@ -561,8 +561,12 @@ class AnnotationApp:
         width = 2 if overlay.selected else 1
         try:
             self.canvas.itemconfigure(view.rect_id, outline=outline, width=width)
-            state = "normal" if overlay.selected else "hidden"
-            self.canvas.itemconfigure(view.window_id, state=state)
+            self.canvas.itemconfigure(view.window_id, state="normal")
+            if hasattr(view.entry, "configure"):
+                bg = "#FFFFFF" if overlay.selected else "#F8F9FA"
+                fg = "#000000"
+                view.entry.configure(state=tk.NORMAL)
+                view.entry.configure(bg=bg, fg=fg, insertbackground=fg)
         except tk.TclError:
             pass
 
