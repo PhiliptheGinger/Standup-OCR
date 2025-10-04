@@ -88,6 +88,9 @@ class AnnotationApp:
 
     MAX_SIZE = (900, 700)
     FADE_DELAY_MS = 150
+    MIN_ZOOM = 0.5
+    MAX_ZOOM = 3.0
+    ZOOM_STEP = 1.1
 
     def __init__(
         self,
@@ -119,11 +122,15 @@ class AnnotationApp:
         self._undo_stack: list[list[RemovedOverlay]] = []
         self.current_tokens: list[OcrToken] = []
         self.display_scale: Tuple[float, float] = (1.0, 1.0)
+        self._base_display_image: Optional[Image.Image] = None
+        self._base_scale: Tuple[float, float] = (1.0, 1.0)
+        self.zoom_factor: float = 1.0
         self.manual_token_counter = 0
         self._drag_start: Optional[Tuple[float, float]] = None
         self._active_temp_rect: Optional[int] = None
         self._marquee_rect: Optional[int] = None
-        self._modifier_drag = False
+        self._marquee_dragging = False
+        self._marquee_additive = False
         self._pressed_overlay: Optional[OverlayItem] = None
 
         self.filename_var = tk.StringVar()
@@ -148,8 +155,20 @@ class AnnotationApp:
         header = tk.Label(container, textvariable=self.filename_var, font=("TkDefaultFont", 14, "bold"))
         header.pack(anchor="w")
 
-        self.canvas = tk.Canvas(container, bd=1, relief="sunken", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, pady=12)
+        canvas_frame = tk.Frame(container)
+        canvas_frame.pack(fill="both", expand=True, pady=12)
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.columnconfigure(0, weight=1)
+
+        self.canvas = tk.Canvas(canvas_frame, bd=1, relief="sunken", highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+
+        v_scroll = tk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll = tk.Scrollbar(canvas_frame, orient="horizontal", command=self.canvas.xview)
+        h_scroll.grid(row=1, column=0, sticky="ew")
+
+        self.canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
         button_sequences = (
             "<ButtonPress-1>",
             "<Shift-ButtonPress-1>",
@@ -174,6 +193,9 @@ class AnnotationApp:
         )
         for sequence in release_sequences:
             self.canvas.bind(sequence, self._on_canvas_release)
+        self.canvas.bind("<MouseWheel>", self._on_canvas_mousewheel)
+        self.canvas.bind("<Button-4>", self._on_canvas_mousewheel)
+        self.canvas.bind("<Button-5>", self._on_canvas_mousewheel)
 
         toolbar = tk.Frame(container)
         toolbar.pack(anchor="w", pady=(0, 8))
@@ -383,10 +405,13 @@ class AnnotationApp:
         display_image.thumbnail(self.MAX_SIZE, Image.LANCZOS)
         scale_x = display_image.width / base_width if base_width else 1.0
         scale_y = display_image.height / base_height if base_height else 1.0
-        self.display_scale = (scale_x, scale_y)
+        self._base_display_image = display_image.copy()
+        self._base_scale = (scale_x, scale_y)
+        self.zoom_factor = 1.0
+        self.display_scale = self._base_scale
         self.manual_token_counter = 0
 
-        photo = ImageTk.PhotoImage(display_image)
+        photo = ImageTk.PhotoImage(self._base_display_image)
         self.current_photo = photo
 
         self._clear_overlay_entries()
@@ -399,7 +424,11 @@ class AnnotationApp:
         self._refresh_delete_button()
         self.current_tokens = []
         self.canvas_image_id = self.canvas.create_image(0, 0, image=photo, anchor="nw")
-        self.canvas.config(scrollregion=(0, 0, display_image.width, display_image.height))
+        self.canvas.config(
+            scrollregion=(0, 0, self._base_display_image.width, self._base_display_image.height)
+        )
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
         self.canvas.focus_set()
 
         for token in tokens:
@@ -663,7 +692,8 @@ class AnnotationApp:
         self._drag_start = (event.x, event.y)
         self._active_temp_rect = None
         self._marquee_rect = None
-        self._modifier_drag = False
+        self._marquee_dragging = False
+        self._marquee_additive = False
         mode = self._get_mode()
         if mode == "draw":
             self._active_temp_rect = self.canvas.create_rectangle(
@@ -676,14 +706,16 @@ class AnnotationApp:
                 tags="overlay-temp",
             )
         else:
-            has_modifier = self._event_has_ctrl(event) or self._event_has_shift(event)
-            self._modifier_drag = has_modifier
+            additive = self._event_has_ctrl(event) or self._event_has_shift(event)
+            self._marquee_additive = additive
             overlay = self._find_overlay_at(event.x, event.y)
             self._pressed_overlay = overlay
-            if overlay is not None and not has_modifier:
+            if overlay is not None and not additive:
                 self._apply_single_selection(overlay, additive=False)
-            elif overlay is None and not has_modifier:
-                self._clear_selection()
+            elif overlay is None:
+                self._marquee_dragging = True
+                if not additive:
+                    self._clear_selection()
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
         if self._drag_start is None:
@@ -709,7 +741,7 @@ class AnnotationApp:
                     event.y,
                 )
         else:
-            if not self._modifier_drag:
+            if not self._marquee_dragging:
                 return
             if self._marquee_rect is None:
                 self._marquee_rect = self.canvas.create_rectangle(
@@ -753,7 +785,7 @@ class AnnotationApp:
                     left, top, right, bottom = coords
                     bbox = (min(left, right), min(top, bottom), max(left, right), max(top, bottom))
                     overlays = self._overlays_in_rect(bbox)
-                    additive = self._modifier_drag
+                    additive = self._marquee_additive
                     self._apply_marquee_selection(overlays, additive=additive)
             else:
                 overlay = self._pressed_overlay
@@ -761,12 +793,118 @@ class AnnotationApp:
                     additive = self._event_has_ctrl(event) or self._event_has_shift(event)
                     if additive or overlay.rect_id not in self.selected_rects:
                         self._apply_single_selection(overlay, additive=additive)
-                elif not (self._event_has_ctrl(event) or self._event_has_shift(event)):
+                elif not self._marquee_additive:
                     self._clear_selection()
         self._pressed_overlay = None
         self._drag_start = None
         self._marquee_rect = None
-        self._modifier_drag = False
+        self._marquee_dragging = False
+        self._marquee_additive = False
+
+    def _on_canvas_mousewheel(self, event: tk.Event) -> str:
+        direction = 0
+        delta = getattr(event, "delta", 0)
+        if delta > 0:
+            direction = 1
+        elif delta < 0:
+            direction = -1
+        else:
+            num = getattr(event, "num", 0)
+            if num == 4:
+                direction = 1
+            elif num == 5:
+                direction = -1
+        if direction == 0:
+            return ""
+        step = self.ZOOM_STEP if direction > 0 else 1 / self.ZOOM_STEP
+        focus = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        self._apply_zoom(self.zoom_factor * step, focus=focus)
+        return "break"
+
+    def _apply_zoom(
+        self,
+        target: float,
+        *,
+        focus: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        if self._base_display_image is None:
+            return
+        target = max(self.MIN_ZOOM, min(self.MAX_ZOOM, target))
+        if abs(target - self.zoom_factor) < 1e-3:
+            return
+        old_factor = self.zoom_factor
+        base_width, base_height = self._base_display_image.size
+        new_width = max(1, int(base_width * target))
+        new_height = max(1, int(base_height * target))
+        resized = self._base_display_image.resize((new_width, new_height), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(resized)
+        self.current_photo = photo
+        if self.canvas_image_id is None:
+            self.canvas_image_id = self.canvas.create_image(0, 0, image=photo, anchor="nw")
+        else:
+            try:
+                self.canvas.itemconfigure(self.canvas_image_id, image=photo)
+            except tk.TclError:
+                self.canvas_image_id = self.canvas.create_image(0, 0, image=photo, anchor="nw")
+        self.canvas.config(scrollregion=(0, 0, new_width, new_height))
+        self.zoom_factor = target
+        base_scale_x, base_scale_y = self._base_scale
+        self.display_scale = (base_scale_x * target, base_scale_y * target)
+        self._update_overlay_positions()
+        if focus is not None:
+            self._adjust_canvas_view(focus, old_factor, target, new_width, new_height)
+
+    def _adjust_canvas_view(
+        self,
+        focus: Tuple[float, float],
+        old_factor: float,
+        new_factor: float,
+        new_width: int,
+        new_height: int,
+    ) -> None:
+        if old_factor <= 0:
+            scale_ratio = new_factor
+        else:
+            scale_ratio = new_factor / old_factor
+        new_focus_x = focus[0] * scale_ratio
+        new_focus_y = focus[1] * scale_ratio
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+        if new_width > canvas_width:
+            left = max(0.0, min(new_focus_x - canvas_width / 2, new_width - canvas_width))
+            self.canvas.xview_moveto(left / new_width)
+        else:
+            self.canvas.xview_moveto(0)
+        if new_height > canvas_height:
+            top = max(0.0, min(new_focus_y - canvas_height / 2, new_height - canvas_height))
+            self.canvas.yview_moveto(top / new_height)
+        else:
+            self.canvas.yview_moveto(0)
+
+    def _update_overlay_positions(self) -> None:
+        scale_x, scale_y = self.display_scale
+        for overlay in self.overlay_items:
+            left, top, right, bottom = overlay.token.bbox
+            disp_left = left * scale_x
+            disp_top = top * scale_y
+            disp_right = right * scale_x
+            disp_bottom = bottom * scale_y
+            try:
+                self.canvas.coords(overlay.rect_id, disp_left, disp_top, disp_right, disp_bottom)
+            except tk.TclError:
+                continue
+            width = max(4, int(max(1, abs(disp_right - disp_left)) / 8))
+            try:
+                overlay.entry.configure(width=width)
+            except tk.TclError:
+                pass
+            desired_top = disp_top - 24
+            if desired_top < 0:
+                desired_top = disp_top
+            try:
+                self.canvas.coords(overlay.window_id, disp_left, desired_top)
+            except tk.TclError:
+                continue
 
     def _add_overlay_item(
         self,
@@ -918,7 +1056,7 @@ class AnnotationApp:
             return ""
         overlays = self._undo_stack.pop()
         for overlay in overlays:
-            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index, scale=overlay.scale)
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
         self._update_combined_transcription()
         return "break"
 
@@ -1106,7 +1244,7 @@ class AnnotationApp:
             return ""
         overlays = self._undo_stack.pop()
         for overlay in overlays:
-            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index, scale=overlay.scale)
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
         self._update_combined_transcription()
         return "break"
 
@@ -1294,7 +1432,7 @@ class AnnotationApp:
             return ""
         overlays = self._undo_stack.pop()
         for overlay in overlays:
-            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index, scale=overlay.scale)
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
         self._update_combined_transcription()
         return "break"
 
@@ -1482,7 +1620,7 @@ class AnnotationApp:
             return ""
         overlays = self._undo_stack.pop()
         for overlay in overlays:
-            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index, scale=overlay.scale)
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
         self._update_combined_transcription()
         return "break"
 
@@ -1670,7 +1808,7 @@ class AnnotationApp:
             return ""
         overlays = self._undo_stack.pop()
         for overlay in overlays:
-            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index, scale=overlay.scale)
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
         self._update_combined_transcription()
         return "break"
 
