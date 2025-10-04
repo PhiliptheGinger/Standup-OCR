@@ -11,6 +11,11 @@ import tkinter as tk
 from tkinter import messagebox
 
 from PIL import Image, ImageOps, ImageTk
+import pytesseract
+from pytesseract import Output
+
+TokenOrder = Tuple[int, int, int, int, int]
+LineKey = Tuple[int, int, int]
 
 
 def _prepare_image(image: Image.Image) -> Image.Image:
@@ -36,6 +41,27 @@ class OcrToken:
     line_key: LineKey
 
 
+@dataclass
+class OverlayItem:
+    """UI artefacts representing an editable OCR token."""
+
+    token: OcrToken
+    rect_id: int
+    window_id: int
+    entry: tk.Entry
+    selected: bool = False
+    fade_job: Optional[str] = None
+
+
+@dataclass
+class RemovedOverlay:
+    """Snapshot of an overlay used to support undo behaviour."""
+
+    token: OcrToken
+    text: str
+    index: int
+
+
 def prepare_image(path: Path) -> Image.Image:
     """Open ``path`` and apply EXIF-based orientation for consistent display."""
 
@@ -48,6 +74,7 @@ class AnnotationApp:
     """Tkinter-based interface for stepping through a set of images."""
 
     MAX_SIZE = (900, 700)
+    FADE_DELAY_MS = 150
 
     def __init__(
         self,
@@ -70,8 +97,13 @@ class AnnotationApp:
 
         self.current_photo: Optional[ImageTk.PhotoImage] = None
         self.canvas_image_id: Optional[int] = None
-        self.overlay_entries: list[tk.Entry] = []
+        self.overlay_items: list[OverlayItem] = []
         self.current_tokens: list[OcrToken] = []
+        # Track overlay deletions so Ctrl+Z can restore prior rectangles/entries.
+        self._undo_stack: list[list[RemovedOverlay]] = []
+        # Canvas/image scaling factors are required as soon as _display_image runs.
+        self._scale_x = 1.0
+        self._scale_y = 1.0
 
         self.filename_var = tk.StringVar()
         self.status_var = tk.StringVar()
@@ -124,6 +156,10 @@ class AnnotationApp:
         self.status_label.pack(anchor="w")
 
         self.master.bind("<Escape>", self._on_exit)
+        self.master.bind("<Delete>", self._on_delete_selected)
+        self.master.bind("<BackSpace>", self._on_delete_selected)
+        self.master.bind("<Control-z>", self._on_undo)
+        self.master.bind("<Control-Z>", self._on_undo)
         self.master.protocol("WM_DELETE_WINDOW", self._on_exit)
 
     # ------------------------------------------------------------------
@@ -194,8 +230,17 @@ class AnnotationApp:
         suggestion = self._compose_text_from_tokens(tokens)
         if suggestion:
             self._set_transcription(suggestion)
+            self.status_var.set("Pre-filled transcription using OCR result.")
         else:
-            self._set_transcription(self._suggest_label(path))
+            self._set_transcription("")
+            filename_hint = self._suggest_label(path)
+            if filename_hint:
+                self.status_var.set(
+                    "OCR produced no suggestion; using filename hint: "
+                    f"{filename_hint}"
+                )
+            else:
+                self.status_var.set("OCR produced no suggestion; please transcribe manually.")
 
         self._display_image(image, tokens)
         image.close()
@@ -204,13 +249,17 @@ class AnnotationApp:
         base_width, base_height = image.size
         display_image = image.copy().convert("RGBA")
         display_image.thumbnail(self.MAX_SIZE, Image.LANCZOS)
-        scale_x = display_image.width / base_width if base_width else 1.0
-        scale_y = display_image.height / base_height if base_height else 1.0
+        self._scale_x = display_image.width / base_width if base_width else 1.0
+        self._scale_y = display_image.height / base_height if base_height else 1.0
 
         photo = ImageTk.PhotoImage(display_image)
         self.current_photo = photo
 
         self._clear_overlay_entries()
+        if hasattr(self, "_undo_stack"):
+            self._undo_stack.clear()
+        else:  # pragma: no cover - defensive for partially initialised instances
+            self._undo_stack = []
         self.canvas.delete("all")
         self.current_tokens = list(tokens)
         self.canvas_image_id = self.canvas.create_image(0, 0, image=photo, anchor="nw")
@@ -219,44 +268,190 @@ class AnnotationApp:
         for token in tokens:
             if not token.text:
                 continue
-            left, top, right, bottom = token.bbox
-            disp_left = left * scale_x
-            disp_top = top * scale_y
-            disp_right = right * scale_x
-            disp_bottom = bottom * scale_y
-
-            rect = self.canvas.create_rectangle(
-                disp_left,
-                disp_top,
-                disp_right,
-                disp_bottom,
-                outline="#2F80ED",
-                width=1,
-                tags="overlay",
-            )
-            self.canvas.tag_raise(rect)
-
-            entry_width = max(4, int((disp_right - disp_left) / 8))
-            entry = tk.Entry(self.canvas, width=entry_width)
-            entry.insert(0, token.text)
-            entry.bind("<KeyRelease>", self._on_overlay_modified)
-
-            desired_top = disp_top - 24
-            if desired_top < 0:
-                desired_top = disp_top
-
-            window_id = self.canvas.create_window(
-                disp_left,
-                desired_top,
-                anchor="nw",
-                window=entry,
-                tags="overlay",
-            )
-            self.canvas.tag_raise(window_id)
-            self.overlay_entries.append(entry)
+            self._add_overlay_item(token, token.text)
 
         if tokens:
             self._update_combined_transcription()
+
+    def _add_overlay_item(self, token: OcrToken, text: str, index: Optional[int] = None) -> None:
+        left, top, right, bottom = token.bbox
+        disp_left = left * self._scale_x
+        disp_top = top * self._scale_y
+        disp_right = right * self._scale_x
+        disp_bottom = bottom * self._scale_y
+
+        rect = self.canvas.create_rectangle(
+            disp_left,
+            disp_top,
+            disp_right,
+            disp_bottom,
+            outline="#2F80ED",
+            width=1,
+            tags="overlay",
+        )
+        self.canvas.tag_raise(rect)
+
+        entry_width = max(4, int((disp_right - disp_left) / 8))
+        entry = tk.Entry(self.canvas, width=entry_width)
+        if text:
+            entry.insert(0, text)
+        entry.bind("<KeyRelease>", self._on_overlay_modified)
+        entry.bind("<Button-1>", lambda event, item_token=token: self._focus_overlay_by_token(item_token))
+        entry.bind("<FocusIn>", lambda event, token=token: self._focus_overlay_by_token(token))
+        entry.bind("<Enter>", lambda event, token=token: self._on_overlay_enter(token))
+        entry.bind("<Leave>", lambda event, token=token: self._on_overlay_leave(token))
+
+        desired_top = disp_top - 24
+        if desired_top < 0:
+            desired_top = disp_top
+
+        window_id = self.canvas.create_window(
+            disp_left,
+            desired_top,
+            anchor="nw",
+            window=entry,
+            tags="overlay",
+        )
+        self.canvas.tag_raise(window_id)
+
+        item = OverlayItem(token=token, rect_id=rect, window_id=window_id, entry=entry)
+        self.canvas.tag_bind(rect, "<Button-1>", lambda event, token=token: self._on_overlay_click(event, token))
+        self.canvas.tag_bind(rect, "<Enter>", lambda event, token=token: self._on_overlay_enter(token))
+        self.canvas.tag_bind(rect, "<Leave>", lambda event, token=token: self._on_overlay_leave(token))
+
+        if index is None or index >= len(self.overlay_items):
+            self.overlay_items.append(item)
+            self.current_tokens.append(token)
+        else:
+            self.overlay_items.insert(index, item)
+            self.current_tokens.insert(index, token)
+
+    def _focus_overlay_by_token(self, token: OcrToken) -> None:
+        item = self._find_overlay(token)
+        if item is None:
+            return
+        self._select_overlay(item, additive=False)
+        self._set_entry_visibility(item, True)
+
+    def _find_overlay(self, token: OcrToken) -> Optional[OverlayItem]:
+        for item in self.overlay_items:
+            if item.token is token:
+                return item
+        return None
+
+    def _on_overlay_click(self, event: tk.Event, token: OcrToken) -> None:
+        item = self._find_overlay(token)
+        if item is None:
+            return
+        ctrl = bool(event.state & 0x0004)
+        shift = bool(event.state & 0x0001)
+        additive = ctrl or shift
+        if additive and item.selected:
+            self._set_overlay_selected(item, False)
+        else:
+            self._select_overlay(item, additive=additive)
+        self._set_entry_visibility(item, True)
+        item.entry.focus_set()
+
+    def _select_overlay(self, target: OverlayItem, additive: bool = False) -> None:
+        if not additive:
+            for item in self.overlay_items:
+                if item.selected:
+                    self._set_overlay_selected(item, False)
+        self._set_overlay_selected(target, True)
+
+    def _set_overlay_selected(self, item: OverlayItem, value: bool) -> None:
+        item.selected = value
+        outline = "#F2994A" if value else "#2F80ED"
+        width = 2 if value else 1
+        try:
+            self.canvas.itemconfigure(item.rect_id, outline=outline, width=width)
+        except tk.TclError:
+            pass
+        if value:
+            self._set_entry_visibility(item, True)
+
+    def _on_delete_selected(self, event: Optional[tk.Event]) -> str:
+        if self._delete_selected_overlays():
+            return "break"
+        return ""
+
+    def _delete_selected_overlays(self) -> bool:
+        removed: list[RemovedOverlay] = []
+        for index in reversed(range(len(self.overlay_items))):
+            item = self.overlay_items[index]
+            if not item.selected:
+                continue
+            removed.append(RemovedOverlay(token=item.token, text=item.entry.get(), index=index))
+            if item.fade_job is not None:
+                try:
+                    self.master.after_cancel(item.fade_job)
+                except tk.TclError:
+                    pass
+                item.fade_job = None
+            try:
+                self.canvas.delete(item.rect_id)
+                self.canvas.delete(item.window_id)
+            except tk.TclError:
+                pass
+            try:
+                item.entry.destroy()
+            except tk.TclError:
+                pass
+            del self.overlay_items[index]
+            del self.current_tokens[index]
+
+        if not removed:
+            return False
+
+        # Maintain original order for undo restoration.
+        removed.sort(key=lambda overlay: overlay.index)
+        self._undo_stack.append(removed)
+        self._update_combined_transcription()
+        return True
+
+    def _on_undo(self, event: Optional[tk.Event]) -> str:
+        if not self._undo_stack:
+            return ""
+        overlays = self._undo_stack.pop()
+        for overlay in overlays:
+            self._add_overlay_item(overlay.token, overlay.text, index=overlay.index)
+        self._update_combined_transcription()
+        return "break"
+
+    def _on_overlay_enter(self, token: OcrToken) -> None:
+        item = self._find_overlay(token)
+        if item is None or item.selected:
+            return
+        if item.fade_job is not None:
+            try:
+                self.master.after_cancel(item.fade_job)
+            except tk.TclError:
+                pass
+        item.fade_job = self.master.after(
+            self.FADE_DELAY_MS, lambda item=item: self._set_entry_visibility(item, False)
+        )
+
+    def _on_overlay_leave(self, token: OcrToken) -> None:
+        item = self._find_overlay(token)
+        if item is None:
+            return
+        if item.fade_job is not None:
+            try:
+                self.master.after_cancel(item.fade_job)
+            except tk.TclError:
+                pass
+            item.fade_job = None
+        self._set_entry_visibility(item, True)
+
+    def _set_entry_visibility(self, item: OverlayItem, visible: bool) -> None:
+        try:
+            state = "normal" if visible else "hidden"
+            self.canvas.itemconfigure(item.window_id, state=state)
+        except tk.TclError:
+            pass
+        if visible and item.fade_job is not None:
+            item.fade_job = None
 
     def _extract_tokens(self, image: Image.Image) -> List[OcrToken]:
         ocr_image: Optional[Image.Image] = None
@@ -341,10 +536,11 @@ class AnnotationApp:
 
     def _compose_transcription(self) -> str:
         lines: dict[LineKey, list[Tuple[int, str]]] = {}
-        for token, entry in zip(self.current_tokens, self.overlay_entries):
-            value = entry.get().strip()
+        for item in self.overlay_items:
+            value = item.entry.get().strip()
             if not value:
                 continue
+            token = item.token
             lines.setdefault(token.line_key, []).append((token.order_key[-1], value))
 
         composed: list[str] = []
@@ -365,12 +561,23 @@ class AnnotationApp:
         return self.entry_widget.get("1.0", tk.END).strip()
 
     def _clear_overlay_entries(self) -> None:
-        for entry in self.overlay_entries:
+        for item in self.overlay_items:
+            if item.fade_job is not None:
+                try:
+                    self.master.after_cancel(item.fade_job)
+                except tk.TclError:
+                    pass
+                item.fade_job = None
             try:
-                entry.destroy()
+                self.canvas.delete(item.rect_id)
+                self.canvas.delete(item.window_id)
             except tk.TclError:
                 pass
-        self.overlay_entries.clear()
+            try:
+                item.entry.destroy()
+            except tk.TclError:
+                pass
+        self.overlay_items.clear()
 
     def _suggest_label(self, path: Path) -> str:
         stem = path.stem
@@ -395,12 +602,10 @@ class AnnotationApp:
             counter += 1
 
         with Image.open(path) as image:
-            image = _prepare_image(image)
-            if image.mode not in {"RGB", "L"}:
-                image = image.convert("RGB")
-            image.save(candidate)
-        finally:
-            image.close()
+            prepared_image = _prepare_image(image)
+            if prepared_image.mode not in {"RGB", "L"}:
+                prepared_image = prepared_image.convert("RGB")
+            prepared_image.save(candidate)
         return candidate
 
     def _append_log(self, source: Path, label: str, status: str, saved_path: Optional[Path]) -> None:
