@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Protocol, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 
 
 BBox = Tuple[int, int, int, int]
@@ -118,23 +118,6 @@ class SetSelection(Command):
         store._apply_selection(self._previous)
 
 
-@dataclass
-class UpdateOverlayBounds(Command):
-    overlay_id: int
-    new_bbox: BBox
-    _previous: Optional[BBox] = field(default=None, init=False)
-
-    def do(self, store: "OverlayStore") -> None:
-        self._previous = store._set_overlay_bbox(self.overlay_id, self.new_bbox)
-        store._emit_overlays()
-
-    def undo(self, store: "OverlayStore") -> None:
-        if self._previous is None:
-            return
-        store._set_overlay_bbox(self.overlay_id, self._previous)
-        store._emit_overlays()
-
-
 class OverlayStore:
     """Single source of truth for overlays and selection state."""
 
@@ -244,21 +227,13 @@ class OverlayStore:
             return
         if additive:
             selection = set(self._selection)
-            if overlay_id in selection:
-                selection.remove(overlay_id)
-            else:
-                selection.add(overlay_id)
+            selection.add(overlay_id)
         else:
             selection = {overlay_id}
         self._apply_selection(selection)
 
-    def select_set(self, ids: Set[int], *, additive: bool = False) -> None:
-        if additive:
-            selection = set(self._selection)
-            selection.update(ids)
-        else:
-            selection = set(ids)
-        self._apply_selection(selection)
+    def select_set(self, ids: Set[int]) -> None:
+        self._apply_selection(set(ids))
 
     def clear_selection(self) -> None:
         if not self._selection:
@@ -296,10 +271,6 @@ class OverlayStore:
 
     def update_text(self, overlay_id: int, text: str) -> None:
         command = UpdateOverlayText(overlay_id, text)
-        self.do(command)
-
-    def update_bbox(self, overlay_id: int, bbox_base: BBox) -> None:
-        command = UpdateOverlayBounds(overlay_id, bbox_base)
         self.do(command)
 
     def remove_by_ids(self, ids: Sequence[int]) -> List[Overlay]:
@@ -414,16 +385,6 @@ class OverlayStore:
         if previous == text:
             return previous
         overlay.text = text
-        return previous
-
-    def _set_overlay_bbox(self, overlay_id: int, bbox: BBox) -> BBox:
-        overlay = self._overlays.get(overlay_id)
-        if overlay is None:
-            raise KeyError(f"Overlay {overlay_id} not found")
-        previous = overlay.bbox_base
-        if previous == bbox:
-            return previous
-        overlay.bbox_base = bbox
         return previous
 
     def _apply_selection(self, selection: Set[int]) -> None:
