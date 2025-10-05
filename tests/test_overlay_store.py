@@ -57,6 +57,8 @@ def test_manual_add_remove_and_history() -> None:
     assert store.selection == (manual_id,)
     manual_overlay = store.get_overlay(manual_id)
     assert manual_overlay is not None and manual_overlay.is_manual
+    assert manual_overlay.paragraph_key == (9999, manual_id, manual_id)
+    assert manual_overlay.line_key == (9999, manual_id, manual_id)
 
     removed = store.remove_by_ids([manual_id])
     assert [overlay.id for overlay in removed] == [manual_id]
