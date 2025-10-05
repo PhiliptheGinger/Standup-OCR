@@ -7,7 +7,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence,
 
 BBox = Tuple[int, int, int, int]
 TokenOrder = Tuple[int, int, int, int, int]
-LineKey = Tuple[int, int, int, int]
+ParagraphKey = Tuple[int, int, int]
+LineKey = Tuple[int, int, int]
 Listener = Callable[[object], None]
 
 
@@ -18,6 +19,7 @@ class OcrToken:
     text: str
     bbox: BBox
     order_key: TokenOrder
+    paragraph_key: ParagraphKey
     line_key: LineKey
 
 
@@ -30,6 +32,7 @@ class Overlay:
     text: str
     is_manual: bool
     order_key: TokenOrder
+    paragraph_key: ParagraphKey
     line_key: LineKey
     selected: bool = False
 
@@ -229,6 +232,7 @@ class OverlayStore:
                 text=token.text,
                 is_manual=False,
                 order_key=token.order_key,
+                paragraph_key=token.paragraph_key,
                 line_key=token.line_key,
             )
             self._insert_overlay(overlay)
@@ -282,7 +286,8 @@ class OverlayStore:
             text="",
             is_manual=True,
             order_key=(9999, 0, 0, overlay_id, overlay_id),
-            line_key=(9999, 0, 0, overlay_id),
+            paragraph_key=(9999, 0, overlay_id),
+            line_key=(9999, overlay_id, overlay_id),
         )
         command = AddOverlay([overlay], index=index)
         self.do(command)
@@ -325,26 +330,45 @@ class OverlayStore:
 
     def compose_text(self) -> str:
         lines: Dict[LineKey, List[Tuple[TokenOrder, str]]] = {}
+        line_orders: Dict[LineKey, Tuple[int, int, int, int]] = {}
+        paragraph_keys: Dict[LineKey, ParagraphKey] = {}
         for overlay in self.list_overlays():
             text = overlay.text.strip()
             if not text:
                 continue
-            lines.setdefault(overlay.line_key, []).append((overlay.order_key, text))
+            line_key = overlay.line_key
+            lines.setdefault(line_key, []).append((overlay.order_key, text))
+            line_orders.setdefault(line_key, overlay.order_key[:-1])
+            paragraph_keys.setdefault(line_key, overlay.paragraph_key)
 
         if not lines:
             return ""
 
-        ordered_lines: List[str] = []
-        for line_key in sorted(lines.keys()):
-            words = [
+        ordered_lines: List[Tuple[Tuple[int, int, int, int], ParagraphKey, str]] = []
+        for line_key, words in lines.items():
+            ordered_words = [
                 word
                 for _, word in sorted(
-                    lines[line_key],
+                    words,
                     key=lambda item: item[0],
                 )
             ]
-            ordered_lines.append(" ".join(words))
-        return "\n".join(ordered_lines)
+            ordered_lines.append(
+                (
+                    line_orders[line_key],
+                    paragraph_keys[line_key],
+                    " ".join(ordered_words),
+                )
+            )
+
+        composed_lines: List[str] = []
+        previous_paragraph: Optional[ParagraphKey] = None
+        for _, paragraph_key, line_text in sorted(ordered_lines, key=lambda item: item[0]):
+            if previous_paragraph is not None and paragraph_key != previous_paragraph:
+                composed_lines.append("")
+            composed_lines.append(line_text)
+            previous_paragraph = paragraph_key
+        return "\n".join(composed_lines)
 
     # ------------------------------------------------------------------
     # Undo/redo
@@ -474,6 +498,7 @@ __all__ = [
     "BBox",
     "LineKey",
     "TokenOrder",
+    "ParagraphKey",
     "OcrToken",
     "Overlay",
     "OverlayStore",

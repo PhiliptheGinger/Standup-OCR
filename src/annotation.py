@@ -32,7 +32,8 @@ except ImportError:  # pragma: no cover - fallback when running as script
 
 
 TokenOrder = Tuple[int, int, int, int, int]
-LineKey = Tuple[int, int, int, int]
+ParagraphKey = Tuple[int, int, int]
+LineKey = Tuple[int, int, int]
 
 CONTROL_MASK = 0x0004
 SHIFT_MASK = 0x0001
@@ -471,6 +472,7 @@ class AnnotationApp:
                 text=overlay.text,
                 bbox=overlay.bbox_base,
                 order_key=overlay.order_key,
+                paragraph_key=overlay.paragraph_key,
                 line_key=overlay.line_key,
             )
             legacy = existing.get(overlay.id)
@@ -1199,8 +1201,17 @@ class AnnotationApp:
 
             bbox = (left, top, left + width, top + height)
             order_key: TokenOrder = (page, block, paragraph, line, word)
-            line_key: LineKey = (page, block, paragraph, line)
-            tokens.append(OcrToken(text=text, bbox=bbox, order_key=order_key, line_key=line_key))
+            paragraph_key: ParagraphKey = (page, block, paragraph)
+            line_key: LineKey = (page, block, line)
+            tokens.append(
+                OcrToken(
+                    text=text,
+                    bbox=bbox,
+                    order_key=order_key,
+                    paragraph_key=paragraph_key,
+                    line_key=line_key,
+                )
+            )
 
         tokens.sort(key=lambda token: token.order_key)
         return tokens
@@ -1209,14 +1220,39 @@ class AnnotationApp:
         if not tokens:
             return ""
 
-        lines: Dict[LineKey, List[Tuple[int, str]]] = {}
+        lines: Dict[LineKey, List[Tuple[TokenOrder, str]]] = {}
+        line_orders: Dict[LineKey, Tuple[int, int, int, int]] = {}
+        paragraph_keys: Dict[LineKey, ParagraphKey] = {}
         for token in tokens:
-            lines.setdefault(token.line_key, []).append((token.order_key[-1], token.text))
+            line_key = token.line_key
+            lines.setdefault(line_key, []).append((token.order_key, token.text))
+            line_orders.setdefault(line_key, token.order_key[:-1])
+            paragraph_keys.setdefault(line_key, token.paragraph_key)
+
+        ordered_lines: List[Tuple[Tuple[int, int, int, int], ParagraphKey, str]] = []
+        for line_key, words in lines.items():
+            ordered_words = [
+                word
+                for _, word in sorted(
+                    words,
+                    key=lambda item: item[0],
+                )
+            ]
+            ordered_lines.append(
+                (
+                    line_orders[line_key],
+                    paragraph_keys[line_key],
+                    " ".join(ordered_words),
+                )
+            )
 
         composed: List[str] = []
-        for line_key in sorted(lines.keys()):
-            words = [word for _, word in sorted(lines[line_key], key=lambda item: item[0])]
-            composed.append(" ".join(words))
+        previous_paragraph: Optional[ParagraphKey] = None
+        for _, paragraph_key, text in sorted(ordered_lines, key=lambda item: item[0]):
+            if previous_paragraph is not None and paragraph_key != previous_paragraph:
+                composed.append("")
+            composed.append(text)
+            previous_paragraph = paragraph_key
         return "\n".join(composed)
 
     # ------------------------------------------------------------------

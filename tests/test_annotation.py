@@ -209,8 +209,20 @@ def test_apply_transcription_clears_overlay_entries():
     app.rect_to_overlay = {}
     app.selected_rects = set()
     app.current_tokens = [
-        annotation.OcrToken("first", (0, 0, 0, 0), (0, 0, 0, 0, 0), (0, 0, 0)),
-        annotation.OcrToken("second", (0, 0, 0, 0), (0, 0, 0, 0, 1), (0, 0, 0)),
+        annotation.OcrToken(
+            "first",
+            (0, 0, 0, 0),
+            (0, 0, 0, 0, 0),
+            (0, 0, 0),
+            (0, 0, 0),
+        ),
+        annotation.OcrToken(
+            "second",
+            (0, 0, 0, 0),
+            (0, 0, 0, 0, 1),
+            (0, 0, 0),
+            (0, 0, 0),
+        ),
     ]
     app.entry_widget = DummyText("")
     app._setting_transcription = False
@@ -549,8 +561,20 @@ def test_draw_select_delete_interactions(monkeypatch):
 
     image = Image.new("RGB", (100, 40), "white")
     tokens = [
-        annotation.OcrToken("alpha", (0, 0, 20, 10), (1, 1, 1, 1, 1), (1, 1, 1)),
-        annotation.OcrToken("beta", (25, 0, 45, 10), (1, 1, 1, 1, 2), (1, 1, 1)),
+        annotation.OcrToken(
+            "alpha",
+            (0, 0, 20, 10),
+            (1, 1, 1, 1, 1),
+            (1, 1, 1),
+            (1, 1, 1),
+        ),
+        annotation.OcrToken(
+            "beta",
+            (25, 0, 45, 10),
+            (1, 1, 1, 1, 2),
+            (1, 1, 1),
+            (1, 1, 1),
+        ),
     ]
 
     AnnotationApp._display_image(app, image, tokens)
