@@ -233,6 +233,59 @@ def test_apply_transcription_clears_overlay_entries():
     assert all(entry.value == "" for entry in entries)
 
 
+def test_compose_text_from_tokens_groups_lines_and_paragraphs() -> None:
+    app = AnnotationApp.__new__(AnnotationApp)
+    tokens = [
+        annotation.OcrToken(
+            "hello",
+            (0, 0, 0, 0),
+            (1, 1, 1, 1, 1),
+            (1, 1, 1),
+            (1, 1, 1),
+        ),
+        annotation.OcrToken(
+            "there",
+            (0, 0, 0, 0),
+            (1, 1, 1, 1, 2),
+            (1, 1, 1),
+            (1, 1, 1),
+        ),
+        annotation.OcrToken(
+            "general",
+            (0, 0, 0, 0),
+            (1, 1, 1, 2, 1),
+            (1, 1, 1),
+            (1, 1, 2),
+        ),
+        annotation.OcrToken(
+            "kenobi",
+            (0, 0, 0, 0),
+            (1, 1, 1, 2, 2),
+            (1, 1, 1),
+            (1, 1, 2),
+        ),
+        annotation.OcrToken(
+            "Another",
+            (0, 0, 0, 0),
+            (1, 1, 2, 1, 1),
+            (1, 1, 2),
+            (1, 1, 3),
+        ),
+        annotation.OcrToken(
+            "paragraph",
+            (0, 0, 0, 0),
+            (1, 1, 2, 1, 2),
+            (1, 1, 2),
+            (1, 1, 3),
+        ),
+    ]
+
+    assert (
+        AnnotationApp._compose_text_from_tokens(app, tokens)
+        == "hello there\ngeneral kenobi\n\nAnother paragraph"
+    )
+
+
 def test_confirm_revisit_uses_persisted_metadata(tmp_path):
     app = AnnotationApp.__new__(AnnotationApp)
     image_path = tmp_path / "sample.png"

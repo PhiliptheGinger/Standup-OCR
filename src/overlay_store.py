@@ -285,8 +285,8 @@ class OverlayStore:
             bbox_base=bbox_base,
             text="",
             is_manual=True,
-            order_key=(9999, 0, 0, overlay_id, overlay_id),
-            paragraph_key=(9999, 0, overlay_id),
+            order_key=(9999, overlay_id, overlay_id, overlay_id, overlay_id),
+            paragraph_key=(9999, overlay_id, overlay_id),
             line_key=(9999, overlay_id, overlay_id),
         )
         command = AddOverlay([overlay], index=index)
