@@ -9,9 +9,16 @@ def make_token(
     text: str,
     bbox: tuple[int, int, int, int],
     order: tuple[int, int, int, int, int],
+    paragraph: tuple[int, int, int],
     line: tuple[int, int, int],
 ) -> OcrToken:
-    return OcrToken(text=text, bbox=bbox, order_key=order, line_key=line)
+    return OcrToken(
+        text=text,
+        bbox=bbox,
+        order_key=order,
+        paragraph_key=paragraph,
+        line_key=line,
+    )
 
 
 def extract_ids(store: OverlayStore) -> List[int]:
@@ -21,8 +28,8 @@ def extract_ids(store: OverlayStore) -> List[int]:
 def test_set_tokens_and_selection() -> None:
     store = OverlayStore()
     tokens = [
-        make_token("hello", (0, 0, 10, 10), (1, 1, 1, 1, 1), (1, 1, 1)),
-        make_token("world", (12, 0, 22, 10), (1, 1, 1, 1, 2), (1, 1, 1)),
+        make_token("hello", (0, 0, 10, 10), (1, 1, 1, 1, 1), (1, 1, 1), (1, 1, 1)),
+        make_token("world", (12, 0, 22, 10), (1, 1, 1, 1, 2), (1, 1, 1), (1, 1, 1)),
     ]
 
     store.set_tokens(tokens)
@@ -68,9 +75,9 @@ def test_manual_add_remove_and_history() -> None:
 def test_compose_text_and_update_order() -> None:
     store = OverlayStore()
     tokens = [
-        make_token("first", (0, 0, 10, 10), (1, 1, 1, 1, 1), (1, 1, 1)),
-        make_token("third", (15, 0, 25, 10), (1, 1, 1, 1, 2), (1, 1, 1)),
-        make_token("second", (0, 20, 10, 30), (1, 1, 1, 2, 1), (1, 1, 2)),
+        make_token("first", (0, 0, 10, 10), (1, 1, 1, 1, 1), (1, 1, 1), (1, 1, 1)),
+        make_token("third", (15, 0, 25, 10), (1, 1, 1, 1, 2), (1, 1, 1), (1, 1, 1)),
+        make_token("second", (0, 20, 10, 30), (1, 1, 1, 2, 1), (1, 1, 1), (1, 1, 2)),
     ]
     store.set_tokens(tokens)
     overlays = store.list_overlays()
@@ -81,10 +88,28 @@ def test_compose_text_and_update_order() -> None:
     assert store.compose_text() == "first third\nsecond"
 
 
+def test_compose_text_preserves_paragraph_breaks() -> None:
+    store = OverlayStore()
+    tokens = [
+        make_token("hello", (0, 0, 10, 10), (1, 1, 1, 1, 1), (1, 1, 1), (1, 1, 1)),
+        make_token("there", (12, 0, 20, 10), (1, 1, 1, 1, 2), (1, 1, 1), (1, 1, 1)),
+        make_token("general", (0, 12, 15, 22), (1, 1, 1, 2, 1), (1, 1, 1), (1, 1, 2)),
+        make_token("kenobi", (16, 12, 30, 22), (1, 1, 1, 2, 2), (1, 1, 1), (1, 1, 2)),
+        make_token("Another", (0, 30, 15, 40), (1, 1, 2, 1, 1), (1, 1, 2), (1, 1, 3)),
+        make_token("paragraph", (16, 30, 35, 40), (1, 1, 2, 1, 2), (1, 1, 2), (1, 1, 3)),
+    ]
+    store.set_tokens(tokens)
+
+    assert (
+        store.compose_text()
+        == "hello there\ngeneral kenobi\n\nAnother paragraph"
+    )
+
+
 def test_redo_cleared_after_new_command() -> None:
     store = OverlayStore()
     tokens = [
-        make_token("word", (0, 0, 10, 10), (1, 1, 1, 1, 1), (1, 1, 1)),
+        make_token("word", (0, 0, 10, 10), (1, 1, 1, 1, 1), (1, 1, 1), (1, 1, 1)),
     ]
     store.set_tokens(tokens)
     overlay_id = store.list_overlays()[0].id
@@ -98,8 +123,8 @@ def test_redo_cleared_after_new_command() -> None:
 def test_remove_returns_overlays_in_order() -> None:
     store = OverlayStore()
     tokens = [
-        make_token("a", (0, 0, 5, 5), (1, 1, 1, 1, 1), (1, 1, 1)),
-        make_token("b", (10, 0, 15, 5), (1, 1, 1, 1, 2), (1, 1, 1)),
+        make_token("a", (0, 0, 5, 5), (1, 1, 1, 1, 1), (1, 1, 1), (1, 1, 1)),
+        make_token("b", (10, 0, 15, 5), (1, 1, 1, 1, 2), (1, 1, 1), (1, 1, 1)),
     ]
     store.set_tokens(tokens)
     overlays = store.list_overlays()
