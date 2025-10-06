@@ -8,10 +8,11 @@ from typing import Iterable, List
 
 import pandas as pd
 
-from src.annotation import annotate_images, AnnotationAutoTrainConfig
+from src.annotation import AnnotationAutoTrainConfig, AnnotationOptions, annotate_images
 from src.ocr import ocr_image
 from src.review import ReviewAborted, ReviewConfig, ReviewSession
 from src.training import SUPPORTED_EXTENSIONS, train_model
+from src.kraken_adapter import is_available as kraken_available, ocr as kraken_ocr, train as kraken_train
 
 
 DEFAULT_TRAIN_DIR = Path("train")
@@ -36,6 +37,23 @@ def iter_images(folder: Path) -> Iterable[Path]:
 
 
 def handle_train(args: argparse.Namespace) -> None:
+    if args.engine == "kraken":
+        if not kraken_available():
+            raise RuntimeError(
+                "Kraken is not installed. Install it with 'pip install kraken[serve]' to train Kraken models."
+            )
+        model_out = args.model if args.model else args.model_dir / "kraken.mlmodel"
+        base_model = args.base_model
+        model_path = kraken_train(
+            args.train_dir,
+            Path(model_out),
+            epochs=args.epochs,
+            val_split=args.val_split,
+            base_model=base_model,
+        )
+        logging.info("Kraken model saved to %s", model_path)
+        return
+
     model_path = train_model(
         args.train_dir,
         args.output_model,
@@ -80,6 +98,49 @@ def handle_batch(args: argparse.Namespace) -> None:
     output = Path(args.output)
     df.to_csv(output, index=False)
     logging.info("Batch OCR complete. Results saved to %s", output)
+
+
+def handle_ocr(args: argparse.Namespace) -> None:
+    input_path = Path(args.input_dir)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input path not found: {input_path}")
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.engine == "kraken":
+        if not kraken_available():
+            raise RuntimeError(
+                "Kraken is not installed. Install it with 'pip install kraken[serve]' to run Kraken OCR."
+            )
+        if args.model is None:
+            raise ValueError("--model is required when using --engine kraken")
+        model_path = Path(args.model)
+        if input_path.is_dir():
+            images = list(iter_images(input_path))
+        else:
+            images = [input_path]
+        if not images:
+            logging.warning("No images found in %s", input_path)
+        for image_path in images:
+            out_txt = output_dir / f"{image_path.stem}.txt"
+            kraken_ocr(image_path, model_path, out_txt)
+        return
+
+    if input_path.is_dir():
+        images = list(iter_images(input_path))
+    else:
+        images = [input_path]
+    if not images:
+        logging.warning("No images found in %s", input_path)
+    for image_path in images:
+        text = ocr_image(
+            image_path,
+            model_path=args.model,
+            tessdata_dir=args.tessdata_dir,
+            psm=args.psm,
+        )
+        out_txt = output_dir / f"{image_path.stem}.txt"
+        out_txt.write_text(text, encoding="utf8")
 
 
 def handle_review(args: argparse.Namespace) -> None:
@@ -167,9 +228,21 @@ def handle_annotate(args: argparse.Namespace) -> None:
             tessdata_dir=args.tessdata_dir,
         )
 
+    if args.engine == "kraken" and args.seg == "auto" and not kraken_available():
+        logging.warning(
+            "Kraken auto-segmentation requested but Kraken is not installed; falling back to manual mode."
+        )
+
+    options = AnnotationOptions(
+        engine=args.engine,
+        segmentation=args.seg,
+        export_format=args.export,
+    )
+
     annotate_images(
         paths,
         args.train_dir,
+        options=options,
         log_path=args.output_log,
         auto_train_config=auto_train_config,
     )
@@ -190,6 +263,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fine-tune a Tesseract model using samples placed in the train/ folder.",
     )
     train_parser.add_argument(
+        "--engine",
+        choices=["tesseract", "kraken"],
+        default="tesseract",
+        help="Training engine to use (default: tesseract).",
+    )
+    train_parser.add_argument(
         "--train-dir",
         type=Path,
         default=DEFAULT_TRAIN_DIR,
@@ -207,6 +286,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Base name of the output model (default: handwriting).",
     )
     train_parser.add_argument(
+        "--model",
+        type=Path,
+        help="Output model path when training with Kraken.",
+    )
+    train_parser.add_argument(
         "--tessdata-dir",
         type=Path,
         help="Path to tessdata directory containing base traineddata files.",
@@ -221,6 +305,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1000,
         help="Training iterations to run (default: 1000).",
+    )
+    train_parser.add_argument(
+        "--epochs",
+        type=int,
+        default=50,
+        help="Epochs to train when using Kraken (default: 50).",
+    )
+    train_parser.add_argument(
+        "--val-split",
+        type=float,
+        default=0.1,
+        help="Validation split for Kraken training (default: 0.1).",
+    )
+    train_parser.add_argument(
+        "--base-model",
+        type=Path,
+        help="Optional base Kraken model to fine-tune.",
     )
     train_parser.set_defaults(func=handle_train)
 
@@ -275,6 +376,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Where to save the CSV summary (default: results.csv).",
     )
     batch_parser.set_defaults(func=handle_batch)
+
+    ocr_parser = subparsers.add_parser(
+        "ocr",
+        help="Run OCR over a file or folder using the selected engine.",
+    )
+    ocr_parser.add_argument(
+        "--engine",
+        choices=["tesseract", "kraken"],
+        default="kraken",
+        help="OCR engine to use (default: kraken).",
+    )
+    ocr_parser.add_argument(
+        "--model",
+        type=Path,
+        help="Model to use for OCR (required for Kraken).",
+    )
+    ocr_parser.add_argument(
+        "--in",
+        dest="input_dir",
+        type=Path,
+        required=True,
+        help="Image file or directory to process.",
+    )
+    ocr_parser.add_argument(
+        "--out",
+        dest="output_dir",
+        type=Path,
+        required=True,
+        help="Directory where recognised text files will be written.",
+    )
+    ocr_parser.add_argument(
+        "--tessdata-dir",
+        type=Path,
+        help="Optional tessdata directory for Tesseract OCR.",
+    )
+    ocr_parser.add_argument(
+        "--psm",
+        type=int,
+        default=6,
+        help="Tesseract page segmentation mode when using --engine tesseract (default: 6).",
+    )
+    ocr_parser.set_defaults(func=handle_ocr)
 
     review_parser = subparsers.add_parser(
         "review",
@@ -351,6 +494,24 @@ def build_parser() -> argparse.ArgumentParser:
     annotate_parser = subparsers.add_parser(
         "annotate",
         help="Manually confirm transcriptions for a set of images using a GUI tool.",
+    )
+    annotate_parser.add_argument(
+        "--engine",
+        choices=["tesseract", "kraken"],
+        default="kraken",
+        help="Annotation engine to use for automation (default: kraken).",
+    )
+    annotate_parser.add_argument(
+        "--seg",
+        choices=["auto", "manual"],
+        default="auto",
+        help="Segmentation mode (default: auto).",
+    )
+    annotate_parser.add_argument(
+        "--export",
+        choices=["lines", "pagexml"],
+        default="lines",
+        help="Export format for training data (default: lines).",
     )
     annotate_parser.add_argument(
         "--source",
