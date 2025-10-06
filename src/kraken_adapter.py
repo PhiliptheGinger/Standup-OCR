@@ -6,6 +6,7 @@ import inspect
 import logging
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from types import ModuleType
 from typing import List, Optional, Tuple
@@ -135,6 +136,9 @@ def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[
             raise
         except Exception as exc:  # pragma: no cover - segmentation errors only at runtime
             raise RuntimeError(f"Kraken segmentation failed: {exc}") from exc
+
+    if segmentation is None:
+        segmentation = _segment_via_cli(image_path)
 
     baselines: List[List[Tuple[float, float]]] = []
     for line in segmentation.get("lines", []):
