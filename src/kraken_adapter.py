@@ -1,6 +1,4 @@
-"""Thin wrappers around Kraken/ketos functionality."""
-from __future__ import annotations
-"""Optional integration with Kraken (ketos) for segmentation and OCR."""
+"""Integration helpers for Kraken's CLI tooling."""
 
 import inspect
 import logging
@@ -11,12 +9,23 @@ from pathlib import Path
 from types import ModuleType
 from typing import List, Optional, Tuple
 
-from PIL import Image
-
 Logger = logging.getLogger(__name__)
 
 
+def _kraken_exe_in_venv() -> str | None:
+    """Return the kraken executable if available on PATH."""
+
+    exe = shutil.which("kraken")
+    if exe:
+        return exe
+
+    return None
+
+
 def is_available() -> bool:
+    if _kraken_exe_in_venv() is not None:
+        return True
+
     try:
         import kraken  # type: ignore  # pragma: no cover
 
@@ -26,6 +35,9 @@ def is_available() -> bool:
 
 
 def _require_kraken() -> None:
+    if _kraken_exe_in_venv() is not None:
+        return
+
     if not is_available():
         raise RuntimeError(
             "Kraken is not available. Install it with 'pip install kraken[serve]' "
@@ -94,10 +106,14 @@ def _load_segmentation_module() -> ModuleType:
 def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[List[Tuple[float, float]]]:
     """Run Kraken's baseline segmenter and return a list of baselines.
 
-    The function favours the Python API (``kraken.blla``) but falls back to the
-    command line if necessary. When ``out_pagexml`` is provided, the PAGE-XML
-    produced by Kraken is saved to that location when possible.
-    """
+        try:
+            return json.loads(output_json.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - best effort parsing
+            raise RuntimeError(f"Failed to parse Kraken CLI segmentation output: {exc}") from exc
+
+
+def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[List[Tuple[float, float]]]:
+    """Run Kraken's baseline segmenter via the CLI and return baselines."""
 
     _require_kraken()
     try:
@@ -166,12 +182,7 @@ def train(
     val_split: float = 0.1,
     base_model: Optional[Path] = None,
 ) -> Path:
-    """Call ``ketos train`` with the given dataset directory.
-
-    The directory should contain line images with ``.gt.txt`` files or PAGE-XML
-    documents as required by Kraken. This helper constructs a basic training
-    command but leaves advanced options to the user via manual invocation.
-    """
+    """Call ``ketos train`` with the given dataset directory."""
 
     _require_kraken()
     ketos = shutil.which("ketos")
