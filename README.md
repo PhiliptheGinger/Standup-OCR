@@ -85,3 +85,21 @@ evaluate the updated model.
 > **Note:** The annotation interface relies on Tkinter, which ships with most
 > standard Python installers. On some Linux distributions you may need to
 > install an additional package such as `python3-tk` to enable the GUI.
+
+## Kraken installation (Windows quick start)
+
+1. Install [Python 3.10+](https://www.python.org/downloads/windows/) and ensure "Add python.exe to PATH" is ticked during setup.
+2. Open **PowerShell** and install [pipx](https://pypa.github.io/pipx/) if it is not already available:
+
+   ```powershell
+   python -m pip install --user pipx
+   python -m pipx ensurepath
+   ```
+
+3. Close and reopen PowerShell, then install Kraken together with its CLI tools:
+
+   ```powershell
+   pipx install "kraken[serve]"
+   ```
+
+4. Confirm the installation with `kraken --version` and `ketos --help`. Both commands should be available in any new shell session.
