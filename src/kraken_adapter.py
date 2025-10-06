@@ -1,5 +1,9 @@
 """Integration helpers for Kraken's CLI tooling."""
 
+from __future__ import annotations
+
+import json
+
 import inspect
 import logging
 import shutil
@@ -170,7 +174,7 @@ def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[
             xml_bytes = serialize(segmentation=segmentation)
             out_pagexml.write_bytes(xml_bytes)
         except Exception as exc:  # pragma: no cover - serialisation is best-effort
-            Logger.warning("Failed to serialise PAGE-XML via Kraken: %s", exc)
+            log.warning("Failed to serialise PAGE-XML via Kraken: %s", exc)
 
     return baselines
 
@@ -206,7 +210,7 @@ def train(
         cmd.extend(["--load", str(base_model)])
     cmd.append(str(dataset_dir))
 
-    Logger.info("Running ketos: %s", " ".join(cmd))
+    log.info("Running ketos: %s", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True)
     except FileNotFoundError as exc:  # pragma: no cover - subprocess failure only at runtime
@@ -240,7 +244,7 @@ def ocr(image_path: Path, model_path: Path, out_txt: Path) -> None:
         "-m",
         str(model_path),
     ]
-    Logger.info("Running kraken OCR: %s", " ".join(cmd))
+    log.info("Running kraken OCR: %s", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True)
     except FileNotFoundError as exc:  # pragma: no cover
