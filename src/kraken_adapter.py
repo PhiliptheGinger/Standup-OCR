@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+
+import inspect
 import logging
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from types import ModuleType
 from typing import List, Optional, Tuple
 
-log = logging.getLogger(__name__)
+Logger = logging.getLogger(__name__)
 
 
 def _kraken_exe_in_venv() -> str | None:
@@ -46,26 +49,66 @@ def _require_kraken() -> None:
         )
 
 
-def _run_cli_segment(image_path: Path) -> dict:
-    """Run Kraken's CLI segmenter and return the parsed JSON output."""
+def _explain_import_error(exc: ImportError, previous_exc: ImportError | None = None) -> str:
+    """Return a user-facing explanation for Kraken import errors."""
 
-    exe = _kraken_exe_in_venv()
-    if exe:
-        cmd = [exe, "-i", str(image_path), "seg.json", "segment"]
-        invocation = "kraken"
-    else:
-        cmd = ["python", "-m", "kraken", "-i", str(image_path), "seg.json", "segment"]
-        invocation = "python -m kraken"
+    message = str(exc)
+    if "kraken.blla is not a package" in message or "'kraken' is not a package" in message:
+        return (
+            "This Kraken installation no longer exposes the legacy 'kraken.blla' module. "
+            "Recent releases moved the segmentation API to 'kraken.lib.segmentation'. "
+            "Upgrade Standup-OCR or reinstall Kraken with 'pip install -U kraken[serve]' "
+            "to ensure the new module is available."
+        )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
-        output_json = tmp_path / "seg.json"
-        cmd = [*cmd[:-2], str(output_json), cmd[-1]]
-        log.info("Running Kraken segmentation via %s: %s", invocation, " ".join(cmd))
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as exc:  # pragma: no cover - runtime failure only
-            raise RuntimeError(f"Kraken CLI segmentation failed with exit code {exc.returncode}") from exc
+    if previous_exc is not None:
+        previous_name = getattr(previous_exc, "name", "")
+        if previous_name == "kraken.lib.segmentation":
+            return (
+                "Kraken's modern segmentation API ('kraken.lib.segmentation') could not "
+                "be imported, and the legacy fallback also failed. Upgrade Kraken with "
+                "'pip install -U kraken[serve]' to obtain a compatible release."
+            )
+
+    if "not a package" in message:
+        return (
+            "Kraken could not be imported because another module named 'kraken' "
+            "is shadowing the official library. Rename or remove the conflicting "
+            "module (for example a local 'kraken.py' file) and reinstall the "
+            "package with 'pip install -U kraken[serve]'."
+        )
+
+    missing = getattr(exc, "name", "")
+    if missing in {"kraken", "kraken.blla", "kraken.lib.segmentation"}:
+        return (
+            "Kraken's Python API is unavailable. Ensure it is installed in the "
+            "current environment by running 'pip install -U kraken[serve]'."
+        )
+
+    return f"Kraken is installed but failed to load its segmentation API ({message})."
+
+
+def _load_segmentation_module() -> ModuleType:
+    """Load Kraken's segmentation module with support for multiple versions."""
+
+    lib_exc: ImportError | None = None
+    try:
+        from kraken.lib import segmentation as segmentation_mod  # type: ignore
+
+        return segmentation_mod
+    except ImportError as exc:
+        lib_exc = exc
+
+    try:
+        from kraken import blla as segmentation_mod  # type: ignore
+
+        return segmentation_mod
+    except ImportError as exc:
+        raise RuntimeError(_explain_import_error(exc, lib_exc)) from exc
+
+
+def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[List[Tuple[float, float]]]:
+    """Run Kraken's baseline segmenter and return a list of baselines.
 
         try:
             return json.loads(output_json.read_text(encoding="utf-8"))
@@ -77,8 +120,45 @@ def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[
     """Run Kraken's baseline segmenter via the CLI and return baselines."""
 
     _require_kraken()
+    try:
+        segmentation_module = _load_segmentation_module()
+    except RuntimeError:
+        raise
+    except Exception as exc:  # pragma: no cover - only triggered when API fails
+        raise RuntimeError("Kraken is installed but the segmentation API is unavailable") from exc
 
-    segmentation = _run_cli_segment(Path(image_path))
+    with Image.open(image_path) as image:
+        img = image.convert("L")
+        try:
+            if hasattr(segmentation_module, "segment"):
+                segment_fn = getattr(segmentation_module, "segment")
+                kwargs = {}
+                signature = inspect.signature(segment_fn)
+                if "text_direction" in signature.parameters:
+                    kwargs["text_direction"] = "ltr"
+                if "script" in signature.parameters:
+                    kwargs["script"] = "latin"
+                if "model" in signature.parameters:
+                    kwargs["model"] = None
+                segmentation = segment_fn(img, **kwargs)
+            elif hasattr(segmentation_module, "segment_image"):
+                segment_fn = getattr(segmentation_module, "segment_image")
+                kwargs = {}
+                signature = inspect.signature(segment_fn)
+                if "model" in signature.parameters:
+                    kwargs["model"] = None
+                segmentation = segment_fn(img, **kwargs)
+            else:  # pragma: no cover - defensive
+                raise RuntimeError(
+                    "Unsupported Kraken segmentation API: expected 'segment' or 'segment_image'."
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:  # pragma: no cover - segmentation errors only at runtime
+            raise RuntimeError(f"Kraken segmentation failed: {exc}") from exc
+
+    if segmentation is None:
+        segmentation = _segment_via_cli(image_path)
 
     baselines: List[List[Tuple[float, float]]] = []
     for line in segmentation.get("lines", []):
