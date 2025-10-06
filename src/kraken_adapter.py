@@ -1,19 +1,32 @@
-"""Thin wrappers around Kraken/ketos functionality."""
-from __future__ import annotations
-"""Optional integration with Kraken (ketos) for segmentation and OCR."""
+"""Integration helpers for Kraken's CLI tooling."""
 
+from __future__ import annotations
+
+import json
 import logging
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from PIL import Image
+log = logging.getLogger(__name__)
 
-Logger = logging.getLogger(__name__)
+
+def _kraken_exe_in_venv() -> str | None:
+    """Return the kraken executable if available on PATH."""
+
+    exe = shutil.which("kraken")
+    if exe:
+        return exe
+
+    return None
 
 
 def is_available() -> bool:
+    if _kraken_exe_in_venv() is not None:
+        return True
+
     try:
         import kraken  # type: ignore  # pragma: no cover
 
@@ -23,6 +36,9 @@ def is_available() -> bool:
 
 
 def _require_kraken() -> None:
+    if _kraken_exe_in_venv() is not None:
+        return
+
     if not is_available():
         raise RuntimeError(
             "Kraken is not available. Install it with 'pip install kraken[serve]' "
@@ -30,25 +46,39 @@ def _require_kraken() -> None:
         )
 
 
-def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[List[Tuple[float, float]]]:
-    """Run Kraken's baseline segmenter and return a list of baselines.
+def _run_cli_segment(image_path: Path) -> dict:
+    """Run Kraken's CLI segmenter and return the parsed JSON output."""
 
-    The function favours the Python API (``kraken.blla``) but falls back to the
-    command line if necessary. When ``out_pagexml`` is provided, the PAGE-XML
-    produced by Kraken is saved to that location when possible.
-    """
+    exe = _kraken_exe_in_venv()
+    if exe:
+        cmd = [exe, "-i", str(image_path), "seg.json", "segment"]
+        invocation = "kraken"
+    else:
+        cmd = ["python", "-m", "kraken", "-i", str(image_path), "seg.json", "segment"]
+        invocation = "python -m kraken"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_json = tmp_path / "seg.json"
+        cmd = [*cmd[:-2], str(output_json), cmd[-1]]
+        log.info("Running Kraken segmentation via %s: %s", invocation, " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as exc:  # pragma: no cover - runtime failure only
+            raise RuntimeError(f"Kraken CLI segmentation failed with exit code {exc.returncode}") from exc
+
+        try:
+            return json.loads(output_json.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - best effort parsing
+            raise RuntimeError(f"Failed to parse Kraken CLI segmentation output: {exc}") from exc
+
+
+def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[List[Tuple[float, float]]]:
+    """Run Kraken's baseline segmenter via the CLI and return baselines."""
 
     _require_kraken()
-    try:
-        from kraken import blla  # type: ignore
-    except Exception as exc:  # pragma: no cover - only triggered when API fails
-        raise RuntimeError("Kraken is installed but the baseline API is unavailable") from exc
 
-    with Image.open(image_path) as image:
-        try:
-            segmentation = blla.segment(image.convert("L"))  # type: ignore[attr-defined]
-        except Exception as exc:  # pragma: no cover - segmentation errors only at runtime
-            raise RuntimeError(f"Kraken segmentation failed: {exc}") from exc
+    segmentation = _run_cli_segment(Path(image_path))
 
     baselines: List[List[Tuple[float, float]]] = []
     for line in segmentation.get("lines", []):
@@ -64,7 +94,7 @@ def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[
             xml_bytes = serialize(segmentation=segmentation)
             out_pagexml.write_bytes(xml_bytes)
         except Exception as exc:  # pragma: no cover - serialisation is best-effort
-            Logger.warning("Failed to serialise PAGE-XML via Kraken: %s", exc)
+            log.warning("Failed to serialise PAGE-XML via Kraken: %s", exc)
 
     return baselines
 
@@ -76,12 +106,7 @@ def train(
     val_split: float = 0.1,
     base_model: Optional[Path] = None,
 ) -> Path:
-    """Call ``ketos train`` with the given dataset directory.
-
-    The directory should contain line images with ``.gt.txt`` files or PAGE-XML
-    documents as required by Kraken. This helper constructs a basic training
-    command but leaves advanced options to the user via manual invocation.
-    """
+    """Call ``ketos train`` with the given dataset directory."""
 
     _require_kraken()
     ketos = shutil.which("ketos")
@@ -105,7 +130,7 @@ def train(
         cmd.extend(["--load", str(base_model)])
     cmd.append(str(dataset_dir))
 
-    Logger.info("Running ketos: %s", " ".join(cmd))
+    log.info("Running ketos: %s", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True)
     except FileNotFoundError as exc:  # pragma: no cover - subprocess failure only at runtime
@@ -139,7 +164,7 @@ def ocr(image_path: Path, model_path: Path, out_txt: Path) -> None:
         "-m",
         str(model_path),
     ]
-    Logger.info("Running kraken OCR: %s", " ".join(cmd))
+    log.info("Running kraken OCR: %s", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True)
     except FileNotFoundError as exc:  # pragma: no cover
