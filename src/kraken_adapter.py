@@ -3,7 +3,6 @@ from __future__ import annotations
 """Optional integration with Kraken (ketos) for segmentation and OCR."""
 
 import inspect
-import json
 import logging
 import shutil
 import subprocess
@@ -92,31 +91,6 @@ def _load_segmentation_module() -> ModuleType:
         raise RuntimeError(_explain_import_error(exc, lib_exc)) from exc
 
 
-def _segment_via_cli(image_path: Path) -> dict:
-    """Run Kraken's CLI segmenter and return the parsed JSON output."""
-
-    kraken_cmd = shutil.which("kraken")
-    if kraken_cmd is None:
-        raise RuntimeError(
-            "Kraken's Python API is unavailable and the 'kraken' CLI could not be found. "
-            "Install Kraken with 'pip install -U kraken[serve]' to obtain the CLI tools."
-        )
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        output_json = Path(tmpdir) / "segmentation.json"
-        cmd = [kraken_cmd, "-i", str(image_path), str(output_json), "segment"]
-        Logger.info("Falling back to Kraken CLI segmentation: %s", " ".join(cmd))
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as exc:  # pragma: no cover - runtime failure only
-            raise RuntimeError(f"Kraken CLI segmentation failed with exit code {exc.returncode}") from exc
-
-        try:
-            return json.loads(output_json.read_text(encoding="utf-8"))
-        except Exception as exc:  # pragma: no cover - best effort parsing
-            raise RuntimeError(f"Failed to parse Kraken CLI segmentation output: {exc}") from exc
-
-
 def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[List[Tuple[float, float]]]:
     """Run Kraken's baseline segmenter and return a list of baselines.
 
@@ -135,51 +109,31 @@ def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[
 
     with Image.open(image_path) as image:
         img = image.convert("L")
-        segmentation = None
-
-        def _call_segment(function_name: str, extra_kwargs: dict[str, object]) -> Optional[dict]:
-            fn = getattr(segmentation_module, function_name, None)
-            if fn is None or not callable(fn):
-                return None
-
-            kwargs = {}
-            signature = inspect.signature(fn)
-            for key, value in extra_kwargs.items():
-                if key in signature.parameters:
-                    kwargs[key] = value
-
-            try:
-                return fn(img, **kwargs)
-            except TypeError:  # pragma: no cover - signature mismatch, try other APIs
-                return None
-
         try:
-            segmentation = _call_segment(
-                "segment",
-                {"text_direction": "ltr", "script": "latin", "model": None},
-            )
-
-            if segmentation is None:
-                segmentation = _call_segment("segment_image", {"model": None})
-
-            if segmentation is None:
-                segmentation = _call_segment("baseline_segment", {"text_direction": "ltr", "model": None})
-
-            if segmentation is None:
-                segmenter_cls = getattr(segmentation_module, "Segmenter", None)
-                if segmenter_cls is not None:
-                    try:
-                        segmenter = segmenter_cls()
-                        if hasattr(segmenter, "segment") and callable(segmenter.segment):
-                            segmentation = segmenter.segment(img)
-                        elif callable(segmenter):
-                            segmentation = segmenter(img)
-                    except TypeError:  # pragma: no cover - requires args we don't know
-                        pass
-
-            if segmentation is None:
-                segmentation = _call_segment("extract_baselines", {})
-
+            if hasattr(segmentation_module, "segment"):
+                segment_fn = getattr(segmentation_module, "segment")
+                kwargs = {}
+                signature = inspect.signature(segment_fn)
+                if "text_direction" in signature.parameters:
+                    kwargs["text_direction"] = "ltr"
+                if "script" in signature.parameters:
+                    kwargs["script"] = "latin"
+                if "model" in signature.parameters:
+                    kwargs["model"] = None
+                segmentation = segment_fn(img, **kwargs)
+            elif hasattr(segmentation_module, "segment_image"):
+                segment_fn = getattr(segmentation_module, "segment_image")
+                kwargs = {}
+                signature = inspect.signature(segment_fn)
+                if "model" in signature.parameters:
+                    kwargs["model"] = None
+                segmentation = segment_fn(img, **kwargs)
+            else:  # pragma: no cover - defensive
+                raise RuntimeError(
+                    "Unsupported Kraken segmentation API: expected 'segment' or 'segment_image'."
+                )
+        except RuntimeError:
+            raise
         except Exception as exc:  # pragma: no cover - segmentation errors only at runtime
             raise RuntimeError(f"Kraken segmentation failed: {exc}") from exc
 
