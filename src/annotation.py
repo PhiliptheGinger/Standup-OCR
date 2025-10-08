@@ -249,7 +249,74 @@ class AnnotationApp:
 
     def _apply_transcription_to_overlays(self) -> None:
         for entry in list(self.overlay_entries):
-            entry.delete(0, tk.END)
+            try:
+                entry.delete(0, tk.END)
+            except Exception:  # pragma: no cover - defensive for stub entries
+                pass
+
+        if not self.overlay_items:
+            self.current_tokens = []
+            return
+
+        raw_text = self.entry_widget.get("1.0", tk.END)
+        text = raw_text.replace("\r\n", "\n").rstrip("\n")
+
+        overlays = sorted(self.overlay_items, key=lambda item: item.order_key)
+        remaining = text
+        previous_paragraph: Optional[Tuple[int, int, int]] = None
+        previous_line: Optional[Tuple[int, int, int, int]] = None
+        updated_tokens: List[OcrToken] = []
+
+        for overlay in overlays:
+            paragraph_key = overlay.order_key[:3]
+            line_key = overlay.order_key[:4]
+
+            if previous_paragraph is not None:
+                if paragraph_key != previous_paragraph:
+                    if remaining.startswith("\n\n"):
+                        remaining = remaining[2:]
+                    else:
+                        remaining = remaining.lstrip("\n")
+                elif line_key != previous_line:
+                    if remaining.startswith("\n"):
+                        remaining = remaining[1:]
+
+            if "\n" in remaining:
+                line_text, remaining = remaining.split("\n", 1)
+            else:
+                line_text, remaining = remaining, ""
+
+            overlay.entry.delete(0, tk.END)
+            overlay.entry.insert(0, line_text)
+
+            if overlay.token is not None:
+                overlay.token.text = line_text
+                baseline = overlay.token.baseline
+                origin = overlay.token.origin
+            else:
+                baseline = (0, 0, 0)
+                origin = (0, 0, 0)
+
+            updated_tokens.append(
+                OcrToken(
+                    text=line_text,
+                    bbox=overlay.bbox,
+                    order_key=overlay.order_key,
+                    baseline=baseline,
+                    origin=origin,
+                )
+            )
+
+            previous_paragraph = paragraph_key
+            previous_line = line_key
+
+        self.current_tokens = updated_tokens
+
+    def _on_transcription_modified(self, _event: Optional[tk.Event]) -> None:
+        if self._setting_transcription:
+            return
+        self._user_modified_transcription = True
+        self._apply_transcription_to_overlays()
 
     def _compose_text_from_tokens(self, tokens: Sequence[OcrToken]) -> str:
         pieces: List[str] = []
