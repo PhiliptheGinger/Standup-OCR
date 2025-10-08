@@ -823,4 +823,9 @@ def annotate_images(
         callback = AnnotationTrainer(root, train_dir=Path(train_dir), config=auto_train_config)
 
     app = AnnotationApp(root, items, Path(train_dir), options=options, log_path=log_path, on_sample_saved=callback)
+
+    logging.info(
+        "Annotation window ready for %d image(s). Interact with the GUI to continue (e.g. Save/Skip).",
+        len(items),
+    )
     root.mainloop()
