@@ -1,4 +1,5 @@
-"""GUI for baseline-based handwriting annotation."""
+"""Tkinter application for creating OCR training annotations."""
+
 from __future__ import annotations
 
 import csv
@@ -13,12 +14,31 @@ from tkinter import messagebox
 
 from PIL import Image, ImageOps, ImageTk
 
-from .exporters import save_line_crops, save_pagexml
-from .kraken_adapter import is_available as kraken_available, segment_lines
-from .line_store import AddLine, LineStore, Point, RemoveLines, SetSelection, UpdateText
+try:  # pragma: no cover - allow running as a package or script
+    from .exporters import save_line_crops, save_pagexml
+    from .kraken_adapter import is_available as kraken_available, segment_lines
+    from .line_store import Line
+except ImportError:  # pragma: no cover
+    from exporters import save_line_crops, save_pagexml
+    from kraken_adapter import is_available as kraken_available, segment_lines
+    from line_store import Line
 
 CONTROL_MASK = 0x0004
 SHIFT_MASK = 0x0001
+
+
+def _prepare_image(image: Image.Image) -> Image.Image:
+    """Return ``image`` rotated according to its EXIF orientation."""
+
+    return ImageOps.exif_transpose(image)
+
+
+def prepare_image(path: Path) -> Image.Image:
+    """Load and prepare an image from ``path``."""
+
+    with Image.open(path) as src:
+        prepared = _prepare_image(src)
+        return prepared.copy()
 
 
 @dataclass
@@ -37,43 +57,34 @@ class AnnotationOptions:
 
 
 @dataclass
-class LineView:
-    line_id: int
-    canvas_item: Optional[int]
-    text_var: tk.StringVar
+class OcrToken:
+    text: str
+    bbox: Tuple[int, int, int, int]
+    order_key: Tuple[int, int, int, int, int]
+    baseline: Tuple[int, int, int]
+    origin: Tuple[int, int, int]
+
+
+@dataclass
+class OverlayItem:
+    rect_id: int
     entry: tk.Entry
+    bbox: Tuple[int, int, int, int]
+    order_key: Tuple[int, int, int, int, int]
+    token: Optional[OcrToken] = None
+    is_manual: bool = False
+    selected: bool = False
 
-
-def _prepare_image(image: Image.Image) -> Image.Image:
-    return ImageOps.exif_transpose(image)
-
-
-def prepare_image(path: Path) -> Image.Image:
-    with Image.open(path) as src:
-        prepared = _prepare_image(src)
-        return prepared.copy()
-
-
-def to_display_point(point: Point, scale: Tuple[float, float]) -> Tuple[float, float]:
-    sx, sy = scale
-    return point[0] * sx, point[1] * sy
-
-
-def to_base_point(point: Tuple[float, float], scale: Tuple[float, float]) -> Point:
-    sx, sy = scale
-    if sx == 0 or sy == 0:
-        return point[0], point[1]
-    return point[0] / sx, point[1] / sy
-
-
-def to_base_bbox(bbox: Tuple[float, float, float, float], scale: Tuple[float, float]) -> Tuple[int, int, int, int]:
-    x1, y1 = to_base_point((bbox[0], bbox[1]), scale)
-    x2, y2 = to_base_point((bbox[2], bbox[3]), scale)
-    return int(x1), int(y1), int(x2), int(y2)
+    @property
+    def text(self) -> str:
+        try:
+            return self.entry.get()
+        except tk.TclError:  # pragma: no cover - defensive for destroyed entries
+            return ""
 
 
 class AnnotationApp:
-    """Tkinter-based interface for baseline annotation."""
+    """Tkinter-based interface for collecting OCR training data."""
 
     MAX_SIZE = (900, 700)
 
@@ -100,7 +111,21 @@ class AnnotationApp:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._on_sample_saved = on_sample_saved
 
-        self.store = LineStore()
+        self.overlay_entries: List[tk.Entry] = []
+        self.overlay_items: List[OverlayItem] = []
+        self.rect_to_overlay: Dict[int, OverlayItem] = {}
+        self.selected_rects: set[int] = set()
+        self.current_tokens: List[OcrToken] = []
+        self.manual_token_counter = 0
+
+        self._pressed_overlay: Optional[OverlayItem] = None
+        self._drag_start: Optional[Tuple[float, float]] = None
+        self._active_temp_rect: Optional[int] = None
+        self._modifier_drag = False
+        self._marquee_rect: Optional[int] = None
+        self._user_modified_transcription = False
+        self._setting_transcription = False
+
         self.display_scale: Tuple[float, float] = (1.0, 1.0)
         self.current_photo: Optional[ImageTk.PhotoImage] = None
         self.canvas_image_id: Optional[int] = None
@@ -109,8 +134,6 @@ class AnnotationApp:
         self.mode_var = tk.StringVar(value="select")
         self.status_var = tk.StringVar()
         self.filename_var = tk.StringVar()
-        self._user_modified_transcription = False
-        self._setting_transcription = False
 
         self.canvas: tk.Canvas
         self.entry_widget: tk.Text
@@ -118,15 +141,11 @@ class AnnotationApp:
         self.back_button: tk.Button
         self.lines_frame: tk.Frame
 
-        self.line_views: Dict[int, LineView] = {}
-        self._drawing_points: List[Point] = []
-        self._drawing_canvas_item: Optional[int] = None
-
         self._build_ui()
         self._show_current()
 
     # ------------------------------------------------------------------
-    # UI construction
+    # UI construction helpers
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         self.master.title("Standup-OCR Annotation")
@@ -181,54 +200,108 @@ class AnnotationApp:
         back_btn = tk.Button(buttons, text="Back", command=self.back)
         back_btn.pack(side="left", padx=4)
         self.back_button = back_btn
+        tk.Button(buttons, text="Skip", command=self.skip).pack(side="left", padx=4)
         confirm_btn = tk.Button(buttons, text="Confirm", command=self.confirm, default=tk.ACTIVE)
         confirm_btn.pack(side="left", padx=4)
-        tk.Button(buttons, text="Skip", command=self.skip).pack(side="left", padx=4)
         tk.Button(buttons, text="Unsure", command=self.unsure).pack(side="left", padx=4)
 
         status_label = tk.Label(container, textvariable=self.status_var, fg="gray")
         status_label.pack(anchor="w")
 
-        self.canvas.bind("<ButtonPress-1>", self._on_canvas_press)
+        self.canvas.bind("<ButtonPress-1>", self._on_canvas_button_press)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
 
         self.master.bind("<Escape>", self._on_escape)
         self.master.bind("<Delete>", self._on_delete_selected)
         self.master.bind("<BackSpace>", self._on_delete_selected)
-        self.master.bind("<Control-z>", self._on_undo)
-        self.master.bind("<Control-Z>", self._on_undo)
-        self.master.bind("<Control-y>", self._on_redo)
-        self.master.bind("<Control-Y>", self._on_redo)
-        self.master.bind("<Control-Shift-Z>", self._on_redo)
-        self.master.bind("<Alt-Left>", lambda event: self.back())
-        self.master.bind("<Return>", self._on_return)
 
-        self.master.protocol("WM_DELETE_WINDOW", self._on_exit)
+    # ------------------------------------------------------------------
+    # Utility helpers
+    # ------------------------------------------------------------------
+    def _slugify(self, value: str) -> str:
+        slug = "-".join(value.strip().lower().split())
+        slug = slug.replace("_", "-")
+        while "--" in slug:
+            slug = slug.replace("--", "-")
+        return slug[:60].rstrip("-")
+
+    def _on_confirm(self, _event: Optional[tk.Event]) -> None:
+        self.confirm()
+
+    def _on_escape(self, _event: Optional[tk.Event]) -> None:
+        if self._active_temp_rect is not None:
+            self.canvas.delete(self._active_temp_rect)
+            self._active_temp_rect = None
+            self._drag_start = None
+        else:
+            self.master.destroy()
+
+    def _get_transcription_text(self) -> str:
+        return self.entry_widget.get("1.0", tk.END).strip()
+
+    def _set_transcription(self, value: str) -> None:
+        self._setting_transcription = True
+        self.entry_widget.delete("1.0", tk.END)
+        if value:
+            self.entry_widget.insert("1.0", value)
+        self._setting_transcription = False
+
+    def _apply_transcription_to_overlays(self) -> None:
+        for entry in list(self.overlay_entries):
+            entry.delete(0, tk.END)
+
+    def _compose_text_from_tokens(self, tokens: Sequence[OcrToken]) -> str:
+        pieces: List[str] = []
+        previous_paragraph: Optional[Tuple[int, int, int]] = None
+        previous_line: Optional[Tuple[int, int, int, int]] = None
+        for token in tokens:
+            paragraph_key = token.order_key[:3]
+            line_key = token.order_key[:4]
+            if not pieces:
+                pieces.append(token.text)
+            else:
+                if paragraph_key != previous_paragraph:
+                    pieces.append("\n\n" + token.text)
+                elif line_key != previous_line:
+                    pieces.append("\n" + token.text)
+                else:
+                    pieces.append(" " + token.text)
+            previous_paragraph = paragraph_key
+            previous_line = line_key
+        return "".join(pieces)
+
+    def _scale_bbox(self, bbox: Tuple[int, int, int, int]) -> Tuple[float, float, float, float]:
+        sx, sy = self.display_scale
+        x1, y1, x2, y2 = bbox
+        return (x1 * sx, y1 * sy, x2 * sx, y2 * sy)
+
+    def _to_base_bbox(self, coords: Tuple[float, float, float, float]) -> Tuple[int, int, int, int]:
+        sx, sy = self.display_scale
+        x1, y1, x2, y2 = coords
+        if sx == 0 or sy == 0:
+            return int(x1), int(y1), int(x2), int(y2)
+        return int(x1 / sx), int(y1 / sy), int(x2 / sx), int(y2 / sy)
+
+    def _safe_messagebox(self, name: str, *args, **kwargs):
+        func = getattr(messagebox, name)
+        try:
+            return func(*args, **kwargs)
+        except tk.TclError:
+            return None
 
     # ------------------------------------------------------------------
     # Navigation
     # ------------------------------------------------------------------
-    def _on_confirm(self, event: Optional[tk.Event]) -> None:
-        self.confirm()
-
-    def _on_escape(self, event: Optional[tk.Event]) -> None:
-        if self._drawing_points:
-            self._cancel_drawing()
-        else:
-            self._on_exit()
-
-    def _on_exit(self, event: Optional[tk.Event] = None) -> None:
-        if messagebox.askokcancel("Quit", "Abort annotation and close the window?"):
-            self.master.destroy()
-
     def confirm(self) -> None:
-        if not self.store.list():
-            messagebox.showinfo("No lines", "Create at least one line before confirming.")
+        text = self._get_transcription_text()
+        if not self.overlay_items and not text:
+            self._safe_messagebox("showinfo", "No lines", "Create at least one line before confirming.")
             return
-        text = self.store.compose_text().strip()
+
         if not text:
-            if not messagebox.askyesno(
+            if not self._safe_messagebox(
+                "askyesno",
                 "Empty transcription",
                 "No text was entered for the selected lines. Export anyway?",
             ):
@@ -236,10 +309,13 @@ class AnnotationApp:
 
         item = self.items[self.index]
         try:
-            saved_path = self._export_lines(item)
-        except Exception as exc:
+            saved_path = self._save_annotation(item, text)
+        except OSError as exc:
+            self._safe_messagebox("showerror", "Export failed", f"Could not export training data: {exc}")
+            return
+        except Exception as exc:  # pragma: no cover - defensive guard
             logging.exception("Export failed")
-            messagebox.showerror("Export failed", f"Could not export training data: {exc}")
+            self._safe_messagebox("showerror", "Export failed", str(exc))
             return
 
         item.label = text
@@ -247,8 +323,9 @@ class AnnotationApp:
         item.saved_path = saved_path
         self._append_log(item.path, text, "confirmed", saved_path)
         self.status_var.set("Exported training data")
-        if self._on_sample_saved is not None and saved_path is not None:
-            self._on_sample_saved(saved_path)
+        callback = getattr(self, "_on_sample_saved", None)
+        if callback is not None and saved_path is not None:
+            callback(saved_path)
         self._advance()
 
     def skip(self) -> None:
@@ -263,7 +340,7 @@ class AnnotationApp:
     def unsure(self) -> None:
         item = self.items[self.index]
         item.status = "unsure"
-        item.label = self.store.compose_text()
+        item.label = self._get_transcription_text()
         item.saved_path = None
         self._append_log(item.path, item.label or "", "unsure", None)
         self.status_var.set("Marked as unsure")
@@ -271,7 +348,9 @@ class AnnotationApp:
 
     def back(self) -> None:
         if self.index == 0:
-            self.status_var.set("Already at the first item")
+            if hasattr(self, "back_button"):
+                self.back_button.config(state=tk.DISABLED)
+            self.status_var.set("Already at the first item.")
             return
         self.index -= 1
         self._show_current(revisit=True)
@@ -279,7 +358,7 @@ class AnnotationApp:
     def _advance(self) -> None:
         self.index += 1
         if self.index >= len(self.items):
-            messagebox.showinfo("Complete", "All images have been processed.")
+            self._safe_messagebox("showinfo", "Complete", "All images have been processed.")
             self.master.destroy()
             return
         self._show_current()
@@ -288,80 +367,299 @@ class AnnotationApp:
         item = self.items[self.index]
         self.filename_var.set(f"{item.path.name} ({self.index + 1}/{len(self.items)})")
         self.back_button.config(state=tk.NORMAL if self.index > 0 else tk.DISABLED)
-        self._user_modified_transcription = False
-        self._load_item(item)
+        self._display_item(item)
         self.entry_widget.focus_set()
         if revisit:
-            self.status_var.set("Returned to previous item.")
+            status = self.status_var.get()
+            extra = []
+            if item.saved_path is not None:
+                extra.append(f"Previously saved to {item.saved_path.name}.")
+            extra.append("Returned to previous item.")
+            prefix = f"{status} " if status else ""
+            self.status_var.set(prefix + " ".join(extra))
 
     # ------------------------------------------------------------------
-    # Item display and export
+    # Item display and token management
     # ------------------------------------------------------------------
-    def _load_item(self, item: AnnotationItem) -> None:
-        self._clear_canvas()
-        self.store = LineStore()
-        self.line_views.clear()
+    def _display_item(self, item: AnnotationItem) -> None:
         try:
             with Image.open(item.path) as image:
-                image = _prepare_image(image)
-                base_image = image.convert("RGB")
+                base = _prepare_image(image).convert("RGB")
         except Exception as exc:
             messagebox.showerror("Error", f"Could not open {item.path.name}: {exc}")
             self.skip()
             return
 
-        self._base_image = base_image
-        display = base_image.copy()
+        display = base.copy()
         display.thumbnail(self.MAX_SIZE, Image.LANCZOS)
-        sx = display.width / base_image.width if base_image.width else 1.0
-        sy = display.height / base_image.height if base_image.height else 1.0
+        sx = display.width / base.width if base.width else 1.0
+        sy = display.height / base.height if base.height else 1.0
         self.display_scale = (sx, sy)
+        self._base_image = base
 
-        self.current_photo = ImageTk.PhotoImage(display)
-        self.canvas_image_id = self.canvas.create_image(0, 0, anchor="nw", image=self.current_photo)
-        self.canvas.configure(scrollregion=(0, 0, display.width, display.height))
+        tokens: List[OcrToken]
+        if item.label:
+            tokens = []
+        elif self.options.segmentation == "auto" and self.options.engine == "kraken" and kraken_available():
+            try:
+                baselines = segment_lines(item.path)
+            except RuntimeError as exc:
+                self.status_var.set(str(exc))
+                baselines = []
+            tokens = [
+                OcrToken(
+                    text="",
+                    bbox=self._baseline_to_bbox(baseline),
+                    order_key=(1, 1, 1, index + 1, 1),
+                    baseline=(0, 0, 0),
+                    origin=(0, 0, 0),
+                )
+                for index, baseline in enumerate(baselines)
+            ]
+        else:
+            tokens = []
+
+        self._display_image(display, tokens)
 
         if item.label:
-            self.entry_widget.delete("1.0", tk.END)
-            self.entry_widget.insert("1.0", item.label)
+            self._set_transcription(item.label)
+            self.status_var.set("Loaded existing transcription.")
         else:
-            self.entry_widget.delete("1.0", tk.END)
+            suggestion = self._suggest_label(item.path)
+            if suggestion:
+                self._set_transcription(suggestion)
+                self.status_var.set("Pre-filled transcription using OCR result.")
+            else:
+                self._set_transcription(self._compose_text_from_tokens(tokens))
+                if tokens:
+                    self.status_var.set("Kraken returned baseline segmentation.")
+                else:
+                    self.status_var.set("Draw baselines manually using the canvas.")
 
-        if self.options.segmentation == "auto" and self.options.engine == "kraken":
-            self._auto_segment(item.path)
+    def _display_image(self, image: Image.Image, tokens: Sequence[OcrToken]) -> None:
+        self.canvas.delete("all")
+        self._clear_overlay_entries()
+        self.overlay_items.clear()
+        self.rect_to_overlay.clear()
+        self.selected_rects.clear()
+        self.current_tokens = list(tokens)
+
+        self.current_photo = ImageTk.PhotoImage(image)
+        self.canvas_image_id = self.canvas.create_image(0, 0, anchor="nw", image=self.current_photo)
+        if hasattr(self.canvas, "config"):
+            self.canvas.config(scrollregion=(0, 0, image.width, image.height))
+
+        for token in tokens:
+            self._create_overlay(token.text, token.bbox, token.order_key, token)
+
+        self._update_transcription_from_overlays()
+
+    def _baseline_to_bbox(self, baseline: Sequence[Tuple[float, float]]) -> Tuple[int, int, int, int]:
+        xs = [point[0] for point in baseline]
+        ys = [point[1] for point in baseline]
+        left = int(min(xs))
+        right = int(max(xs))
+        top = int(min(ys))
+        bottom = int(max(ys)) + 10
+        return left, top, right, bottom
+
+    def _create_overlay(
+        self,
+        text: str,
+        bbox: Tuple[int, int, int, int],
+        order_key: Tuple[int, int, int, int, int],
+        token: Optional[OcrToken] = None,
+        *,
+        is_manual: bool = False,
+        select: bool = False,
+    ) -> OverlayItem:
+        scaled = self._scale_bbox(bbox)
+        rect_id = self.canvas.create_rectangle(*scaled, outline="#f97316", width=2, tags=("overlay",))
+        entry_parent = getattr(self, "lines_frame", None)
+        entry = tk.Entry(entry_parent, width=80)
+        entry.insert(0, text)
+        entry.bind("<Key>", self._on_overlay_modified)
+        if hasattr(entry, "pack"):
+            entry.pack(fill="x", pady=2)
+        overlay = OverlayItem(rect_id=rect_id, entry=entry, bbox=bbox, order_key=order_key, token=token, is_manual=is_manual)
+        self.overlay_items.append(overlay)
+        self.overlay_entries.append(entry)
+        self.rect_to_overlay[rect_id] = overlay
+        if select:
+            self._select_overlay(overlay, additive=False)
+        return overlay
+
+    def _clear_overlay_entries(self) -> None:
+        for entry in list(self.overlay_entries):
+            try:
+                entry.destroy()
+            except Exception:  # pragma: no cover - defensive
+                pass
+        self.overlay_entries.clear()
+
+    def _suggest_label(self, _path: Path) -> str:
+        return ""
+
+    def _extract_tokens(self, _image: Image.Image) -> List[OcrToken]:
+        return []
+
+    # ------------------------------------------------------------------
+    # Canvas interaction
+    # ------------------------------------------------------------------
+    def _on_canvas_button_press(self, event: tk.Event) -> None:
+        self._pressed_overlay = None
+        self._modifier_drag = bool(event.state & (CONTROL_MASK | SHIFT_MASK))
+        self._drag_start = (event.x, event.y)
+
+        for overlay in self.overlay_items:
+            left, top, right, bottom = self.canvas.coords(overlay.rect_id)
+            if left <= event.x <= right and top <= event.y <= bottom:
+                self._pressed_overlay = overlay
+                if not self._modifier_drag:
+                    self._clear_selection()
+                self._select_overlay(overlay, additive=self._modifier_drag)
+                return
+
+        if self.mode_var.get() == "draw":
+            self._start_manual_overlay(event.x, event.y)
         else:
-            self.status_var.set("Manual annotation mode")
+            self._clear_selection()
 
-        self._refresh_lines()
-        self._update_transcription()
+    def _on_canvas_drag(self, event: tk.Event) -> None:
+        if self._active_temp_rect is not None:
+            x0, y0 = self._drag_start if self._drag_start is not None else (event.x, event.y)
+            self.canvas.coords(self._active_temp_rect, x0, y0, event.x, event.y)
 
-    def _auto_segment(self, path: Path) -> None:
-        if not kraken_available():
-            self.status_var.set("Kraken not installed; manual segmentation required (pip install kraken[serve]).")
-            return
-        try:
-            baselines = segment_lines(path)
-        except RuntimeError as exc:
-            self.status_var.set(str(exc))
+    def _on_canvas_release(self, event: tk.Event) -> None:
+        if self._active_temp_rect is not None:
+            self._finish_manual_overlay(event.x, event.y)
             return
 
-        for baseline in baselines:
-            if len(baseline) < 2:
+        if self._pressed_overlay is not None and self._modifier_drag:
+            self._select_overlay(self._pressed_overlay, additive=True)
+        elif self._pressed_overlay is not None:
+            self._select_overlay(self._pressed_overlay, additive=False)
+
+    def _start_manual_overlay(self, x: float, y: float) -> None:
+        self._active_temp_rect = self.canvas.create_rectangle(x, y, x, y, outline="#10b981", dash=(4, 2))
+
+    def _finish_manual_overlay(self, x: float, y: float) -> None:
+        if self._active_temp_rect is None or self._drag_start is None:
+            return
+        coords = self.canvas.coords(self._active_temp_rect)
+        self.canvas.delete(self._active_temp_rect)
+        self._active_temp_rect = None
+        self._drag_start = None
+
+        left, top, right, bottom = coords
+        if abs(right - left) < 5 or abs(bottom - top) < 5:
+            return
+
+        base_bbox = self._to_base_bbox((left, top, right, bottom))
+        self.manual_token_counter += 1
+        order_key = (9, 9, 9, 9, self.manual_token_counter)
+        overlay = self._create_overlay("", base_bbox, order_key, None, is_manual=True, select=True)
+        overlay.entry.focus_set()
+        if hasattr(self, "status_var"):
+            self.status_var.set("Added manual line")
+        self._update_transcription_from_overlays()
+
+    def _select_overlay(self, overlay: OverlayItem, *, additive: bool) -> None:
+        if not additive:
+            self._clear_selection()
+        overlay.selected = True
+        self.selected_rects.add(overlay.rect_id)
+        self.canvas.itemconfigure(overlay.rect_id, outline="#2563eb")
+        if hasattr(self, "delete_button"):
+            self.delete_button.config(state=tk.NORMAL)
+
+    def _clear_selection(self) -> None:
+        for overlay in self.overlay_items:
+            if overlay.selected:
+                overlay.selected = False
+                self.canvas.itemconfigure(overlay.rect_id, outline="#f97316")
+        self.selected_rects.clear()
+        if hasattr(self, "delete_button"):
+            self.delete_button.config(state=tk.DISABLED)
+
+    def _on_overlay_modified(self, _event: Optional[tk.Event]) -> None:
+        self._user_modified_transcription = True
+        self._update_transcription_from_overlays()
+
+    def _update_transcription_from_overlays(self) -> None:
+        if self._setting_transcription:
+            return
+        tokens: List[OcrToken] = []
+        for overlay in sorted(self.overlay_items, key=lambda item: item.order_key):
+            tokens.append(
+                OcrToken(
+                    text=overlay.text,
+                    bbox=overlay.bbox,
+                    order_key=overlay.order_key,
+                    baseline=(0, 0, 0),
+                    origin=(0, 0, 0),
+                )
+            )
+        self.current_tokens = tokens
+        text = self._compose_text_from_tokens(tokens)
+        self._set_transcription(text)
+
+    def _delete_selected(self) -> None:
+        if not self.selected_rects:
+            return
+        for rect_id in list(self.selected_rects):
+            overlay = self.rect_to_overlay.pop(rect_id, None)
+            if overlay is None:
                 continue
-            self.store.add_line(baseline, is_manual=False)
-        if baselines:
-            self.status_var.set(f"Loaded {len(baselines)} baselines from Kraken")
-        else:
-            self.status_var.set("Kraken returned no lines; draw them manually")
+            try:
+                overlay.entry.destroy()
+            except Exception:  # pragma: no cover
+                pass
+            try:
+                self.canvas.delete(rect_id)
+            except Exception:  # pragma: no cover - stub canvas may not implement delete
+                pass
+            if overlay in self.overlay_items:
+                self.overlay_items.remove(overlay)
+            if overlay.entry in self.overlay_entries:
+                self.overlay_entries.remove(overlay.entry)
+        self.selected_rects.clear()
+        if hasattr(self, "delete_button"):
+            self.delete_button.config(state=tk.DISABLED)
+        self._update_transcription_from_overlays()
 
-    def _export_lines(self, item: AnnotationItem) -> Optional[Path]:
-        lines = self.store.list()
+    def _on_delete_selected(self, _event: Optional[tk.Event]) -> None:
+        self._delete_selected()
+
+    # ------------------------------------------------------------------
+    # Transcription export helpers
+    # ------------------------------------------------------------------
+    def _collect_lines(self) -> List[Line]:
+        lines: List[Line] = []
+        for idx, overlay in enumerate(sorted(self.overlay_items, key=lambda item: item.order_key), start=1):
+            left, top, right, bottom = overlay.bbox
+            baseline = [(left, bottom - 1), (right, bottom - 1)]
+            line = Line(
+                id=idx,
+                baseline=baseline,
+                bbox=overlay.bbox,
+                text=overlay.text,
+                order_key=overlay.order_key,
+                selected=overlay.selected,
+                is_manual=overlay.is_manual,
+            )
+            lines.append(line)
+        return lines
+
+    def _save_annotation(self, item: AnnotationItem, label: str) -> Path:
+        lines = self._collect_lines()
         if self.options.export_format == "pagexml":
             out_dir = self.train_dir / "pagexml"
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"{item.path.stem}.xml"
+            out_path = out_dir / f"{self._slugify(item.path.stem)}.xml"
             save_pagexml(item.path, lines, out_path)
             return out_path
+
         out_dir = self.train_dir / "lines"
         save_line_crops(item.path, lines, out_dir)
         return out_dir
@@ -375,207 +673,6 @@ class AnnotationApp:
             if is_new:
                 writer.writerow(["filename", "label", "status", "saved_path"])
             writer.writerow([path.name, label, status, saved_path.name if saved_path else ""])
-
-    def _clear_canvas(self) -> None:
-        self.canvas.delete("all")
-        for view in self.line_views.values():
-            view.entry.destroy()
-        self.line_views.clear()
-
-    # ------------------------------------------------------------------
-    # Canvas interaction
-    # ------------------------------------------------------------------
-    def _on_canvas_press(self, event: tk.Event) -> None:
-        if self.mode_var.get() == "draw":
-            self._start_drawing(event)
-            return
-        base_point = to_base_point((event.x, event.y), self.display_scale)
-        line_id = self.store.hit_test(base_point[0], base_point[1], tol=5.0)
-        if line_id is not None:
-            additive = bool(event.state & (CONTROL_MASK | SHIFT_MASK))
-            self.store.do(SetSelection({line_id}, additive=additive))
-            self._refresh_lines()
-            self._focus_selected()
-        elif event.state & (CONTROL_MASK | SHIFT_MASK):
-            self._start_marquee(event)
-        else:
-            self.store.select_only(set())
-            self._refresh_lines()
-
-    def _on_canvas_drag(self, event: tk.Event) -> None:
-        if self._drawing_points:
-            self._update_drawing(event)
-        elif hasattr(self, "_marquee_start"):
-            self._update_marquee(event)
-
-    def _on_canvas_release(self, event: tk.Event) -> None:
-        if self._drawing_points:
-            return
-        if hasattr(self, "_marquee_start"):
-            self._finish_marquee(event)
-
-    def _start_drawing(self, event: tk.Event) -> None:
-        point = to_base_point((event.x, event.y), self.display_scale)
-        self._drawing_points = [point]
-        display_point = to_display_point(point, self.display_scale)
-        self._drawing_canvas_item = self.canvas.create_line(*display_point, *display_point, fill="orange", width=2)
-        self.status_var.set("Drawing baseline: press Enter to finish, Esc to cancel")
-
-    def _update_drawing(self, event: tk.Event) -> None:
-        point = to_base_point((event.x, event.y), self.display_scale)
-        if self._drawing_points and self._drawing_points[-1] == point:
-            return
-        self._drawing_points.append(point)
-        display_points = []
-        for pt in self._drawing_points:
-            display_points.extend(to_display_point(pt, self.display_scale))
-        if self._drawing_canvas_item is not None:
-            self.canvas.coords(self._drawing_canvas_item, *display_points)
-
-    def _finish_drawing(self) -> None:
-        if len(self._drawing_points) < 2:
-            self._cancel_drawing()
-            return
-        baseline = list(self._drawing_points)
-        self.store.do(AddLine(baseline))
-        self._cancel_drawing()
-        self._refresh_lines()
-        self.status_var.set("Added manual line")
-
-    def _cancel_drawing(self) -> None:
-        if self._drawing_canvas_item is not None:
-            self.canvas.delete(self._drawing_canvas_item)
-        self._drawing_canvas_item = None
-        self._drawing_points = []
-        self.status_var.set("Drawing cancelled")
-
-    def _on_return(self, event: tk.Event) -> None:
-        if self._drawing_points:
-            self._finish_drawing()
-
-    def _start_marquee(self, event: tk.Event) -> None:
-        self._marquee_start = (event.x, event.y)
-        self._marquee_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="blue", dash=(2, 2))
-
-    def _update_marquee(self, event: tk.Event) -> None:
-        if not hasattr(self, "_marquee_start"):
-            return
-        x0, y0 = self._marquee_start
-        if self._marquee_rect is not None:
-            self.canvas.coords(self._marquee_rect, x0, y0, event.x, event.y)
-
-    def _finish_marquee(self, event: tk.Event) -> None:
-        x0, y0 = self._marquee_start
-        x1, y1 = event.x, event.y
-        if self._marquee_rect is not None:
-            self.canvas.delete(self._marquee_rect)
-        del self._marquee_start
-        self._marquee_rect = None
-        if abs(x1 - x0) < 5 or abs(y1 - y0) < 5:
-            return
-        base_bbox = to_base_bbox((x0, y0, x1, y1), self.display_scale)
-        hits = self.store.bbox_intersect(base_bbox)
-        self.store.do(SetSelection(hits, additive=True))
-        self._refresh_lines()
-        self.status_var.set(f"Selected {len(hits)} lines")
-
-    # ------------------------------------------------------------------
-    # Line rendering
-    # ------------------------------------------------------------------
-    def _refresh_lines(self) -> None:
-        # Remove previous line drawings but keep background image
-        for view in list(self.line_views.values()):
-            if view.canvas_item is not None:
-                self.canvas.delete(view.canvas_item)
-            view.entry.destroy()
-        self.line_views.clear()
-
-        for line in self.store.list():
-            display_points: List[float] = []
-            for point in line.baseline:
-                display_points.extend(to_display_point(point, self.display_scale))
-            colour = "#2563eb" if line.selected else "#f97316"
-            canvas_item = self.canvas.create_line(*display_points, fill=colour, width=2)
-            text_var = tk.StringVar(value=line.text)
-            entry = tk.Entry(self.lines_frame, textvariable=text_var, width=80)
-            entry.pack(fill="x", pady=2)
-            entry.bind("<FocusOut>", lambda event, line_id=line.id, var=text_var: self._commit_entry(line_id, var))
-            entry.bind("<Return>", lambda event, line_id=line.id, var=text_var: self._commit_entry(line_id, var))
-            entry.bind("<Key>", lambda event: self._on_entry_key())
-            if line.selected:
-                entry.configure(background="#dbeafe")
-            self.line_views[line.id] = LineView(line.id, canvas_item, text_var, entry)
-
-        self.delete_button.config(state=tk.NORMAL if self.store.selection() else tk.DISABLED)
-        self._update_transcription()
-
-    def _commit_entry(self, line_id: int, var: tk.StringVar) -> None:
-        try:
-            text = var.get()
-        except tk.TclError:
-            return
-        line = next((line for line in self.store.list() if line.id == line_id), None)
-        if line is None or line.text == text:
-            return
-        self.store.do(UpdateText(line_id, text))
-        self._refresh_lines()
-        self.status_var.set("Updated text")
-
-    def _on_entry_key(self) -> None:
-        self._user_modified_transcription = True
-
-    def _focus_selected(self) -> None:
-        selected = self.store.selection()
-        if len(selected) == 1:
-            line_id = next(iter(selected))
-            view = self.line_views.get(line_id)
-            if view is not None:
-                view.entry.focus_set()
-
-    # ------------------------------------------------------------------
-    # Editing helpers
-    # ------------------------------------------------------------------
-    def _delete_selected(self) -> None:
-        selection = self.store.selection()
-        if not selection:
-            return
-        self.store.do(RemoveLines(selection))
-        self._refresh_lines()
-        self.status_var.set("Removed selected lines")
-
-    def _on_delete_selected(self, event: Optional[tk.Event]) -> None:
-        self._delete_selected()
-
-    def _on_undo(self, event: Optional[tk.Event]) -> None:
-        if self.store.undo():
-            self._refresh_lines()
-            self.status_var.set("Undo")
-
-    def _on_redo(self, event: Optional[tk.Event]) -> None:
-        if self.store.redo():
-            self._refresh_lines()
-            self.status_var.set("Redo")
-
-    def _on_transcription_modified(self, event: tk.Event) -> None:
-        if event.keysym in {"Shift_L", "Shift_R", "Control_L", "Control_R"}:
-            return
-        self._user_modified_transcription = True
-
-    def _update_transcription(self) -> None:
-        if self._user_modified_transcription:
-            return
-        text = self.store.compose_text()
-        self._setting_transcription = True
-        self.entry_widget.delete("1.0", tk.END)
-        self.entry_widget.insert("1.0", text)
-        self._setting_transcription = False
-
-def _train_model(*args, **kwargs):  # pragma: no cover
-    if __package__:
-        from .training import train_model as _impl
-    else:
-        from training import train_model as _impl  # type: ignore
-    return _impl(*args, **kwargs)
 
 
 @dataclass
@@ -594,10 +691,12 @@ class AnnotationTrainer:
     train_dir: Path
     config: AnnotationAutoTrainConfig
     _pending: Sequence[Path] = field(default_factory=list, init=False)
+    seen_samples: List[Path] = field(default_factory=list, init=False)
 
     def __call__(self, sample_path: Path) -> None:
         path = Path(sample_path)
         self._pending = list(self._pending) + [path]
+        self.seen_samples.append(path)
         if len(self._pending) >= self.config.auto_train:
             self.master.after(0, self._maybe_train)
 
@@ -623,6 +722,14 @@ class AnnotationTrainer:
                 logging.exception("Auto-training failed")
 
         threading.Thread(target=worker, daemon=True).start()
+
+
+def _train_model(*args, **kwargs):  # pragma: no cover
+    if __package__:
+        from .training import train_model as _impl
+    else:
+        from training import train_model as _impl  # type: ignore
+    return _impl(*args, **kwargs)
 
 
 def annotate_images(
