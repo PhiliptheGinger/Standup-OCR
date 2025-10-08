@@ -8,7 +8,10 @@ from xml.etree import ElementTree as ET
 
 from PIL import Image
 
-from .line_store import Line
+try:  # pragma: no cover - allow importing as a script
+    from .line_store import Line
+except ImportError:  # pragma: no cover - fallback for flat imports
+    from line_store import Line
 
 
 def _sorted_lines(lines: Iterable[Line]) -> List[Line]:
