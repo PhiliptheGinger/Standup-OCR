@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-import json
-
 import inspect
+import json
 import logging
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from types import ModuleType
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-Logger = logging.getLogger(__name__)
+from PIL import Image
+
+log = logging.getLogger(__name__)
 
 
 def _kraken_exe_in_venv() -> str | None:
@@ -107,8 +108,35 @@ def _load_segmentation_module() -> ModuleType:
         raise RuntimeError(_explain_import_error(exc, lib_exc)) from exc
 
 
-def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[List[Tuple[float, float]]]:
-    """Run Kraken's baseline segmenter and return a list of baselines.
+def _segment_via_cli(image_path: Path) -> Dict[str, Any]:
+    """Call the Kraken CLI to obtain segmentation data as JSON."""
+
+    kraken_cli = shutil.which("kraken")
+    if kraken_cli is None:
+        raise RuntimeError(
+            "The 'kraken' command was not found. Install Kraken with 'pip install kraken[serve]' "
+            "and ensure it's available on PATH."
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_json = Path(tmpdir) / "segmentation.json"
+        cmd = [
+            kraken_cli,
+            "segment",
+            "-i",
+            str(image_path),
+            str(output_json),
+        ]
+        log.info("Running kraken segmentation: %s", " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True)
+        except FileNotFoundError as exc:  # pragma: no cover - subprocess failure only at runtime
+            raise RuntimeError(f"kraken executable not found: {exc}") from exc
+        except subprocess.CalledProcessError as exc:  # pragma: no cover
+            raise RuntimeError(f"kraken segment failed with exit code {exc.returncode}") from exc
+
+        if not output_json.exists():
+            raise RuntimeError("Kraken segmentation did not produce any output JSON file.")
 
         try:
             return json.loads(output_json.read_text(encoding="utf-8"))
@@ -117,7 +145,7 @@ def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[
 
 
 def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[List[Tuple[float, float]]]:
-    """Run Kraken's baseline segmenter via the CLI and return baselines."""
+    """Run Kraken's baseline segmenter and return a list of baselines."""
 
     _require_kraken()
     try:
@@ -127,12 +155,14 @@ def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[
     except Exception as exc:  # pragma: no cover - only triggered when API fails
         raise RuntimeError("Kraken is installed but the segmentation API is unavailable") from exc
 
+    segmentation: Optional[Dict[str, Any]] = None
+
     with Image.open(image_path) as image:
         img = image.convert("L")
         try:
             if hasattr(segmentation_module, "segment"):
                 segment_fn = getattr(segmentation_module, "segment")
-                kwargs = {}
+                kwargs: Dict[str, Any] = {}
                 signature = inspect.signature(segment_fn)
                 if "text_direction" in signature.parameters:
                     kwargs["text_direction"] = "ltr"
@@ -159,6 +189,12 @@ def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[
 
     if segmentation is None:
         segmentation = _segment_via_cli(image_path)
+
+    if not isinstance(segmentation, dict):
+        if hasattr(segmentation, "to_dict"):
+            segmentation = segmentation.to_dict()
+        else:  # pragma: no cover - fallback when API returns a list-like structure
+            segmentation = {"lines": segmentation}
 
     baselines: List[List[Tuple[float, float]]] = []
     for line in segmentation.get("lines", []):
