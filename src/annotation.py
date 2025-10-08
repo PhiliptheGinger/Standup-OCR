@@ -247,12 +247,6 @@ class AnnotationApp:
             self.entry_widget.insert("1.0", value)
         self._setting_transcription = False
 
-    def _on_transcription_modified(self, _event: Optional[tk.Event]) -> None:
-        if self._setting_transcription:
-            return
-        self._user_modified_transcription = True
-        self._apply_transcription_to_overlays()
-
     def _apply_transcription_to_overlays(self) -> None:
         for entry in list(self.overlay_entries):
             entry.delete(0, tk.END)
