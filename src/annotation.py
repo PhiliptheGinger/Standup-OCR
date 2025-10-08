@@ -169,8 +169,27 @@ class AnnotationApp:
         header = tk.Label(container, textvariable=self.filename_var, font=("TkDefaultFont", 14, "bold"))
         header.pack(anchor="w")
 
-        canvas_frame = tk.Frame(container)
-        canvas_frame.pack(fill="both", expand=True, pady=12)
+        toolbar = tk.Frame(container)
+        toolbar.pack(anchor="w", pady=(12, 8))
+        tk.Radiobutton(toolbar, text="Select", variable=self.mode_var, value="select").pack(side="left")
+        tk.Radiobutton(toolbar, text="Draw", variable=self.mode_var, value="draw").pack(side="left", padx=(8, 0))
+
+        delete_btn = tk.Button(toolbar, text="Delete Selected", command=self._delete_selected, state=tk.DISABLED)
+        delete_btn.pack(side="left", padx=(16, 0))
+        self.delete_button = delete_btn
+
+        tk.Button(toolbar, text="Zoom In", command=lambda: self._adjust_zoom(self.ZOOM_STEP)).pack(side="left", padx=(16, 0))
+        tk.Button(toolbar, text="Zoom Out", command=lambda: self._adjust_zoom(1 / self.ZOOM_STEP)).pack(side="left", padx=(4, 0))
+        tk.Button(toolbar, text="Reset Zoom", command=self._reset_zoom).pack(side="left", padx=(4, 0))
+
+        content = tk.Frame(container)
+        content.pack(fill="both", expand=True)
+        content.columnconfigure(0, weight=3)
+        content.columnconfigure(1, weight=2)
+        content.rowconfigure(0, weight=1)
+
+        canvas_frame = tk.Frame(content)
+        canvas_frame.grid(row=0, column=0, sticky="nsew")
         canvas_frame.rowconfigure(0, weight=1)
         canvas_frame.columnconfigure(0, weight=1)
 
@@ -183,36 +202,30 @@ class AnnotationApp:
         h_scroll.grid(row=1, column=0, sticky="ew")
         self.canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
 
-        toolbar = tk.Frame(container)
-        toolbar.pack(anchor="w", pady=(0, 8))
-        tk.Radiobutton(toolbar, text="Select", variable=self.mode_var, value="select").pack(side="left")
-        tk.Radiobutton(toolbar, text="Draw", variable=self.mode_var, value="draw").pack(side="left", padx=(8, 0))
+        side_panel = tk.Frame(content)
+        side_panel.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+        side_panel.columnconfigure(0, weight=1)
+        side_panel.rowconfigure(0, weight=1)
+        side_panel.rowconfigure(1, weight=1)
 
-        delete_btn = tk.Button(toolbar, text="Delete Selected", command=self._delete_selected, state=tk.DISABLED)
-        delete_btn.pack(side="left", padx=(16, 0))
-        self.delete_button = delete_btn
-
-        tk.Button(toolbar, text="Zoom In", command=lambda: self._adjust_zoom(self.ZOOM_STEP)).pack(side="left", padx=(16, 0))
-        tk.Button(toolbar, text="Zoom Out", command=lambda: self._adjust_zoom(1 / self.ZOOM_STEP)).pack(side="left", padx=(4, 0))
-        tk.Button(toolbar, text="Reset Zoom", command=self._reset_zoom).pack(side="left", padx=(4, 0))
-
-        lines_container = tk.LabelFrame(container, text="Lines")
-        lines_container.pack(fill="x", pady=(0, 8))
+        lines_container = tk.LabelFrame(side_panel, text="Lines")
+        lines_container.grid(row=0, column=0, sticky="nsew")
         self.lines_frame = tk.Frame(lines_container)
-        self.lines_frame.pack(fill="x")
+        self.lines_frame.pack(fill="both", expand=True)
 
-        entry_frame = tk.Frame(container)
-        entry_frame.pack(fill="x", pady=(0, 8))
-        tk.Label(entry_frame, text="Transcription:").pack(side="left")
-        text_widget = tk.Text(entry_frame, height=4, wrap="word")
-        text_widget.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        transcription_container = tk.LabelFrame(side_panel, text="Transcription")
+        transcription_container.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        transcription_container.rowconfigure(0, weight=1)
+        transcription_container.columnconfigure(0, weight=1)
+        text_widget = tk.Text(transcription_container, height=6, wrap="word")
+        text_widget.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         text_widget.bind("<Key>", self._on_transcription_modified)
         text_widget.bind("<Control-Return>", self._on_confirm)
         text_widget.bind("<Command-Return>", self._on_confirm)
         self.entry_widget = text_widget
 
-        buttons = tk.Frame(container)
-        buttons.pack(pady=(0, 8))
+        buttons = tk.Frame(side_panel)
+        buttons.grid(row=2, column=0, sticky="ew", pady=(12, 8))
         back_btn = tk.Button(buttons, text="Back", command=self.back)
         back_btn.pack(side="left", padx=4)
         self.back_button = back_btn
@@ -221,8 +234,8 @@ class AnnotationApp:
         confirm_btn.pack(side="left", padx=4)
         tk.Button(buttons, text="Unsure", command=self.unsure).pack(side="left", padx=4)
 
-        status_label = tk.Label(container, textvariable=self.status_var, fg="gray")
-        status_label.pack(anchor="w")
+        status_label = tk.Label(side_panel, textvariable=self.status_var, fg="gray")
+        status_label.grid(row=3, column=0, sticky="w")
 
         self.canvas.bind("<ButtonPress-1>", self._on_canvas_button_press)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
@@ -267,7 +280,7 @@ class AnnotationApp:
             self.master.destroy()
 
     def _get_transcription_text(self) -> str:
-        return self.entry_widget.get("1.0", tk.END).strip()
+        return self.entry_widget.get("1.0", tk.END).rstrip("\n")
 
     def _set_transcription(self, value: str) -> None:
         self._setting_transcription = True
@@ -288,32 +301,27 @@ class AnnotationApp:
             return
 
         raw_text = self.entry_widget.get("1.0", tk.END)
-        text = raw_text.replace("\r\n", "\n").rstrip("\n")
+        normalized = raw_text.replace("\r\n", "\n")
 
         overlays = sorted(self.overlay_items, key=lambda item: item.order_key)
-        remaining = text
-        previous_paragraph: Optional[Tuple[int, int, int]] = None
-        previous_line: Optional[Tuple[int, int, int, int]] = None
+        segments = normalized.split("\n")
+        segment_index = 0
         updated_tokens: List[OcrToken] = []
 
-        for overlay in overlays:
-            paragraph_key = overlay.order_key[:3]
-            line_key = overlay.order_key[:4]
+        for position, overlay in enumerate(overlays):
+            remaining_overlays = len(overlays) - position
+            while (
+                segment_index < len(segments)
+                and segments[segment_index] == ""
+                and (len(segments) - segment_index) > remaining_overlays
+            ):
+                segment_index += 1
 
-            if previous_paragraph is not None:
-                if paragraph_key != previous_paragraph:
-                    if remaining.startswith("\n\n"):
-                        remaining = remaining[2:]
-                    else:
-                        remaining = remaining.lstrip("\n")
-                elif line_key != previous_line:
-                    if remaining.startswith("\n"):
-                        remaining = remaining[1:]
-
-            if "\n" in remaining:
-                line_text, remaining = remaining.split("\n", 1)
+            if segment_index < len(segments):
+                line_text = segments[segment_index]
+                segment_index += 1
             else:
-                line_text, remaining = remaining, ""
+                line_text = ""
 
             overlay.entry.delete(0, tk.END)
             overlay.entry.insert(0, line_text)
@@ -335,9 +343,6 @@ class AnnotationApp:
                     origin=origin,
                 )
             )
-
-            previous_paragraph = paragraph_key
-            previous_line = line_key
 
         self.current_tokens = updated_tokens
 
@@ -843,6 +848,14 @@ class AnnotationApp:
         self._update_transcription_from_overlays()
 
     def _on_delete_selected(self, _event: Optional[tk.Event]) -> None:
+        try:
+            widget = self.master.focus_get()
+        except tk.TclError:
+            widget = None
+        if widget is not None:
+            widget_class = widget.winfo_class()
+            if widget_class in {"Entry", "Text", "TEntry"}:
+                return
         self._delete_selected()
 
     # ------------------------------------------------------------------

@@ -233,6 +233,56 @@ def test_apply_transcription_clears_overlay_entries():
     assert all(entry.value == "" for entry in entries)
 
 
+def test_apply_transcription_skips_extra_blank_lines():
+    app = AnnotationApp.__new__(AnnotationApp)
+
+    class DummyText:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def get(self, *_args: object, **_kwargs: object) -> str:
+            return self.value
+
+    class DummyEntry:
+        def __init__(self) -> None:
+            self.value = ""
+
+        def delete(self, *_args: object, **_kwargs: object) -> None:
+            self.value = ""
+
+        def insert(self, _index: object, text: str) -> None:
+            self.value = text
+
+    entries = [DummyEntry(), DummyEntry()]
+    app.overlay_entries = entries
+    app.overlay_items = [
+        SimpleNamespace(
+            entry=entries[0],
+            bbox=(0, 0, 0, 0),
+            order_key=(1, 1, 1, 1, 1),
+            token=annotation.OcrToken("", (0, 0, 0, 0), (1, 1, 1, 1, 1), (0, 0, 0), (0, 0, 0)),
+            is_manual=False,
+        ),
+        SimpleNamespace(
+            entry=entries[1],
+            bbox=(0, 0, 0, 0),
+            order_key=(1, 1, 1, 2, 1),
+            token=annotation.OcrToken("", (0, 0, 0, 0), (1, 1, 1, 2, 1), (0, 0, 0), (0, 0, 0)),
+            is_manual=False,
+        ),
+    ]
+    app.rect_to_overlay = {}
+    app.selected_rects = set()
+    app.current_tokens = []
+    app.entry_widget = DummyText("first\n\nsecond")
+    app._setting_transcription = False
+    app._user_modified_transcription = False
+
+    AnnotationApp._apply_transcription_to_overlays(app)
+
+    assert [entry.value for entry in entries] == ["first", "second"]
+    assert [token.text for token in app.current_tokens] == ["first", "second"]
+
 def test_compose_text_from_tokens_groups_lines_and_paragraphs() -> None:
     app = AnnotationApp.__new__(AnnotationApp)
     tokens = [
