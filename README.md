@@ -4,6 +4,31 @@ Standup-OCR is a small toolkit that helps capture handwritten stand-up notes,
 correct OCR mistakes, and fine-tune a custom Tesseract model on the confirmed
 samples.
 
+## Usage
+
+```bash
+# Core OCR run
+python -m src.ocr.main --agentic
+
+# Re-run missing files
+python -m src.ocr.main --rerun-failed
+
+# Check missing scans
+python -m src.ocr.utils.pending_scans
+
+# Verify logs
+python -m src.verify.annotation_log --check
+
+# Upload for GPT transcription
+python -m src.ocr.upload_to_gpt
+
+# Continuous background mode
+python -m src.agent.watchdog
+
+# Optional Drive sync
+python -m src.sync.drive_upload
+```
+
 ## Command-line interface
 
 Install the dependencies listed in `requirements.txt`, then invoke the CLI via
