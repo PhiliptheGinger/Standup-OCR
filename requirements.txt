@@ -1,5 +1,10 @@
-pytesseract
-opencv-python
+google-api-python-client
+google-auth
+kraken
 numpy
+opencv-python
 pandas
-Pillow
+pillow
+pytesseract
+tqdm
+watchdog
