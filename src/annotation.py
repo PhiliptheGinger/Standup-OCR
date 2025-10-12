@@ -969,6 +969,8 @@ class AnnotationApp:
         self._drag_start = None
 
         left, top, right, bottom = coords
+        left, right = sorted((left, right))
+        top, bottom = sorted((top, bottom))
         if abs(right - left) < 5 or abs(bottom - top) < 5:
             return
 
