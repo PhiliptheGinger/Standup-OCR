@@ -88,10 +88,14 @@ Key behaviour:
   extensions.
 * Confirming an entry copies the image into `--train-dir` with the confirmed
   label embedded in the file name, ready for `train_model`.
+* The confirmed transcription is also written to
+  ``transcripts/raw/<image>.txt`` (configurable via ``--transcripts-dir``) so
+  that subsequent packaging steps include your corrections.
 * Images are automatically rotated based on their embedded EXIF orientation so
   the preview and saved snippet share the correct layout.
 * Use **Skip** to omit an image or **Unsure** to log it without saving a copy.
-  The optional `--output-log` CSV records every action.
+  The optional `--output-log` CSV records every action with `page`,
+  `transcription`, and `timestamp` columns for downstream tooling.
 * The preview honours EXIF orientation so sideways scans load upright, and the
   OCR suggestion is rendered as editable overlays directly above each detected
   word for quick correction before saving.

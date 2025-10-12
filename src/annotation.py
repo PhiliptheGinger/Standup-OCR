@@ -6,6 +6,7 @@ import csv
 import logging
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -142,6 +143,7 @@ class AnnotationApp:
         options: Optional[AnnotationOptions] = None,
         log_path: Optional[Path] = None,
         on_sample_saved: Optional[callable[[Path], None]] = None,
+        transcripts_dir: Optional[Path] = None,
     ) -> None:
         self.master = master
         self.items: List[AnnotationItem] = list(items)
@@ -154,6 +156,9 @@ class AnnotationApp:
         self.log_path = Path(log_path) if log_path is not None else None
         if self.log_path is not None:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.transcripts_dir = Path(transcripts_dir) if transcripts_dir is not None else None
+        if self.transcripts_dir is not None:
+            self.transcripts_dir.mkdir(parents=True, exist_ok=True)
         self._on_sample_saved = on_sample_saved
 
         self.overlay_entries: List[tk.Entry] = []
@@ -459,6 +464,7 @@ class AnnotationApp:
         item.status = "confirmed"
         item.saved_path = saved_path
         self._append_log(item.path, text, "confirmed", saved_path)
+        self._update_transcript(item, text)
         self.status_var.set("Exported training data")
         callback = getattr(self, "_on_sample_saved", None)
         if callback is not None and saved_path is not None:
@@ -1200,15 +1206,77 @@ class AnnotationApp:
         save_line_crops(item.path, lines, out_dir)
         return out_dir
 
-    def _append_log(self, path: Path, label: str, status: str, saved_path: Optional[Path]) -> None:
+    def _append_log(
+        self, path: Path, label: str, status: str, saved_path: Optional[Path]
+    ) -> None:
         if self.log_path is None:
             return
-        is_new = not self.log_path.exists()
+
+        now = datetime.now(timezone.utc).isoformat()
+        row = {
+            "page": path.name,
+            "transcription": label,
+            "timestamp": now,
+            "status": status,
+            "saved_path": saved_path.name if saved_path else "",
+        }
+
+        fieldnames = ["page", "transcription", "timestamp", "status", "saved_path"]
+        write_header = False
+
+        if self.log_path.exists():
+            with self.log_path.open("r", newline="", encoding="utf8") as handle:
+                reader = csv.DictReader(handle)
+                existing_fields = reader.fieldnames or []
+                missing_required = [
+                    name
+                    for name in ("page", "transcription", "timestamp")
+                    if name not in existing_fields
+                ]
+                if missing_required:
+                    migrated_rows = []
+                    for existing in reader:
+                        migrated_rows.append(
+                            {
+                                "page": existing.get("page")
+                                or existing.get("filename")
+                                or "",
+                                "transcription": existing.get("transcription")
+                                or existing.get("label")
+                                or "",
+                                "timestamp": existing.get("timestamp")
+                                or now,
+                                "status": existing.get("status") or "",
+                                "saved_path": existing.get("saved_path") or "",
+                            }
+                        )
+
+                    with self.log_path.open("w", newline="", encoding="utf8") as out:
+                        writer = csv.DictWriter(out, fieldnames=fieldnames)
+                        writer.writeheader()
+                        for migrated in migrated_rows:
+                            writer.writerow(migrated)
+                else:
+                    fieldnames = list(existing_fields)
+                    for extra in ("status", "saved_path"):
+                        if extra and extra not in fieldnames:
+                            fieldnames.append(extra)
+        else:
+            write_header = True
+
         with self.log_path.open("a", newline="", encoding="utf8") as handle:
-            writer = csv.writer(handle)
-            if is_new:
-                writer.writerow(["filename", "label", "status", "saved_path"])
-            writer.writerow([path.name, label, status, saved_path.name if saved_path else ""])
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def _update_transcript(self, item: AnnotationItem, text: str) -> None:
+        transcripts_dir = getattr(self, "transcripts_dir", None)
+        if transcripts_dir is None:
+            return
+
+        transcript_path = Path(transcripts_dir) / f"{item.path.stem}.txt"
+        transcript_path.write_text(text, encoding="utf8")
 
 
 @dataclass
@@ -1275,6 +1343,7 @@ def annotate_images(
     options: Optional[AnnotationOptions] = None,
     log_path: Optional[Path] = None,
     auto_train_config: Optional[AnnotationAutoTrainConfig] = None,
+    transcripts_dir: Optional[Path] = None,
 ) -> None:
     items = [AnnotationItem(Path(path)) for path in sources]
     if not items:
@@ -1291,7 +1360,15 @@ def annotate_images(
     if auto_train_config is not None:
         callback = AnnotationTrainer(root, train_dir=Path(train_dir), config=auto_train_config)
 
-    app = AnnotationApp(root, items, Path(train_dir), options=options, log_path=log_path, on_sample_saved=callback)
+    app = AnnotationApp(
+        root,
+        items,
+        Path(train_dir),
+        options=options,
+        log_path=log_path,
+        on_sample_saved=callback,
+        transcripts_dir=transcripts_dir,
+    )
 
     logging.info(
         "Annotation window ready for %d image(s). Interact with the GUI to continue (e.g. Save/Skip).",
