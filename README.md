@@ -127,6 +127,10 @@ python main.py train --train-dir train --output-model handwriting \
     --gpt-model gpt-4o --gpt-cache-dir .cache/gpt
 ```
 
+Pass `--gpt-max-images N` to cap how many samples are transcribed by ChatGPT
+before the pipeline falls back to file-name derived labels. This helps limit API
+usage during experimentation.
+
 Pass `--no-gpt-ocr` to fall back to the legacy behaviour of deriving labels from
 file names when required.
 
