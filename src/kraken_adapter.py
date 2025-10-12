@@ -7,7 +7,9 @@ import json
 import logging
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
@@ -407,6 +409,69 @@ def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[
     return baselines
 
 
+def _run_with_live_output(cmd: list[str]) -> tuple[str, str]:
+    """Run ``cmd`` while teeing stdout/stderr to the parent process."""
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def _drain(stream, collector, sink):
+        assert stream is not None  # for type checkers
+        try:
+            for chunk in stream:
+                collector.append(chunk)
+                sink.write(chunk)
+                sink.flush()
+        finally:
+            stream.close()
+
+    threads: list[threading.Thread] = []
+    if process.stdout is not None:
+        threads.append(
+            threading.Thread(
+                target=_drain,
+                args=(process.stdout, stdout_chunks, sys.stdout),
+                daemon=True,
+            )
+        )
+    if process.stderr is not None:
+        threads.append(
+            threading.Thread(
+                target=_drain,
+                args=(process.stderr, stderr_chunks, sys.stderr),
+                daemon=True,
+            )
+        )
+
+    for thread in threads:
+        thread.start()
+
+    returncode = process.wait()
+
+    for thread in threads:
+        thread.join()
+
+    stdout = "".join(stdout_chunks)
+    stderr = "".join(stderr_chunks)
+
+    if returncode != 0:
+        raise subprocess.CalledProcessError(
+            returncode,
+            cmd,
+            output=stdout,
+            stderr=stderr,
+        )
+
+    return stdout, stderr
+
+
 def train(
     dataset_dir: Path,
     model_out: Path,
@@ -446,17 +511,25 @@ def train(
 
         log.info("Running ketos: %s", " ".join(cmd))
         try:
-            subprocess.run(cmd, check=True, stderr=subprocess.PIPE, text=True)
+            _run_with_live_output(cmd)
         except FileNotFoundError as exc:  # pragma: no cover - subprocess failure only at runtime
             raise RuntimeError(f"ketos executable not found: {exc}") from exc
         except subprocess.CalledProcessError as exc:  # pragma: no cover
             stderr = (exc.stderr or "").strip()
-            if "Model did not improve during training" in stderr:
+            stdout = getattr(exc, "stdout", "") or getattr(exc, "output", "")
+            combined_output = "\n".join(
+                part for part in [stdout.strip(), stderr] if part
+            )
+
+            if "Model did not improve during training" in combined_output:
                 hint = (
                     "Kraken aborted training because the validation metric never improved. "
                     "Add more line images or adjust the validation split/epoch count before retrying."
                 )
                 raise RuntimeError(f"{hint} (ketos exit code {exc.returncode})") from exc
+
+            if combined_output and not stderr:
+                stderr = combined_output
 
             if stderr:
                 raise RuntimeError(
