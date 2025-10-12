@@ -10,6 +10,7 @@ from typing import Iterable, List, Optional, Tuple
 import cv2
 
 from .preprocessing import preprocess_image
+from .gpt_ocr import GPTTranscriber, GPTTranscriptionError
 
 PathLike = str | os.PathLike[str]
 
@@ -53,9 +54,11 @@ def _run_command(command: Iterable[str], *, cwd: Optional[Path] = None) -> None:
     subprocess.run(command, check=True, cwd=cwd)
 
 
-def _prepare_ground_truth(image_path: Path, work_dir: Path) -> Tuple[Path, Path]:
+def _prepare_ground_truth(image_path: Path, label: str, work_dir: Path) -> Tuple[Path, Path]:
     """Write the ground-truth file required by Tesseract training."""
-    label = _extract_label(image_path)
+    label = label.strip()
+    if not label:
+        raise ValueError(f"Empty transcription supplied for {image_path}")
     base_name = image_path.stem
     gt_file = work_dir / f"{base_name}.gt.txt"
     gt_file.write_text(label + "\n", encoding="utf-8")
@@ -96,12 +99,29 @@ def _resolve_tessdata_dir(tessdata_dir: Optional[PathLike]) -> Path:
     env_dir = os.environ.get("TESSDATA_PREFIX")
     if env_dir:
         return Path(env_dir)
+    try:
+        result = subprocess.run(
+            ["tesseract", "--print-tessdata-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        result = None
+    else:
+        candidate = Path(result.stdout.strip())
+        if candidate.exists():
+            return candidate
+    windows_default = Path("C:/Program Files/Tesseract-OCR/tessdata")
+    if windows_default.exists():
+        return windows_default
     # Default for many linux distributions
     default = Path("/usr/share/tesseract-ocr/4.00/tessdata")
     if default.exists():
         return default
     raise FileNotFoundError(
-        "Unable to locate tessdata directory. Set TESSDATA_PREFIX or pass tessdata_dir explicitly."
+        "Unable to locate tessdata directory. Set TESSDATA_PREFIX, install Tesseract, "
+        "or pass tessdata_dir explicitly (see README for details)."
     )
 
 
@@ -113,6 +133,12 @@ def train_model(
     tessdata_dir: Optional[PathLike] = None,
     base_lang: str = "eng",
     max_iterations: int = 1000,
+    use_gpt_ocr: bool = True,
+    gpt_model: str = "gpt-4o-mini",
+    gpt_prompt: Optional[str] = None,
+    gpt_cache_dir: Optional[PathLike] = None,
+    gpt_max_output_tokens: int = 256,
+    gpt_max_images: Optional[int] = None,
 ) -> Path:
     """Fine-tune a Tesseract model using handwriting samples.
 
@@ -141,6 +167,25 @@ def train_model(
     max_iterations:
         How many training iterations to run. Increase this value when you add
         more samples.
+    use_gpt_ocr:
+        When ``True`` (default) each training image is transcribed with
+        ChatGPT's vision API to derive the ground-truth label. Disable this to
+        fall back to file-name derived labels.
+    gpt_model:
+        The ChatGPT model identifier to call when ``use_gpt_ocr`` is enabled.
+    gpt_prompt:
+        Optional custom prompt to send alongside each image when requesting a
+        transcription.
+    gpt_cache_dir:
+        Optional directory where ChatGPT transcriptions are cached. Cached
+        files are reused on subsequent runs to avoid repeated API calls.
+    gpt_max_output_tokens:
+        Maximum number of tokens ChatGPT may return for each transcription
+        request.
+    gpt_max_images:
+        Optional upper bound on how many images should be transcribed with
+        ChatGPT. Once the limit is reached the remaining samples fall back to
+        file-name derived labels so you can cap API usage.
 
     Returns
     -------
@@ -157,9 +202,49 @@ def train_model(
 
     logging.info("Starting Tesseract training with %d images", len(images))
 
+    if gpt_max_images is not None:
+        if gpt_max_images < 0:
+            raise ValueError("gpt_max_images must be zero or a positive integer")
+
+    transcriber: Optional[GPTTranscriber] = None
+    if use_gpt_ocr and (gpt_max_images is None or gpt_max_images != 0):
+        transcriber_kwargs: dict[str, object] = {"model": gpt_model, "max_output_tokens": gpt_max_output_tokens}
+        if gpt_prompt is not None:
+            transcriber_kwargs["prompt"] = gpt_prompt
+        if gpt_cache_dir is not None:
+            transcriber_kwargs["cache_dir"] = Path(gpt_cache_dir)
+        try:
+            transcriber = GPTTranscriber(**transcriber_kwargs)
+        except GPTTranscriptionError as exc:
+            raise RuntimeError(f"Unable to initialise ChatGPT OCR: {exc}") from exc
+
     lstmf_paths: List[Path] = []
-    for image_path in images:
-        processed_path, _ = _prepare_ground_truth(image_path, work_dir)
+    gpt_transcriptions = 0
+    gpt_limit_reached = False
+    for index, image_path in enumerate(images):
+        use_transcriber = False
+        if transcriber is not None:
+            if gpt_max_images is None or gpt_transcriptions < gpt_max_images:
+                use_transcriber = True
+            elif not gpt_limit_reached:
+                remaining = len(images) - index
+                logging.info(
+                    "GPT OCR limit of %d image(s) reached; falling back to file-name labels for the remaining %d image(s).",
+                    gpt_max_images,
+                    remaining,
+                )
+                gpt_limit_reached = True
+
+        if use_transcriber:
+            try:
+                label = transcriber.transcribe(image_path)
+            except GPTTranscriptionError as exc:
+                raise RuntimeError(f"ChatGPT OCR failed for {image_path.name}: {exc}") from exc
+            gpt_transcriptions += 1
+        else:
+            label = _extract_label(image_path)
+
+        processed_path, _ = _prepare_ground_truth(image_path, label, work_dir)
         lstmf_path = _generate_lstmf(processed_path, work_dir)
         lstmf_paths.append(lstmf_path)
 

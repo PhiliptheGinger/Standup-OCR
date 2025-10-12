@@ -111,6 +111,78 @@ python main.py train --train-dir train --output-model handwriting
 Use the `--model` flag on the `test`, `batch`, or `review` subcommands to
 evaluate the updated model.
 
+#### Locating Tesseract's tessdata files
+
+Tesseract needs access to its language packs (the `tessdata` folder) before the
+training pipeline can start. The CLI now attempts to discover this directory in
+several ways:
+
+1. Respect an explicit `--tessdata-dir` argument when you provide one.
+2. Fall back to the `TESSDATA_PREFIX` environment variable if it is set.
+3. Ask the local Tesseract binary via `tesseract --print-tessdata-dir`.
+4. Check the default installation paths on Windows and Linux.
+
+If all of these checks fail you'll see an error similar to "Unable to locate
+tessdata directory". Fix it by either setting the environment variable or
+passing the path explicitly:
+
+```bash
+# macOS / Linux
+export TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
+
+# Windows PowerShell (default install location)
+$env:TESSDATA_PREFIX="C:/Program Files/Tesseract-OCR/tessdata"
+
+# Or pass it directly to the CLI
+python main.py train --train-dir train --output-model handwriting \
+    --tessdata-dir "C:/Program Files/Tesseract-OCR/tessdata"
+```
+
+> **Tip:** Running `tesseract --print-tessdata-dir` in your shell prints the
+> directory that the binary uses internally. Point `TESSDATA_PREFIX` to that
+> location if the training command cannot find it automatically.
+
+### ChatGPT-powered transcription
+
+Set the `OPENAI_API_KEY` environment variable to enable ChatGPT's multimodal
+API for handwriting transcription. When active, the training pipeline sends
+each snippet to ChatGPT, writes the recognised text into the required
+`.gt.txt` files, and then proceeds with the normal Tesseract fine-tuning
+workflow. The default configuration uses the `gpt-4o-mini` model and caches can
+optionally be persisted via `--gpt-cache-dir` to avoid duplicate API calls.
+
+You can configure the key either by exporting it in your shell **or** by
+creating a `.env` file in the project root (a `.env.example` template is
+included and the CLI now loads this file automatically):
+
+```bash
+# macOS / Linux shell
+export OPENAI_API_KEY="sk-your-key"
+
+# Windows PowerShell
+$env:OPENAI_API_KEY="sk-your-key"
+
+# Optional .env file if you prefer to keep credentials out of your shell profile
+echo "OPENAI_API_KEY=sk-your-key" > .env
+```
+
+Existing environment variables take precedence over the `.env` file so you can
+override the key per-shell or per-command when needed.
+
+To customise the behaviour use the new CLI flags, for example:
+
+```bash
+python main.py train --train-dir train --output-model handwriting \
+    --gpt-model gpt-4o --gpt-cache-dir .cache/gpt
+```
+
+Pass `--gpt-max-images N` to cap how many samples are transcribed by ChatGPT
+before the pipeline falls back to file-name derived labels. This helps limit API
+usage during experimentation.
+
+Pass `--no-gpt-ocr` to fall back to the legacy behaviour of deriving labels from
+file names when required.
+
 > **Note:** The annotation interface relies on Tkinter, which ships with most
 > standard Python installers. On some Linux distributions you may need to
 > install an additional package such as `python3-tk` to enable the GUI.
