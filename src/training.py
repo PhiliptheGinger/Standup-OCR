@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 import cv2
+from PIL import Image, ImageDraw, ImageFont
 
 from .preprocessing import preprocess_image
 from .gpt_ocr import GPTTranscriber, GPTTranscriptionError
@@ -30,19 +31,58 @@ def _extract_label(image_path: Path) -> str:
     return label.replace("-", " ")
 
 
+def _bootstrap_sample_training_image(train_dir: Path) -> Path:
+    """Create a starter handwriting sample so first-time users can train."""
+
+    sample_path = train_dir / "word_sample.png"
+    if sample_path.exists():
+        return sample_path
+
+    image_width = 400
+    image_height = 160
+    image = Image.new("L", (image_width, image_height), color=255)
+    draw = ImageDraw.Draw(image)
+
+    text = "sample"
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 72)
+    except OSError:  # pragma: no cover - fallback for environments without the font
+        font = ImageFont.load_default()
+
+    try:
+        text_bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+    except AttributeError:  # pragma: no cover - Pillow < 8 compatibility
+        text_width, text_height = draw.textsize(text, font=font)
+    x_pos = max((image_width - text_width) // 2, 10)
+    y_pos = max((image_height - text_height) // 2, 10)
+
+    draw.text((x_pos, y_pos), text, fill=0, font=font)
+    image.save(sample_path, format="PNG")
+
+    return sample_path
+
+
 def _discover_images(train_dir: Path) -> List[Path]:
     """Return a sorted list of image paths inside ``train_dir``."""
+
+    train_dir.mkdir(parents=True, exist_ok=True)
     images = [
         p
         for p in sorted(train_dir.iterdir())
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
     ]
-    if not images:
-        raise FileNotFoundError(
-            f"No training images found in {train_dir}. Place handwriting samples "
-            "named like 'word_hello.png' inside this folder."
-        )
-    return images
+    if images:
+        return images
+
+    sample = _bootstrap_sample_training_image(train_dir)
+    logging.info(
+        "No training images found in %s; created starter sample %s. Replace this image with your own handwriting to continue training.",
+        train_dir,
+        sample.name,
+    )
+    return [sample]
 
 
 def _ensure_directory(path: Path) -> Path:

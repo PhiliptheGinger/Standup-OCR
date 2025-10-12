@@ -1,4 +1,4 @@
-"""Tests for tessdata discovery helpers."""
+"""Tests for tessdata discovery helpers and training directory bootstrapping."""
 
 from src import training
 
@@ -36,3 +36,14 @@ def test_resolve_uses_tesseract_binary_location(monkeypatch, tmp_path):
     result = training._resolve_tessdata_dir(None)
 
     assert result == tessdata
+
+
+def test_discover_images_creates_sample(tmp_path):
+    train_dir = tmp_path / "train"
+
+    images = training._discover_images(train_dir)
+
+    assert len(images) == 1
+    sample = images[0]
+    assert sample.name == "word_sample.png"
+    assert sample.exists()

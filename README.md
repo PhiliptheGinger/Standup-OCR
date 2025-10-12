@@ -108,6 +108,10 @@ Once you have collected a set of labelled snippets run:
 python main.py train --train-dir train --output-model handwriting
 ```
 
+The first run will automatically drop a starter sample (`word_sample.png`) into
+`train/` if the directory is empty. Replace this placeholder with your own
+labelled handwriting images to begin fine-tuning.
+
 Use the `--model` flag on the `test`, `batch`, or `review` subcommands to
 evaluate the updated model.
 
