@@ -13,7 +13,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, List, Optional, Tuple
 
-from PIL import Image
+from PIL import Image, ImageOps
+
+import numpy as np
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +117,129 @@ def _discover_ground_truth(dataset_dir: Path) -> list[str]:
         "No Kraken ground truth files were found in the training directory. "
         "Export PAGE-XML data or line image crops before running training."
     )
+
+
+def _label_path_for_line(image_path: Path) -> Path:
+    """Return the expected transcription file path for ``image_path``."""
+
+    stem = image_path.stem
+    return image_path.with_name(f"{stem}.gt.txt")
+
+
+def _is_line_image(path: Path) -> bool:
+    return path.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+
+
+def _line_needs_center_padding(image_path: Path, target_height: int = 120) -> bool:
+    """Return ``True`` if Kraken's center normalizer is likely to fail."""
+
+    try:
+        with Image.open(image_path) as im:
+            grayscale = im.convert("L")
+            line = np.asarray(grayscale, dtype=np.float32)
+    except Exception as exc:  # pragma: no cover - best effort probing only
+        log.debug("Skipping center normalization probe for %s: %s", image_path, exc)
+        return False
+
+    if line.size == 0:
+        return False
+
+    from kraken.lib.lineest import CenterNormalizer  # lazy import
+
+    normalizer = CenterNormalizer(target_height)
+    maximum = float(line.max())
+    temp = maximum - line
+    max_temp = float(temp.max())
+    if max_temp > 0:
+        temp /= max_temp
+
+    try:
+        normalizer.measure(temp)
+        normalizer.normalize(line, cval=maximum)
+    except ValueError as exc:
+        if "inhomogeneous shape" in str(exc):
+            return True
+        raise
+
+    return False
+
+
+def _relative_to_dataset(path: Path, dataset_dir: Path) -> Path:
+    try:
+        return path.relative_to(dataset_dir)
+    except ValueError:
+        return Path(path.name)
+
+
+def _copy_transcription(src_image: Path, dst_image: Path) -> None:
+    src_label = _label_path_for_line(src_image)
+    if not src_label.exists():
+        log.debug("No transcription found for %s", src_image)
+        return
+
+    dst_label = _label_path_for_line(dst_image)
+    dst_label.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_label, dst_label)
+
+
+def _write_padded_line(src: Path, dst: Path, padding: int = 32) -> None:
+    with Image.open(src) as im:
+        padded = ImageOps.expand(im.convert("L"), border=padding, fill=255)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        padded.save(dst)
+
+
+def _prepare_line_images(
+    ground_truth: list[str], dataset_dir: Path, target_height: int = 120
+) -> tuple[list[str], tempfile.TemporaryDirectory | None]:
+    """Pad problematic line images so Kraken's dewarper stops crashing."""
+
+    if not ground_truth:
+        return ground_truth, None
+
+    tmpdir: tempfile.TemporaryDirectory | None = None
+    adjusted: list[str] = []
+    patched_sources: list[Path] = []
+
+    for entry in ground_truth:
+        image_path = Path(entry)
+        if not _is_line_image(image_path):
+            adjusted.append(entry)
+            continue
+
+        try:
+            needs_padding = _line_needs_center_padding(image_path, target_height)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("Failed to probe %s for center normalization: %s", image_path, exc)
+            adjusted.append(entry)
+            continue
+
+        if not needs_padding:
+            adjusted.append(entry)
+            continue
+
+        if tmpdir is None:
+            tmpdir = tempfile.TemporaryDirectory(prefix="kraken-lines-")
+
+        dest_root = Path(tmpdir.name)
+        rel_path = _relative_to_dataset(image_path, dataset_dir)
+        dest_image = dest_root / rel_path
+
+        _write_padded_line(image_path, dest_image)
+        _copy_transcription(image_path, dest_image)
+
+        patched_sources.append(image_path)
+        adjusted.append(str(dest_image))
+
+    if patched_sources:
+        log.warning(
+            "Applied additional padding to %d line images to work around Kraken "
+            "center normalization failures: %s",
+            len(patched_sources),
+            ", ".join(str(path) for path in patched_sources),
+        )
+
+    return adjusted, tmpdir
 
 
 def _explain_import_error(exc: ImportError, previous_exc: ImportError | None = None) -> str:
@@ -300,29 +425,35 @@ def train(
         )
 
     ground_truth = _discover_ground_truth(dataset_dir)
-
-    cmd = [
-        ketos,
-        "train",
-        "--output",
-        str(model_out),
-        "--epochs",
-        str(epochs),
-    ]
-    if val_split > 0:
-        validation_flag = _ketos_train_validation_flag(ketos)
-        cmd.extend([validation_flag, str(val_split)])
-    if base_model is not None:
-        cmd.extend(["--load", str(base_model)])
-    cmd.extend(ground_truth)
-
-    log.info("Running ketos: %s", " ".join(cmd))
+    sanitized_tmp: tempfile.TemporaryDirectory | None = None
     try:
-        subprocess.run(cmd, check=True)
-    except FileNotFoundError as exc:  # pragma: no cover - subprocess failure only at runtime
-        raise RuntimeError(f"ketos executable not found: {exc}") from exc
-    except subprocess.CalledProcessError as exc:  # pragma: no cover
-        raise RuntimeError(f"ketos train failed with exit code {exc.returncode}") from exc
+        ground_truth, sanitized_tmp = _prepare_line_images(ground_truth, dataset_dir)
+
+        cmd = [
+            ketos,
+            "train",
+            "--output",
+            str(model_out),
+            "--epochs",
+            str(epochs),
+        ]
+        if val_split > 0:
+            validation_flag = _ketos_train_validation_flag(ketos)
+            cmd.extend([validation_flag, str(val_split)])
+        if base_model is not None:
+            cmd.extend(["--load", str(base_model)])
+        cmd.extend(ground_truth)
+
+        log.info("Running ketos: %s", " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True)
+        except FileNotFoundError as exc:  # pragma: no cover - subprocess failure only at runtime
+            raise RuntimeError(f"ketos executable not found: {exc}") from exc
+        except subprocess.CalledProcessError as exc:  # pragma: no cover
+            raise RuntimeError(f"ketos train failed with exit code {exc.returncode}") from exc
+    finally:
+        if sanitized_tmp is not None:
+            sanitized_tmp.cleanup()
 
     return model_out
 
