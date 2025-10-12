@@ -158,7 +158,7 @@ def handle_review(args: argparse.Namespace) -> None:
         train_dir=args.train_dir,
         preview=not args.no_preview,
     )
-    session = ReviewSession(config)
+    session: ReviewSession
     last_trained_count = 0
 
     def maybe_train() -> None:
@@ -180,6 +180,8 @@ def handle_review(args: argparse.Namespace) -> None:
             )
             logging.info("Updated model saved to %s", model_path)
             last_trained_count += args.auto_train
+
+    session = ReviewSession(config, on_sample_saved=lambda *_args: maybe_train())
 
     try:
         paths: List[Path]
@@ -233,10 +235,16 @@ def handle_annotate(args: argparse.Namespace) -> None:
             "Kraken auto-segmentation requested but Kraken is not installed; falling back to manual mode."
         )
 
+    prefill_psm = args.prefill_psm if args.prefill_psm is not None else 6
+
     options = AnnotationOptions(
         engine=args.engine,
         segmentation=args.seg,
         export_format=args.export,
+        prefill_enabled=not args.no_prefill,
+        prefill_model=args.prefill_model,
+        prefill_tessdata=args.prefill_tessdata,
+        prefill_psm=prefill_psm,
     )
 
     annotate_images(
@@ -561,6 +569,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-log",
         type=Path,
         help="Optional CSV file to append annotation metadata (image, status, label).",
+    )
+    annotate_parser.add_argument(
+        "--no-prefill",
+        action="store_true",
+        help="Disable automatic OCR transcription prefill when annotating.",
+    )
+    annotate_parser.add_argument(
+        "--prefill-model",
+        type=Path,
+        help="Optional traineddata or Kraken model used to prefill transcriptions.",
+    )
+    annotate_parser.add_argument(
+        "--prefill-tessdata",
+        type=Path,
+        help="Tessdata directory to accompany --prefill-model when using Tesseract.",
+    )
+    annotate_parser.add_argument(
+        "--prefill-psm",
+        type=int,
+        help="Tesseract page segmentation mode for prefill OCR (default: 6).",
     )
     annotate_parser.set_defaults(func=handle_annotate)
 
