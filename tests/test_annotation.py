@@ -98,6 +98,46 @@ def test_confirm_handles_oserror(monkeypatch):
     assert app.status_var.value is None
 
 
+def test_confirm_updates_transcript_file(tmp_path):
+    """Confirming an annotation should persist the transcription to disk."""
+
+    source_path = tmp_path / "scan1.png"
+    app = AnnotationApp.__new__(AnnotationApp)
+    app.items = [AnnotationItem(source_path)]
+    app.index = 0
+    app.overlay_entries = []
+    app.overlay_items = []
+    app.rect_to_overlay = {}
+    app.selected_rects = set()
+    app.current_tokens = []
+    app.transcripts_dir = tmp_path / "transcripts"
+    app.transcripts_dir.mkdir()
+    app._get_transcription_text = lambda: "Updated transcription"
+    app._append_log = lambda *_args, **_kwargs: None
+    app._advance = lambda: None
+    app._on_sample_saved = None
+    app.train_dir = tmp_path / "train"
+    app.train_dir.mkdir()
+
+    saved_path = app.train_dir / "saved.png"
+    app._save_annotation = lambda *_args, **_kwargs: saved_path
+
+    class DummyVar:
+        def __init__(self) -> None:
+            self.value: Optional[str] = None
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    app.status_var = DummyVar()
+
+    AnnotationApp.confirm(app)
+
+    transcript_path = app.transcripts_dir / "scan1.txt"
+    assert transcript_path.exists()
+    assert transcript_path.read_text(encoding="utf8") == "Updated transcription"
+
+
 def test_back_rewinds_without_reappending_logs():
     """The back button should revisit the previous item without side effects."""
 

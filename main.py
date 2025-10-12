@@ -18,6 +18,7 @@ from src.kraken_adapter import is_available as kraken_available, ocr as kraken_o
 DEFAULT_TRAIN_DIR = Path("train")
 DEFAULT_MODEL_DIR = Path("models")
 DEFAULT_RESULTS_FILE = Path("results.csv")
+DEFAULT_TRANSCRIPTS_DIR = Path("transcripts") / "raw"
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -247,12 +248,15 @@ def handle_annotate(args: argparse.Namespace) -> None:
         prefill_psm=prefill_psm,
     )
 
+    transcripts_dir = None if args.skip_transcripts else args.transcripts_dir
+
     annotate_images(
         paths,
         args.train_dir,
         options=options,
         log_path=args.output_log,
         auto_train_config=auto_train_config,
+        transcripts_dir=transcripts_dir,
     )
 
 
@@ -568,7 +572,23 @@ def build_parser() -> argparse.ArgumentParser:
     annotate_parser.add_argument(
         "--output-log",
         type=Path,
-        help="Optional CSV file to append annotation metadata (image, status, label).",
+        help=(
+            "Optional CSV file to append annotation metadata (page, transcription, timestamp)."
+        ),
+    )
+    annotate_parser.add_argument(
+        "--transcripts-dir",
+        type=Path,
+        default=DEFAULT_TRANSCRIPTS_DIR,
+        help=(
+            "Directory where confirmed transcriptions will be written "
+            "(default: transcripts/raw/)."
+        ),
+    )
+    annotate_parser.add_argument(
+        "--skip-transcripts",
+        action="store_true",
+        help="Do not write confirmed transcriptions to the transcripts directory.",
     )
     annotate_parser.add_argument(
         "--no-prefill",
