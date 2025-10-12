@@ -111,6 +111,31 @@ evaluate the updated model.
 > standard Python installers. On some Linux distributions you may need to
 > install an additional package such as `python3-tk` to enable the GUI.
 
+## 🧠 TrOCR Mode (Handwriting OCR)
+
+Standup-OCR now ships with [Microsoft's TrOCR](https://huggingface.co/microsoft)
+handwriting model via Hugging Face Transformers. Install the dependencies with:
+
+```bash
+pip install torch torchvision transformers pillow
+```
+
+Run the automated handwriting pipeline with:
+
+```bash
+python main.py annotate --source path/to/folder --output-log train/annotation_log.csv \
+    --force --verbose
+```
+
+The agentic helper processes each scan with TrOCR, writes transcripts to
+`transcripts/raw/`, and records page-level results in `train/annotation_log.csv`
+with the columns `page`, `transcription`, and `timestamp`. A summary of the run
+is printed as `[TrOCR] Processed …` and `ready_for_review.zip` is refreshed with
+the newly generated text files.
+
+Use the `--model` flag on `python -m src.ocr.main` to experiment with other
+TrOCR variants (for example `microsoft/trocr-large-handwritten`).
+
 ## Kraken installation (Windows quick start)
 
 1. Install [Python 3.10+](https://www.python.org/downloads/windows/) and ensure "Add python.exe to PATH" is ticked during setup.
