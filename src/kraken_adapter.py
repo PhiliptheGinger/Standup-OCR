@@ -531,7 +531,7 @@ def train(
                 part for part in [stdout.strip(), stderr] if part
             )
 
-            if "Model did not improve during training" in combined_output:
+            if "Model did not improve during" in combined_output:
                 hint = (
                     "Kraken aborted training because the validation metric never improved. "
                     "Add more line images or adjust the validation split/epoch count before retrying."
