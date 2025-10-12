@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Tuple
 
 import pytest
 
@@ -13,6 +13,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 import annotation
 from annotation import AnnotationApp, AnnotationItem, _prepare_image
+from annotation import _load_annotation_items
 
 
 def test_prepare_image_applies_exif_orientation():
@@ -138,6 +139,40 @@ def test_confirm_updates_transcript_file(tmp_path):
     transcript_path = app.transcripts_dir / "scan1.txt"
     assert transcript_path.exists()
     assert transcript_path.read_text(encoding="utf8") == "Updated transcription"
+
+
+def test_finish_manual_overlay_normalises_coordinates():
+    app = AnnotationApp.__new__(AnnotationApp)
+    app.canvas = SimpleNamespace(
+        coords=lambda _rect_id: (120.0, 200.0, 20.0, 180.0),
+        delete=lambda _rect_id: None,
+    )
+    app._active_temp_rect = 1
+    app._drag_start = (0.0, 0.0)
+    app.display_scale = (1.0, 1.0)
+    app.manual_token_counter = 0
+    app.overlay_items = []
+    app.rect_to_overlay = {}
+    app.selected_rects = set()
+    app._update_transcription_from_overlays = lambda: None
+    app._push_undo = lambda *_args, **_kwargs: None
+    app.status_var = SimpleNamespace(set=lambda *_args, **_kwargs: None)
+
+    class RecordingOverlay:
+        created_bbox: Optional[Tuple[int, int, int, int]] = None
+
+        def __init__(self, bbox):
+            RecordingOverlay.created_bbox = bbox
+            self.bbox = bbox
+            self.entry = SimpleNamespace(focus_set=lambda: None)
+
+    app._create_overlay = (
+        lambda _text, bbox, _order_key, _token, **_kwargs: RecordingOverlay(bbox)
+    )
+
+    app._finish_manual_overlay(0.0, 0.0)
+
+    assert RecordingOverlay.created_bbox == (20, 180, 120, 200)
 
 
 def test_back_rewinds_without_reappending_logs():
