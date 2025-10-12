@@ -6,5 +6,8 @@ opencv-python
 pandas
 pillow
 pytesseract
+torch
+torchvision
+transformers
 tqdm
 watchdog
