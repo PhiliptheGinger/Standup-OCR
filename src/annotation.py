@@ -251,8 +251,30 @@ class AnnotationApp:
 
         lines_container = tk.LabelFrame(side_panel, text="Lines")
         lines_container.grid(row=0, column=0, sticky="nsew")
-        self.lines_frame = tk.Frame(lines_container)
-        self.lines_frame.pack(fill="both", expand=True)
+        lines_container.rowconfigure(0, weight=1)
+        lines_container.columnconfigure(0, weight=1)
+
+        lines_canvas = tk.Canvas(lines_container, bd=0, highlightthickness=0)
+        lines_canvas.grid(row=0, column=0, sticky="nsew")
+        lines_scroll = tk.Scrollbar(lines_container, orient="vertical", command=lines_canvas.yview)
+        lines_scroll.grid(row=0, column=1, sticky="ns")
+        lines_canvas.configure(yscrollcommand=lines_scroll.set)
+
+        self.lines_frame = tk.Frame(lines_canvas)
+        self.lines_frame.bind(
+            "<Configure>",
+            lambda event: lines_canvas.configure(scrollregion=lines_canvas.bbox("all")),
+        )
+        self._lines_canvas_window = lines_canvas.create_window((0, 0), window=self.lines_frame, anchor="nw")
+
+        def _sync_lines_width(event: tk.Event) -> None:
+            try:
+                lines_canvas.itemconfigure(self._lines_canvas_window, width=event.width)
+            except tk.TclError:
+                pass
+
+        lines_canvas.bind("<Configure>", _sync_lines_width)
+        self.lines_canvas = lines_canvas
 
         transcription_container = tk.LabelFrame(side_panel, text="Transcription")
         transcription_container.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
@@ -664,12 +686,11 @@ class AnnotationApp:
         entry = tk.Entry(entry_parent, width=80)
         entry.insert(0, text)
         entry.bind("<Key>", self._on_overlay_modified)
-        if hasattr(entry, "pack"):
-            entry.pack(fill="x", pady=2)
         overlay = OverlayItem(rect_id=rect_id, entry=entry, bbox=bbox, order_key=order_key, token=token, is_manual=is_manual)
         self.overlay_items.append(overlay)
         self.overlay_entries.append(entry)
         self.rect_to_overlay[rect_id] = overlay
+        self._reorder_overlays()
         if select:
             self._select_overlay(overlay, additive=False)
         return overlay
@@ -681,6 +702,30 @@ class AnnotationApp:
             except Exception:  # pragma: no cover - defensive
                 pass
         self.overlay_entries.clear()
+
+    def _reorder_overlays(self) -> None:
+        if getattr(self, "lines_frame", None) is None:
+            return
+        try:
+            self.overlay_items.sort(key=lambda item: item.order_key)
+        except Exception:  # pragma: no cover - defensive sorting
+            return
+        entries: List[tk.Entry] = []
+        for overlay in self.overlay_items:
+            entry = overlay.entry
+            try:
+                entry.pack_forget()
+            except Exception:  # pragma: no cover - defensive for stubs/destroyed widgets
+                pass
+            try:
+                entry.pack(fill="x", pady=2)
+            except Exception:  # pragma: no cover - defensive for stubs/destroyed widgets
+                continue
+            entries.append(entry)
+        if entries:
+            self.overlay_entries = entries
+        else:
+            self.overlay_entries.clear()
 
     def _suggest_label(self, path: Path) -> str:
         options = getattr(self, "options", AnnotationOptions())
@@ -1015,6 +1060,7 @@ class AnnotationApp:
             self._push_undo(lambda data=snapshots: self._restore_overlays(data))
         if hasattr(self, "delete_button"):
             self.delete_button.config(state=tk.DISABLED)
+        self._reorder_overlays()
         self._update_transcription_from_overlays()
 
     def _on_delete_selected(self, _event: Optional[tk.Event]) -> None:
@@ -1087,6 +1133,7 @@ class AnnotationApp:
             self.overlay_entries.remove(overlay.entry)
         self.rect_to_overlay.pop(overlay.rect_id, None)
         self.selected_rects.discard(overlay.rect_id)
+        self._reorder_overlays()
 
     def _clone_token(self, token: Optional[OcrToken]) -> Optional[OcrToken]:
         if token is None:
