@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 sys.modules.setdefault("cv2", types.ModuleType("cv2"))
 
@@ -40,16 +43,22 @@ def _setup_monkeypatch(monkeypatch, help_text: str | None):
     return captured_commands
 
 
-def test_train_uses_partition_when_supported(monkeypatch, tmp_path):
-    help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
-    captured = _setup_monkeypatch(monkeypatch, help_text)
-
+def _dataset_with_line(tmp_path: Path) -> Path:
     dataset_dir = tmp_path / "dataset"
     dataset_dir.mkdir()
     lines_dir = dataset_dir / "lines"
     lines_dir.mkdir()
     line_image = lines_dir / "sample.png"
     line_image.write_bytes(b"")
+    return dataset_dir
+
+
+def test_train_uses_partition_when_supported(monkeypatch, tmp_path):
+    help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
+    captured = _setup_monkeypatch(monkeypatch, help_text)
+
+    dataset_dir = _dataset_with_line(tmp_path)
+    line_image = dataset_dir / "lines" / "sample.png"
     model_out = tmp_path / "model.mlmodel"
 
     result = kraken_adapter.train(dataset_dir, model_out, epochs=10, val_split=0.2)
@@ -73,12 +82,8 @@ def test_train_falls_back_to_validation(monkeypatch, tmp_path):
     help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --validation FLOAT"
     captured = _setup_monkeypatch(monkeypatch, help_text)
 
-    dataset_dir = tmp_path / "dataset"
-    dataset_dir.mkdir()
-    lines_dir = dataset_dir / "lines"
-    lines_dir.mkdir()
-    line_image = lines_dir / "sample.png"
-    line_image.write_bytes(b"")
+    dataset_dir = _dataset_with_line(tmp_path)
+    line_image = dataset_dir / "lines" / "sample.png"
     model_out = tmp_path / "model.mlmodel"
 
     kraken_adapter.train(dataset_dir, model_out, epochs=5, val_split=0.3)
@@ -99,12 +104,8 @@ def test_train_falls_back_to_validation(monkeypatch, tmp_path):
 def test_train_skips_validation_flag_when_disabled(monkeypatch, tmp_path):
     captured = _setup_monkeypatch(monkeypatch, help_text="Usage: ketos train [OPTIONS]")
 
-    dataset_dir = tmp_path / "dataset"
-    dataset_dir.mkdir()
-    lines_dir = dataset_dir / "lines"
-    lines_dir.mkdir()
-    line_image = lines_dir / "sample.png"
-    line_image.write_bytes(b"")
+    dataset_dir = _dataset_with_line(tmp_path)
+    line_image = dataset_dir / "lines" / "sample.png"
     model_out = tmp_path / "model.mlmodel"
 
     kraken_adapter.train(dataset_dir, model_out, epochs=2, val_split=0.0)
@@ -126,12 +127,7 @@ def test_train_prefers_pagexml_when_available(monkeypatch, tmp_path):
     help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
     captured = _setup_monkeypatch(monkeypatch, help_text)
 
-    dataset_dir = tmp_path / "dataset"
-    dataset_dir.mkdir()
-
-    lines_dir = dataset_dir / "lines"
-    lines_dir.mkdir()
-    (lines_dir / "line.png").write_bytes(b"")
+    dataset_dir = _dataset_with_line(tmp_path)
 
     pagexml_dir = dataset_dir / "pagexml"
     pagexml_dir.mkdir()
@@ -198,3 +194,33 @@ def test_train_pads_problematic_line_images(monkeypatch, tmp_path, caplog):
     assert "Applied additional padding" in caplog.text
 
     shutil.rmtree(tempdirs[0].path)
+
+
+def test_train_surfaces_model_not_improving_error(monkeypatch, tmp_path):
+    help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
+    captured = []
+
+    def fake_run(cmd, *_, **kwargs):
+        captured.append(cmd)
+        if cmd[:3] == ["/usr/bin/ketos", "train", "--help"]:
+            return types.SimpleNamespace(stdout=help_text, stderr="")
+        raise subprocess.CalledProcessError(
+            1,
+            cmd,
+            stderr="Model did not improve during training."
+        )
+
+    monkeypatch.setattr(kraken_adapter, "_require_kraken", lambda: None)
+    monkeypatch.setattr(kraken_adapter.shutil, "which", lambda name: "/usr/bin/ketos" if name == "ketos" else None)
+    monkeypatch.setattr(kraken_adapter.subprocess, "run", fake_run)
+    kraken_adapter._ketos_train_validation_flag.cache_clear()
+
+    dataset_dir = _dataset_with_line(tmp_path)
+    model_out = tmp_path / "model.mlmodel"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        kraken_adapter.train(dataset_dir, model_out, epochs=1, val_split=0.1)
+
+    assert "Kraken aborted training" in str(excinfo.value)
+    assert "exit code 1" in str(excinfo.value)
+    assert captured[-1][0] == "/usr/bin/ketos"
