@@ -111,6 +111,25 @@ python main.py train --train-dir train --output-model handwriting
 Use the `--model` flag on the `test`, `batch`, or `review` subcommands to
 evaluate the updated model.
 
+### ChatGPT-powered transcription
+
+Set the `OPENAI_API_KEY` environment variable to enable ChatGPT's multimodal
+API for handwriting transcription. When active, the training pipeline sends
+each snippet to ChatGPT, writes the recognised text into the required
+`.gt.txt` files, and then proceeds with the normal Tesseract fine-tuning
+workflow. The default configuration uses the `gpt-4o-mini` model and caches can
+optionally be persisted via `--gpt-cache-dir` to avoid duplicate API calls.
+
+To customise the behaviour use the new CLI flags, for example:
+
+```bash
+python main.py train --train-dir train --output-model handwriting \
+    --gpt-model gpt-4o --gpt-cache-dir .cache/gpt
+```
+
+Pass `--no-gpt-ocr` to fall back to the legacy behaviour of deriving labels from
+file names when required.
+
 > **Note:** The annotation interface relies on Tkinter, which ships with most
 > standard Python installers. On some Linux distributions you may need to
 > install an additional package such as `python3-tk` to enable the GUI.
