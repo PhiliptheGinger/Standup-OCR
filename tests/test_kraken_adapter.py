@@ -38,6 +38,12 @@ def _setup_monkeypatch(monkeypatch, help_text: str | None):
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(kraken_adapter.subprocess, "run", fake_run)
+
+    def fake_live_output(cmd):
+        captured_commands.append(cmd)
+        return "", ""
+
+    monkeypatch.setattr(kraken_adapter, "_run_with_live_output", fake_live_output)
     kraken_adapter._ketos_train_validation_flag.cache_clear()
 
     return captured_commands
@@ -201,18 +207,23 @@ def test_train_surfaces_model_not_improving_error(monkeypatch, tmp_path):
     captured = []
 
     def fake_run(cmd, *_, **kwargs):
-        captured.append(cmd)
         if cmd[:3] == ["/usr/bin/ketos", "train", "--help"]:
             return types.SimpleNamespace(stdout=help_text, stderr="")
+        raise AssertionError("unexpected subprocess.run invocation")
+
+    def fake_live_output(cmd):
+        captured.append(cmd)
         raise subprocess.CalledProcessError(
             1,
             cmd,
-            stderr="Model did not improve during training."
+            output="Model did not improve during training.\nSeed set to 42",
+            stderr="",
         )
 
     monkeypatch.setattr(kraken_adapter, "_require_kraken", lambda: None)
     monkeypatch.setattr(kraken_adapter.shutil, "which", lambda name: "/usr/bin/ketos" if name == "ketos" else None)
     monkeypatch.setattr(kraken_adapter.subprocess, "run", fake_run)
+    monkeypatch.setattr(kraken_adapter, "_run_with_live_output", fake_live_output)
     kraken_adapter._ketos_train_validation_flag.cache_clear()
 
     dataset_dir = _dataset_with_line(tmp_path)
