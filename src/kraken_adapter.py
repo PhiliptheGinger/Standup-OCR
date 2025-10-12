@@ -74,6 +74,49 @@ def _ketos_train_validation_flag(ketos_path: str) -> str:
     return "--validation"
 
 
+def _discover_ground_truth(dataset_dir: Path) -> list[str]:
+    """Return the Kraken ground truth files contained in ``dataset_dir``."""
+
+    if dataset_dir.is_file():
+        return [str(dataset_dir)]
+
+    if not dataset_dir.exists():
+        raise FileNotFoundError(f"Training data directory {dataset_dir} does not exist")
+
+    def collect(root: Path, suffixes: tuple[str, ...]) -> list[str]:
+        files = sorted(
+            path
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix.lower() in suffixes
+        )
+        return [str(path) for path in files]
+
+    pagexml_dir = dataset_dir / "pagexml"
+    if pagexml_dir.is_dir():
+        xml_files = collect(pagexml_dir, (".xml",))
+        if xml_files:
+            return xml_files
+
+    lines_dir = dataset_dir / "lines"
+    if lines_dir.is_dir():
+        image_files = collect(lines_dir, (".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+        if image_files:
+            return image_files
+
+    xml_files = collect(dataset_dir, (".xml",))
+    if xml_files:
+        return xml_files
+
+    image_files = collect(dataset_dir, (".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+    if image_files:
+        return image_files
+
+    raise RuntimeError(
+        "No Kraken ground truth files were found in the training directory. "
+        "Export PAGE-XML data or line image crops before running training."
+    )
+
+
 def _explain_import_error(exc: ImportError, previous_exc: ImportError | None = None) -> str:
     """Return a user-facing explanation for Kraken import errors."""
 
@@ -256,6 +299,8 @@ def train(
             "and ensure your virtual environment's bin directory is on PATH."
         )
 
+    ground_truth = _discover_ground_truth(dataset_dir)
+
     cmd = [
         ketos,
         "train",
@@ -269,7 +314,7 @@ def train(
         cmd.extend([validation_flag, str(val_split)])
     if base_model is not None:
         cmd.extend(["--load", str(base_model)])
-    cmd.append(str(dataset_dir))
+    cmd.extend(ground_truth)
 
     log.info("Running ketos: %s", " ".join(cmd))
     try:
