@@ -110,9 +110,7 @@ class GPTTranscriber:
                             {"type": "input_text", "text": self.prompt},
                             {
                                 "type": "input_image",
-                                "image_url": {
-                                    "url": f"data:{mime_type};base64,{encoded}",
-                                },
+                                "image_url": f"data:{mime_type};base64,{encoded}",
                             },
                         ],
                     }
