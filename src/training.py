@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -96,9 +97,13 @@ def _generate_lstmf(processed_image: Path, work_dir: Path) -> Path:
 def _resolve_tessdata_dir(tessdata_dir: Optional[PathLike]) -> Path:
     if tessdata_dir:
         return Path(tessdata_dir)
+
     env_dir = os.environ.get("TESSDATA_PREFIX")
     if env_dir:
-        return Path(env_dir)
+        candidate = Path(env_dir)
+        if candidate.exists():
+            return candidate
+
     try:
         result = subprocess.run(
             ["tesseract", "--print-tessdata-dir"],
@@ -112,13 +117,51 @@ def _resolve_tessdata_dir(tessdata_dir: Optional[PathLike]) -> Path:
         candidate = Path(result.stdout.strip())
         if candidate.exists():
             return candidate
-    windows_default = Path("C:/Program Files/Tesseract-OCR/tessdata")
-    if windows_default.exists():
-        return windows_default
-    # Default for many linux distributions
-    default = Path("/usr/share/tesseract-ocr/4.00/tessdata")
-    if default.exists():
-        return default
+
+    exe_path = shutil.which("tesseract")
+    if exe_path:
+        exe_path = Path(exe_path)
+        search_roots = [exe_path.parent, exe_path.parent.parent]
+        for root in search_roots:
+            if not root:
+                continue
+            candidate = root / "tessdata"
+            if candidate.exists():
+                return candidate
+            share_candidate = root / "share" / "tessdata"
+            if share_candidate.exists():
+                return share_candidate
+
+    env_roots: list[Path] = []
+    for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        path = os.environ.get(env_var)
+        if path:
+            env_roots.append(Path(path))
+    env_roots.append(Path.home())
+
+    known_suffixes = [
+        Path("Tesseract-OCR") / "tessdata",
+        Path("Programs") / "Tesseract-OCR" / "tessdata",
+        Path("scoop") / "apps" / "tesseract" / "current" / "tessdata",
+        Path("scoop") / "apps" / "tesseract-nightly" / "current" / "tessdata",
+    ]
+
+    for root in env_roots:
+        for suffix in known_suffixes:
+            candidate = root / suffix
+            if candidate.exists():
+                return candidate
+
+    linux_defaults = [
+        Path("/usr/share/tesseract-ocr/4.00/tessdata"),
+        Path("/usr/share/tesseract-ocr/5/tessdata"),
+        Path("/usr/share/tesseract-ocr/tessdata"),
+        Path("/usr/share/tessdata"),
+    ]
+    for candidate in linux_defaults:
+        if candidate.exists():
+            return candidate
+
     raise FileNotFoundError(
         "Unable to locate tessdata directory. Set TESSDATA_PREFIX, install Tesseract, "
         "or pass tessdata_dir explicitly (see README for details)."
