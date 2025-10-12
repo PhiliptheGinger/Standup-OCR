@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import base64
+import mimetypes
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 def _load_dotenv(env_path: Path = Path(".env")) -> None:
     """Populate :mod:`os.environ` with variables declared in ``env_path``.
@@ -98,7 +99,7 @@ class GPTTranscriber:
             if cached.exists():
                 return cached.read_text(encoding="utf-8").strip()
 
-        encoded = self._encode_image(image_path)
+        encoded, mime_type = self._encode_image(image_path)
         try:
             response = self._client.responses.create(
                 model=self.model,
@@ -107,7 +108,12 @@ class GPTTranscriber:
                         "role": "user",
                         "content": [
                             {"type": "input_text", "text": self.prompt},
-                            {"type": "input_image", "image_base64": encoded},
+                            {
+                                "type": "input_image",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{encoded}",
+                                },
+                            },
                         ],
                     }
                 ],
@@ -126,9 +132,13 @@ class GPTTranscriber:
 
         return text
 
-    def _encode_image(self, image_path: Path) -> str:
+    def _encode_image(self, image_path: Path) -> Tuple[str, str]:
         data = image_path.read_bytes()
-        return base64.b64encode(data).decode("utf-8")
+        encoded = base64.b64encode(data).decode("utf-8")
+        mime_type, _ = mimetypes.guess_type(str(image_path))
+        if not mime_type:
+            mime_type = "image/png"
+        return encoded, mime_type
 
     def _cache_path(self, image_path: Path) -> Path:
         if self.cache_dir is None:  # pragma: no cover - defensive only
