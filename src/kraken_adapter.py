@@ -8,6 +8,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, List, Optional, Tuple
@@ -48,6 +49,29 @@ def _require_kraken() -> None:
             "Kraken is not available. Install it with 'pip install kraken[serve]' "
             "and ensure the 'kraken' and 'ketos' commands are on your PATH."
         )
+
+
+@lru_cache(maxsize=None)
+def _ketos_train_validation_flag(ketos_path: str) -> str:
+    """Return the validation flag supported by ``ketos train``."""
+
+    help_cmd = [ketos_path, "train", "--help"]
+    try:
+        proc = subprocess.run(
+            help_cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:  # pragma: no cover - best effort probing
+        log.debug("Failed to inspect 'ketos train --help': %s", exc)
+        return "--validation"
+
+    help_text = (proc.stdout or "") + (proc.stderr or "")
+    if "--partition" in help_text:
+        return "--partition"
+
+    return "--validation"
 
 
 def _explain_import_error(exc: ImportError, previous_exc: ImportError | None = None) -> str:
@@ -239,9 +263,10 @@ def train(
         str(model_out),
         "--epochs",
         str(epochs),
-        "--validation",
-        str(val_split),
     ]
+    if val_split > 0:
+        validation_flag = _ketos_train_validation_flag(ketos)
+        cmd.extend([validation_flag, str(val_split)])
     if base_model is not None:
         cmd.extend(["--load", str(base_model)])
     cmd.append(str(dataset_dir))
