@@ -2,9 +2,42 @@
 from __future__ import annotations
 
 import base64
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+def _load_dotenv(env_path: Path = Path(".env")) -> None:
+    """Populate :mod:`os.environ` with variables declared in ``env_path``.
+
+    The implementation is intentionally lightweight so that users can drop a
+    ``.env`` file next to the project without needing an additional
+    dependency such as :mod:`python-dotenv`. Only ``KEY=VALUE`` assignments are
+    supported and existing environment variables always take precedence.
+    """
+
+    try:
+        if not env_path.exists():
+            return
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+            os.environ[key] = value.strip().strip('"').strip("'")
+    except OSError:  # pragma: no cover - filesystem edge cases
+        # Silently ignore issues loading the .env file; environment variables
+        # remain untouched so callers can still configure credentials manually.
+        return
+
+
+_load_dotenv()
+
 
 try:  # pragma: no cover - import guard for optional dependency
     from openai import OpenAI, OpenAIError
