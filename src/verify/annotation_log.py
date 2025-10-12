@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-ANNOTATION_LOG = PROJECT_ROOT / "annotation.log"
+ANNOTATION_LOG = PROJECT_ROOT / "train" / "annotation_log.csv"
 READY_FOR_AGENT_DIR = PROJECT_ROOT / "uploads" / "ready_for_agent"
 TRANSCRIPTS_RAW_DIR = PROJECT_ROOT / "transcripts" / "raw"
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -15,11 +16,9 @@ SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 @dataclass
 class LogEntry:
-    timestamp: str
-    notebook: str
     page: str
-    image_name: str
-    transcript_path: Path
+    transcription: str
+    timestamp: str
     line_number: int
 
 
@@ -54,38 +53,42 @@ def _iter_transcripts() -> Iterable[Path]:
     ]
 
 
-def _parse_line(line: str, line_number: int) -> LogEntry | str:
-    parts = line.strip().split()
-    if len(parts) < 5:
-        return f"Line {line_number}: expected 5 tokens, found {len(parts)}"
-    timestamp_token, notebook, page, image_name, transcript = parts[:5]
-    if not (timestamp_token.startswith("[") and timestamp_token.endswith("]")):
-        return f"Line {line_number}: invalid timestamp token '{timestamp_token}'"
-    timestamp = timestamp_token.strip("[]")
-    transcript_path = Path(transcript)
-    if not transcript_path.is_absolute():
-        transcript_path = PROJECT_ROOT / transcript_path
+def _parse_row(row: dict[str, str], line_number: int) -> LogEntry | str:
+    missing = [key for key in ("page", "transcription", "timestamp") if key not in row]
+    if missing:
+        return f"Line {line_number}: missing column(s) {', '.join(missing)}"
+    page = row["page"].strip()
+    transcription = row["transcription"].strip()
+    timestamp = row["timestamp"].strip()
+    if not page:
+        return f"Line {line_number}: empty page value"
+    if not timestamp:
+        return f"Line {line_number}: empty timestamp value"
     return LogEntry(
-        timestamp=timestamp,
-        notebook=notebook,
         page=page,
-        image_name=image_name,
-        transcript_path=transcript_path,
+        transcription=transcription,
+        timestamp=timestamp,
         line_number=line_number,
     )
 
 
 def load_log_entries() -> tuple[List[LogEntry], List[str]]:
     if not ANNOTATION_LOG.exists():
-        return [], ["annotation.log does not exist"]
+        return [], ["train/annotation_log.csv does not exist"]
     entries: List[LogEntry] = []
     errors: List[str] = []
-    with ANNOTATION_LOG.open("r", encoding="utf-8") as fh:
-        for idx, line in enumerate(fh, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            parsed = _parse_line(line, idx)
+    with ANNOTATION_LOG.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        expected = {"page", "transcription", "timestamp"}
+        if reader.fieldnames is None:
+            return [], ["annotation_log.csv is empty"]
+        missing_columns = expected - set(reader.fieldnames)
+        if missing_columns:
+            errors.append(
+                "annotation_log.csv missing columns: " + ", ".join(sorted(missing_columns))
+            )
+        for idx, row in enumerate(reader, start=2):
+            parsed = _parse_row(row, idx)
             if isinstance(parsed, str):
                 errors.append(parsed)
             else:
@@ -103,14 +106,16 @@ def validate_entries(entries: List[LogEntry]) -> LogValidation:
     missing_transcripts: List[str] = []
 
     for entry in entries:
-        image_counts[entry.image_name] = image_counts.get(entry.image_name, 0) + 1
-        transcript_resolved = entry.transcript_path.resolve()
+        page_name = entry.page
+        image_counts[page_name] = image_counts.get(page_name, 0) + 1
+        transcript_path = TRANSCRIPTS_RAW_DIR / f"{Path(page_name).stem}.txt"
+        transcript_resolved = transcript_path.resolve()
         transcript_counts[transcript_resolved] = transcript_counts.get(transcript_resolved, 0) + 1
 
-        if entry.image_name not in uploads:
-            missing_uploads.append(entry.image_name)
-        if transcript_resolved not in transcripts and not entry.transcript_path.exists():
-            missing_transcripts.append(str(entry.transcript_path))
+        if page_name not in uploads:
+            missing_uploads.append(page_name)
+        if transcript_resolved not in transcripts and not transcript_path.exists():
+            missing_transcripts.append(str(transcript_path))
 
     logged_images = set(image_counts.keys())
     logged_transcripts = set(transcript_counts.keys())
@@ -179,15 +184,17 @@ def run_check() -> None:
             print(f"  - {path}")
 
     if not issues_found:
-        print("annotation.log is consistent with ready_for_agent/ and transcripts/raw/.")
+        print(
+            "annotation_log.csv is consistent with ready_for_agent/ and transcripts/raw/."
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Validate annotation.log")
+    parser = argparse.ArgumentParser(description="Validate annotation_log.csv")
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Validate annotation.log against available files",
+        help="Validate annotation_log.csv against available files",
     )
     return parser
 
