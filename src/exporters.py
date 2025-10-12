@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List
+import json
 from xml.etree import ElementTree as ET
 
 from PIL import Image
@@ -26,6 +27,7 @@ def save_line_crops(image_path: Path, lines: Iterable[Line], out_dir: Path) -> N
         base = image.convert("L")
         width, height = base.size
         padding = 4
+        metadata: List[dict] = []
         for index, line in enumerate(_sorted_lines(lines), start=1):
             left, top, right, bottom = line.bbox
             crop_box = (
@@ -40,6 +42,25 @@ def save_line_crops(image_path: Path, lines: Iterable[Line], out_dir: Path) -> N
             crop.save(image_out)
             text_out = out_dir / f"{base_name}.gt.txt"
             text_out.write_text(line.text or "", encoding="utf8")
+            metadata.append(
+                {
+                    "line": index,
+                    "image": image_out.name,
+                    "text_file": text_out.name,
+                    "text": line.text or "",
+                    "bbox": {
+                        "left": int(left),
+                        "top": int(top),
+                        "right": int(right),
+                        "bottom": int(bottom),
+                    },
+                    "is_manual": bool(line.is_manual),
+                }
+            )
+
+    if metadata:
+        metadata_path = out_dir / f"{image_path.stem}.boxes.json"
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf8")
 
 
 def _format_points(points: Iterable[tuple[float, float]]) -> str:
