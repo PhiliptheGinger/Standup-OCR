@@ -99,12 +99,29 @@ def _resolve_tessdata_dir(tessdata_dir: Optional[PathLike]) -> Path:
     env_dir = os.environ.get("TESSDATA_PREFIX")
     if env_dir:
         return Path(env_dir)
+    try:
+        result = subprocess.run(
+            ["tesseract", "--print-tessdata-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        result = None
+    else:
+        candidate = Path(result.stdout.strip())
+        if candidate.exists():
+            return candidate
+    windows_default = Path("C:/Program Files/Tesseract-OCR/tessdata")
+    if windows_default.exists():
+        return windows_default
     # Default for many linux distributions
     default = Path("/usr/share/tesseract-ocr/4.00/tessdata")
     if default.exists():
         return default
     raise FileNotFoundError(
-        "Unable to locate tessdata directory. Set TESSDATA_PREFIX or pass tessdata_dir explicitly."
+        "Unable to locate tessdata directory. Set TESSDATA_PREFIX, install Tesseract, "
+        "or pass tessdata_dir explicitly (see README for details)."
     )
 
 
