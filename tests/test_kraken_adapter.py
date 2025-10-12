@@ -220,7 +220,10 @@ def test_train_surfaces_model_not_improving_error(monkeypatch, tmp_path):
         raise subprocess.CalledProcessError(
             1,
             cmd,
-            output="Model did not improve during training.\nSeed set to 42",
+            output=(
+                "[10/12/25 19:47:08] WARNING  Model did not improve during    "
+                "recognition.py:321\nSeed set to 42"
+            ),
             stderr="",
         )
 
