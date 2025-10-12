@@ -120,7 +120,11 @@ several ways:
 1. Respect an explicit `--tessdata-dir` argument when you provide one.
 2. Fall back to the `TESSDATA_PREFIX` environment variable if it is set.
 3. Ask the local Tesseract binary via `tesseract --print-tessdata-dir`.
-4. Check the default installation paths on Windows and Linux.
+4. Inspect the location of the `tesseract` executable (e.g. Scoop, Chocolatey,
+   or the standard Windows installer) and look for a sibling `tessdata`
+   directory.
+5. Check a handful of common installation paths on Windows and Linux, including
+   Scoop's `scoop/apps/tesseract/current/tessdata` layout.
 
 If all of these checks fail you'll see an error similar to "Unable to locate
 tessdata directory". Fix it by either setting the environment variable or
