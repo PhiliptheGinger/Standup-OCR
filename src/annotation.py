@@ -696,13 +696,18 @@ class AnnotationApp:
         return text.strip()
 
     def _extract_tokens(self, image: Image.Image) -> List[OcrToken]:
-        if image.width == 0 or image.height == 0 or cv2 is None:
+        if image.width == 0 or image.height == 0:
             return []
 
         gray = np.array(image.convert("L"))
         if gray.size == 0:
             return []
 
+        if cv2 is not None:
+            return self._extract_tokens_with_cv2(gray)
+        return self._extract_tokens_without_cv2(gray)
+
+    def _extract_tokens_with_cv2(self, gray: np.ndarray) -> List[OcrToken]:
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         binary = 255 - thresh
@@ -766,6 +771,97 @@ class AnnotationApp:
 
         tokens.sort(key=lambda token: token.order_key)
         return tokens
+
+    def _extract_tokens_without_cv2(self, gray: np.ndarray) -> List[OcrToken]:
+        threshold = self._otsu_threshold(gray)
+        mask = gray <= threshold
+        if not np.any(mask):
+            return []
+
+        row_activity = mask.sum(axis=1)
+        min_line_pixels = max(8, int(mask.shape[1] * 0.01))
+        active_rows = row_activity >= min_line_pixels
+        line_runs = self._find_runs(active_rows)
+
+        min_line_height = max(6, int(mask.shape[0] * 0.005))
+        tokens: List[OcrToken] = []
+        for line_index, (start, end) in enumerate(line_runs, start=1):
+            if end - start < min_line_height:
+                continue
+
+            line_slice = mask[start:end, :]
+            column_activity = line_slice.sum(axis=0)
+            min_col_pixels = max(4, int((end - start) * 0.3))
+            active_cols = np.where(column_activity >= min_col_pixels)[0]
+            if active_cols.size == 0:
+                active_cols = np.where(column_activity > 0)[0]
+                if active_cols.size == 0:
+                    continue
+
+            left = int(max(0, active_cols[0] - 2))
+            right = int(min(mask.shape[1], active_cols[-1] + 3))
+            top = max(0, start - 2)
+            bottom = min(mask.shape[0], end + 2)
+
+            baseline = (left, bottom - 1, right)
+            origin = (left, top, bottom)
+            order_key = (4, line_index, 1, 1, 1)
+            tokens.append(
+                OcrToken(
+                    text="",
+                    bbox=(left, top, right, bottom),
+                    order_key=order_key,
+                    baseline=baseline,
+                    origin=origin,
+                )
+            )
+
+        tokens.sort(key=lambda token: token.order_key)
+        return tokens
+
+    @staticmethod
+    def _otsu_threshold(gray: np.ndarray) -> int:
+        histogram, _ = np.histogram(gray, bins=256, range=(0, 256))
+        total = gray.size
+        sum_total = float(np.dot(np.arange(256), histogram))
+
+        sum_background = 0.0
+        weight_background = 0
+        max_variance = 0.0
+        threshold = 0
+        for value, count in enumerate(histogram):
+            weight_background += count
+            if weight_background == 0:
+                continue
+
+            weight_foreground = total - weight_background
+            if weight_foreground == 0:
+                break
+
+            sum_background += value * count
+            mean_background = sum_background / weight_background
+            mean_foreground = (sum_total - sum_background) / weight_foreground
+
+            variance = weight_background * weight_foreground * (mean_background - mean_foreground) ** 2
+            if variance > max_variance:
+                max_variance = variance
+                threshold = value
+
+        return threshold
+
+    @staticmethod
+    def _find_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
+        runs: List[Tuple[int, int]] = []
+        start: Optional[int] = None
+        for index, value in enumerate(mask):
+            if bool(value) and start is None:
+                start = index
+            elif not bool(value) and start is not None:
+                runs.append((start, index))
+                start = None
+        if start is not None:
+            runs.append((start, mask.size))
+        return runs
 
     # ------------------------------------------------------------------
     # Canvas interaction
