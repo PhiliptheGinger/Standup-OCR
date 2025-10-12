@@ -28,6 +28,7 @@ def _setup_monkeypatch(monkeypatch, help_text: str | None):
     monkeypatch.setattr(kraken_adapter.shutil, "which", lambda name: "/usr/bin/ketos" if name == "ketos" else None)
 
     captured_commands: list[list[str]] = []
+    captured_envs: list[dict[str, str] | None] = []
 
     def fake_run(cmd, *_, **kwargs):
         captured_commands.append(cmd)
@@ -39,14 +40,15 @@ def _setup_monkeypatch(monkeypatch, help_text: str | None):
 
     monkeypatch.setattr(kraken_adapter.subprocess, "run", fake_run)
 
-    def fake_live_output(cmd):
+    def fake_live_output(cmd, *, env=None):
         captured_commands.append(cmd)
+        captured_envs.append(env)
         return "", ""
 
     monkeypatch.setattr(kraken_adapter, "_run_with_live_output", fake_live_output)
     kraken_adapter._ketos_train_validation_flag.cache_clear()
 
-    return captured_commands
+    return captured_commands, captured_envs
 
 
 def _dataset_with_line(tmp_path: Path) -> Path:
@@ -61,7 +63,7 @@ def _dataset_with_line(tmp_path: Path) -> Path:
 
 def test_train_uses_partition_when_supported(monkeypatch, tmp_path):
     help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
-    captured = _setup_monkeypatch(monkeypatch, help_text)
+    captured, _ = _setup_monkeypatch(monkeypatch, help_text)
 
     dataset_dir = _dataset_with_line(tmp_path)
     line_image = dataset_dir / "lines" / "sample.png"
@@ -86,7 +88,7 @@ def test_train_uses_partition_when_supported(monkeypatch, tmp_path):
 
 def test_train_falls_back_to_validation(monkeypatch, tmp_path):
     help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --validation FLOAT"
-    captured = _setup_monkeypatch(monkeypatch, help_text)
+    captured, _ = _setup_monkeypatch(monkeypatch, help_text)
 
     dataset_dir = _dataset_with_line(tmp_path)
     line_image = dataset_dir / "lines" / "sample.png"
@@ -108,7 +110,7 @@ def test_train_falls_back_to_validation(monkeypatch, tmp_path):
 
 
 def test_train_skips_validation_flag_when_disabled(monkeypatch, tmp_path):
-    captured = _setup_monkeypatch(monkeypatch, help_text="Usage: ketos train [OPTIONS]")
+    captured, _ = _setup_monkeypatch(monkeypatch, help_text="Usage: ketos train [OPTIONS]")
 
     dataset_dir = _dataset_with_line(tmp_path)
     line_image = dataset_dir / "lines" / "sample.png"
@@ -131,7 +133,7 @@ def test_train_skips_validation_flag_when_disabled(monkeypatch, tmp_path):
 
 def test_train_prefers_pagexml_when_available(monkeypatch, tmp_path):
     help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
-    captured = _setup_monkeypatch(monkeypatch, help_text)
+    captured, _ = _setup_monkeypatch(monkeypatch, help_text)
 
     dataset_dir = _dataset_with_line(tmp_path)
 
@@ -149,7 +151,7 @@ def test_train_prefers_pagexml_when_available(monkeypatch, tmp_path):
 
 def test_train_pads_problematic_line_images(monkeypatch, tmp_path, caplog):
     help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
-    captured = _setup_monkeypatch(monkeypatch, help_text)
+    captured, _ = _setup_monkeypatch(monkeypatch, help_text)
 
     dataset_dir = tmp_path / "dataset"
     lines_dir = dataset_dir / "lines"
@@ -205,14 +207,16 @@ def test_train_pads_problematic_line_images(monkeypatch, tmp_path, caplog):
 def test_train_surfaces_model_not_improving_error(monkeypatch, tmp_path):
     help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
     captured = []
+    captured_envs: list[dict[str, str] | None] = []
 
     def fake_run(cmd, *_, **kwargs):
         if cmd[:3] == ["/usr/bin/ketos", "train", "--help"]:
             return types.SimpleNamespace(stdout=help_text, stderr="")
         raise AssertionError("unexpected subprocess.run invocation")
 
-    def fake_live_output(cmd):
+    def fake_live_output(cmd, *, env=None):
         captured.append(cmd)
+        captured_envs.append(env)
         raise subprocess.CalledProcessError(
             1,
             cmd,
@@ -235,3 +239,17 @@ def test_train_surfaces_model_not_improving_error(monkeypatch, tmp_path):
     assert "Kraken aborted training" in str(excinfo.value)
     assert "exit code 1" in str(excinfo.value)
     assert captured[-1][0] == "/usr/bin/ketos"
+
+
+def test_train_forces_utf8_stdio(monkeypatch, tmp_path):
+    help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
+    captured, envs = _setup_monkeypatch(monkeypatch, help_text)
+
+    dataset_dir = _dataset_with_line(tmp_path)
+    model_out = tmp_path / "model.mlmodel"
+
+    kraken_adapter.train(dataset_dir, model_out, epochs=1, val_split=0.1)
+
+    assert envs[-1] is not None
+    assert envs[-1]["PYTHONIOENCODING"] == "utf-8"
+    assert envs[-1]["PYTHONUTF8"] == "1"

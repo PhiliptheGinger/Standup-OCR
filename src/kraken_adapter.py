@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -409,7 +410,9 @@ def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[
     return baselines
 
 
-def _run_with_live_output(cmd: list[str]) -> tuple[str, str]:
+def _run_with_live_output(
+    cmd: list[str], *, env: dict[str, str] | None = None
+) -> tuple[str, str]:
     """Run ``cmd`` while teeing stdout/stderr to the parent process."""
 
     process = subprocess.Popen(
@@ -417,6 +420,9 @@ def _run_with_live_output(cmd: list[str]) -> tuple[str, str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
     )
 
     stdout_chunks: list[str] = []
@@ -510,8 +516,12 @@ def train(
         cmd.extend(ground_truth)
 
         log.info("Running ketos: %s", " ".join(cmd))
+        env = os.environ.copy()
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
+
         try:
-            _run_with_live_output(cmd)
+            _run_with_live_output(cmd, env=env)
         except FileNotFoundError as exc:  # pragma: no cover - subprocess failure only at runtime
             raise RuntimeError(f"ketos executable not found: {exc}") from exc
         except subprocess.CalledProcessError as exc:  # pragma: no cover
