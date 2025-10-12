@@ -446,10 +446,23 @@ def train(
 
         log.info("Running ketos: %s", " ".join(cmd))
         try:
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True, stderr=subprocess.PIPE, text=True)
         except FileNotFoundError as exc:  # pragma: no cover - subprocess failure only at runtime
             raise RuntimeError(f"ketos executable not found: {exc}") from exc
         except subprocess.CalledProcessError as exc:  # pragma: no cover
+            stderr = (exc.stderr or "").strip()
+            if "Model did not improve during training" in stderr:
+                hint = (
+                    "Kraken aborted training because the validation metric never improved. "
+                    "Add more line images or adjust the validation split/epoch count before retrying."
+                )
+                raise RuntimeError(f"{hint} (ketos exit code {exc.returncode})") from exc
+
+            if stderr:
+                raise RuntimeError(
+                    f"ketos train failed with exit code {exc.returncode}: {stderr}"
+                ) from exc
+
             raise RuntimeError(f"ketos train failed with exit code {exc.returncode}") from exc
     finally:
         if sanitized_tmp is not None:
