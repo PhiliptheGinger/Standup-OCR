@@ -37,6 +37,39 @@ def iter_images(folder: Path) -> Iterable[Path]:
             yield path
 
 
+def add_gpt_arguments(parser: argparse.ArgumentParser) -> None:
+    """Attach common ChatGPT OCR arguments to a subparser."""
+
+    parser.add_argument(
+        "--no-gpt-ocr",
+        action="store_true",
+        help=(
+            "Disable ChatGPT-based transcription when preparing training data "
+            "and fall back to file-name derived labels."
+        ),
+    )
+    parser.add_argument(
+        "--gpt-model",
+        default="gpt-4o-mini",
+        help="ChatGPT model identifier to use for OCR (default: gpt-4o-mini).",
+    )
+    parser.add_argument(
+        "--gpt-prompt",
+        help="Custom prompt sent alongside each image when requesting ChatGPT OCR.",
+    )
+    parser.add_argument(
+        "--gpt-cache-dir",
+        type=Path,
+        help="Optional directory used to cache ChatGPT OCR responses.",
+    )
+    parser.add_argument(
+        "--gpt-max-output-tokens",
+        type=int,
+        default=256,
+        help="Maximum number of tokens ChatGPT may return per transcription (default: 256).",
+    )
+
+
 def handle_train(args: argparse.Namespace) -> None:
     if args.engine == "kraken":
         if not kraken_available():
@@ -62,6 +95,11 @@ def handle_train(args: argparse.Namespace) -> None:
         tessdata_dir=args.tessdata_dir,
         base_lang=args.base_lang,
         max_iterations=args.max_iterations,
+        use_gpt_ocr=not args.no_gpt_ocr,
+        gpt_model=args.gpt_model,
+        gpt_prompt=args.gpt_prompt,
+        gpt_cache_dir=args.gpt_cache_dir,
+        gpt_max_output_tokens=args.gpt_max_output_tokens,
     )
     logging.info("Model saved to %s", model_path)
 
@@ -178,6 +216,11 @@ def handle_review(args: argparse.Namespace) -> None:
                 tessdata_dir=args.tessdata_dir,
                 base_lang=args.base_lang,
                 max_iterations=args.max_iterations,
+                use_gpt_ocr=not args.no_gpt_ocr,
+                gpt_model=args.gpt_model,
+                gpt_prompt=args.gpt_prompt,
+                gpt_cache_dir=args.gpt_cache_dir,
+                gpt_max_output_tokens=args.gpt_max_output_tokens,
             )
             logging.info("Updated model saved to %s", model_path)
             last_trained_count += args.auto_train
@@ -229,6 +272,11 @@ def handle_annotate(args: argparse.Namespace) -> None:
             base_lang=args.base_lang,
             max_iterations=args.max_iterations,
             tessdata_dir=args.tessdata_dir,
+            use_gpt_ocr=not args.no_gpt_ocr,
+            gpt_model=args.gpt_model,
+            gpt_prompt=args.gpt_prompt,
+            gpt_cache_dir=args.gpt_cache_dir,
+            gpt_max_output_tokens=args.gpt_max_output_tokens,
         )
 
     if args.engine == "kraken" and args.seg == "auto" and not kraken_available():
@@ -335,6 +383,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional base Kraken model to fine-tune.",
     )
+    add_gpt_arguments(train_parser)
     train_parser.set_defaults(func=handle_train)
 
     test_parser = subparsers.add_parser(
@@ -501,6 +550,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable snippet previews (useful on headless systems).",
     )
+    add_gpt_arguments(review_parser)
     review_parser.set_defaults(func=handle_review)
 
     annotate_parser = subparsers.add_parser(
@@ -610,6 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Tesseract page segmentation mode for prefill OCR (default: 6).",
     )
+    add_gpt_arguments(annotate_parser)
     annotate_parser.set_defaults(func=handle_annotate)
 
     return parser

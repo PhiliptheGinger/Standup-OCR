@@ -1336,6 +1336,11 @@ class AnnotationAutoTrainConfig:
     base_lang: str
     max_iterations: int
     tessdata_dir: Optional[Path] = None
+    use_gpt_ocr: bool = True
+    gpt_model: str = "gpt-4o-mini"
+    gpt_prompt: Optional[str] = None
+    gpt_cache_dir: Optional[Path] = None
+    gpt_max_output_tokens: int = 256
 
 
 @dataclass
@@ -1369,6 +1374,11 @@ class AnnotationTrainer:
                     tessdata_dir=self.config.tessdata_dir,
                     base_lang=self.config.base_lang,
                     max_iterations=self.config.max_iterations,
+                    use_gpt_ocr=self.config.use_gpt_ocr,
+                    gpt_model=self.config.gpt_model,
+                    gpt_prompt=self.config.gpt_prompt,
+                    gpt_cache_dir=self.config.gpt_cache_dir,
+                    gpt_max_output_tokens=self.config.gpt_max_output_tokens,
                 )
                 logging.info("Updated model saved to %s", model_path)
             except Exception:
