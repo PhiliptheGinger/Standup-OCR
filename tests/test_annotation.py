@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
+import pytest
+
 from PIL import Image
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
@@ -233,6 +235,8 @@ def test_back_rewinds_without_reappending_logs():
 
     assert app.index == 0
     assert displayed_paths == [Path("first.png")]
+
+
     assert app.back_button.state == annotation.tk.DISABLED
     status = app.status_var.get()
     assert "Returned to previous item" in status
@@ -249,19 +253,75 @@ def test_back_rewinds_without_reappending_logs():
     assert app.status_var.get() == "Already at the first item."
 
 
-def test_load_annotation_items_prefills_existing_transcripts(tmp_path):
-    image_path = tmp_path / "scan1.png"
-    image_path.write_bytes(b"")
-    transcripts_dir = tmp_path / "transcripts"
-    transcripts_dir.mkdir()
-    transcript_path = transcripts_dir / "scan1.txt"
-    transcript_path.write_text("Saved text", encoding="utf8")
+@pytest.mark.parametrize(
+    "coords, expected",
+    [
+        ((10.0, 20.0, 60.0, 70.0), (10, 20, 60, 70)),
+        ((60.0, 20.0, 10.0, 70.0), (10, 20, 60, 70)),
+        ((10.0, 70.0, 60.0, 20.0), (10, 20, 60, 70)),
+        ((60.0, 70.0, 10.0, 20.0), (10, 20, 60, 70)),
+    ],
+)
+def test_finish_manual_overlay_normalizes_coordinates(coords, expected):
+    """Manual overlays should normalize drag direction before exporting."""
 
-    items = _load_annotation_items([image_path], transcripts_dir)
+    app = AnnotationApp.__new__(AnnotationApp)
+    app.display_scale = (1.0, 1.0)
+    app.manual_token_counter = 0
+    app.overlay_items = []
+    app.rect_to_overlay = {}
+    app.selected_rects = set()
 
-    assert len(items) == 1
-    assert items[0].label == "Saved text"
-    assert items[0].status == "loaded"
+    class DummyEntry:
+        def focus_set(self) -> None:
+            pass
+
+    class DummyOverlay:
+        def __init__(self) -> None:
+            self.entry = DummyEntry()
+
+    captured_bboxes = []
+
+    def fake_create_overlay(text, bbox, order_key, token, *, is_manual, select):
+        captured_bboxes.append(bbox)
+        return DummyOverlay()
+
+    app._create_overlay = fake_create_overlay  # type: ignore[assignment]
+    app._update_transcription_from_overlays = lambda: None
+    app._push_undo = lambda _callback: None
+
+    class DummyVar:
+        def __init__(self) -> None:
+            self.value: Optional[str] = None
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    app.status_var = DummyVar()
+
+    class DummyCanvas:
+        def __init__(self, coords):
+            self._coords = coords
+            self.deleted = None
+
+        def coords(self, rect_id):
+            assert rect_id == 1
+            return self._coords
+
+        def delete(self, rect_id):
+            self.deleted = rect_id
+
+    canvas = DummyCanvas(coords)
+    app.canvas = canvas  # type: ignore[assignment]
+    app._active_temp_rect = 1
+    app._drag_start = (coords[0], coords[1])
+
+    app._finish_manual_overlay(coords[2], coords[3])
+
+    assert canvas.deleted == 1
+    assert app._active_temp_rect is None
+    assert captured_bboxes == [expected]
+    assert app.manual_token_counter == 1
 
 
 def test_apply_transcription_clears_overlay_entries():

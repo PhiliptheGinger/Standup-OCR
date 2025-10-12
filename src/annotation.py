@@ -971,8 +971,7 @@ class AnnotationApp:
         left, top, right, bottom = coords
         left, right = sorted((left, right))
         top, bottom = sorted((top, bottom))
-
-        if (right - left) < 5 or (bottom - top) < 5:
+        if abs(right - left) < 5 or abs(bottom - top) < 5:
             return
 
         base_bbox = self._to_base_bbox((left, top, right, bottom))
