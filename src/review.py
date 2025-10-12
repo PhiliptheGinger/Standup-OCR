@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Iterable, Iterator, Optional, Set
+from typing import Callable, Iterable, Iterator, Optional, Set
 
 import cv2
 import numpy as np
@@ -36,7 +36,13 @@ class ReviewConfig:
 class ReviewSession:
     """Manage the lifecycle of an interactive review session."""
 
-    def __init__(self, config: ReviewConfig, *, log_path: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        config: ReviewConfig,
+        *,
+        log_path: Optional[Path] = None,
+        on_sample_saved: Optional[Callable[[Path, str, Path], None]] = None,
+    ) -> None:
         self.config = config
         self.train_dir = Path(config.train_dir)
         self.train_dir.mkdir(parents=True, exist_ok=True)
@@ -44,6 +50,7 @@ class ReviewSession:
         self._processed_keys: Set[str] = set()
         self._load_log()
         self.saved_samples = 0
+        self._on_sample_saved = on_sample_saved
 
     # ------------------------------------------------------------------
     # Public API
@@ -118,6 +125,7 @@ class ReviewSession:
             saved += 1
             self.saved_samples += 1
             logging.info("Saved %s with label '%s'", snippet_path.name, corrected)
+            self._notify_sample_saved(image_path, corrected, snippet_path)
 
         return saved
 
@@ -261,6 +269,14 @@ class ReviewSession:
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
         self._processed_keys.add(key)
+
+    def _notify_sample_saved(self, image_path: Path, label: str, snippet_path: Path) -> None:
+        if self._on_sample_saved is None:
+            return
+        try:
+            self._on_sample_saved(image_path, label, snippet_path)
+        except Exception:  # pragma: no cover - callbacks are user supplied
+            logging.exception("Sample saved callback failed")
 
     def _iter_images(self, folder: Path) -> Iterator[Path]:
         for path in sorted(folder.iterdir()):
