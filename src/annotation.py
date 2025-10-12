@@ -29,6 +29,37 @@ except ImportError:  # pragma: no cover
     from kraken_adapter import is_available as kraken_available, segment_lines
     from line_store import Line
 
+
+_prefill_ocr_cached = None
+_prefill_ocr_failed = False
+
+
+def _get_prefill_ocr():
+    global _prefill_ocr_cached, _prefill_ocr_failed
+    if _prefill_ocr_failed:
+        return None
+    if _prefill_ocr_cached is not None:
+        return _prefill_ocr_cached
+    try:
+        from .ocr import ocr_image as impl  # type: ignore
+    except ImportError:
+        try:
+            from ocr import ocr_image as impl  # type: ignore
+        except ImportError:
+            import importlib
+            import sys
+
+            root = Path(__file__).resolve().parent.parent
+            if str(root) not in sys.path:
+                sys.path.append(str(root))
+            try:
+                impl = importlib.import_module("src.ocr").ocr_image
+            except Exception:  # pragma: no cover - optional dependency missing
+                _prefill_ocr_failed = True
+                return None
+    _prefill_ocr_cached = impl
+    return impl
+
 CONTROL_MASK = 0x0004
 SHIFT_MASK = 0x0001
 
@@ -53,6 +84,7 @@ class AnnotationItem:
     label: Optional[str] = None
     status: Optional[str] = None
     saved_path: Optional[Path] = None
+    prefill: Optional[str] = None
 
 
 @dataclass
@@ -60,6 +92,10 @@ class AnnotationOptions:
     engine: str = "kraken"
     segmentation: str = "auto"
     export_format: str = "lines"
+    prefill_enabled: bool = True
+    prefill_model: Optional[Path] = None
+    prefill_tessdata: Optional[Path] = None
+    prefill_psm: int = 6
 
 
 @dataclass
@@ -543,20 +579,36 @@ class AnnotationApp:
 
         if item.label:
             self._set_transcription(item.label)
+            self._apply_transcription_to_overlays()
             self.status_var.set("Loaded existing transcription.")
+            return
+
+        suggestion = self._get_prefill(item)
+        if suggestion:
+            self._set_transcription(suggestion)
+            self._apply_transcription_to_overlays()
+            self.status_var.set("Pre-filled transcription using OCR result.")
+            return
+
+        fallback = self._compose_text_from_tokens(tokens)
+        self._set_transcription(fallback)
+        self._apply_transcription_to_overlays()
+        if tokens and self.options.engine == "kraken" and kraken_available():
+            self.status_var.set("Kraken returned baseline segmentation.")
+        elif tokens:
+            self.status_var.set(f"Detected {len(tokens)} line(s) automatically.")
         else:
-            suggestion = self._suggest_label(item.path)
-            if suggestion:
-                self._set_transcription(suggestion)
-                self.status_var.set("Pre-filled transcription using OCR result.")
-            else:
-                self._set_transcription(self._compose_text_from_tokens(tokens))
-                if tokens and self.options.engine == "kraken" and kraken_available():
-                    self.status_var.set("Kraken returned baseline segmentation.")
-                elif tokens:
-                    self.status_var.set(f"Detected {len(tokens)} line(s) automatically.")
-                else:
-                    self.status_var.set("Draw baselines manually using the canvas.")
+            self.status_var.set("Draw baselines manually using the canvas.")
+
+    def _get_prefill(self, item: AnnotationItem) -> str:
+        options = getattr(self, "options", AnnotationOptions())
+        if not options.prefill_enabled:
+            return ""
+        if item.prefill is not None:
+            return item.prefill
+        suggestion = self._suggest_label(item.path)
+        item.prefill = suggestion
+        return suggestion
 
     def _display_image(self, image: Image.Image, tokens: Sequence[OcrToken]) -> None:
         self.canvas.delete("all")
@@ -624,8 +676,24 @@ class AnnotationApp:
                 pass
         self.overlay_entries.clear()
 
-    def _suggest_label(self, _path: Path) -> str:
-        return ""
+    def _suggest_label(self, path: Path) -> str:
+        options = getattr(self, "options", AnnotationOptions())
+        if not options.prefill_enabled:
+            return ""
+        ocr_impl = _get_prefill_ocr()
+        if ocr_impl is None:
+            return ""
+        try:
+            text = ocr_impl(
+                path,
+                model_path=options.prefill_model,
+                tessdata_dir=options.prefill_tessdata,
+                psm=options.prefill_psm,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logging.debug("Prefill OCR failed for %s: %s", path, exc)
+            return ""
+        return text.strip()
 
     def _extract_tokens(self, image: Image.Image) -> List[OcrToken]:
         if image.width == 0 or image.height == 0 or cv2 is None:
