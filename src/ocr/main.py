@@ -2,24 +2,58 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
-import re
-import tempfile
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
-from ..kraken_adapter import is_available as kraken_available, ocr as kraken_ocr
+import torch
+from PIL import Image
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+
 from . import ocr_image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 READY_FOR_AGENT_DIR = PROJECT_ROOT / "uploads" / "ready_for_agent"
 TRANSCRIPTS_RAW_DIR = PROJECT_ROOT / "transcripts" / "raw"
-ANNOTATION_LOG = PROJECT_ROOT / "annotation.log"
+ANNOTATION_LOG = PROJECT_ROOT / "train" / "annotation_log.csv"
 READY_ZIP = PROJECT_ROOT / "ready_for_review.zip"
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+
+DEFAULT_MODEL_NAME = "microsoft/trocr-base-handwritten"
+
+
+processor = TrOCRProcessor.from_pretrained(DEFAULT_MODEL_NAME)
+model = VisionEncoderDecoderModel.from_pretrained(DEFAULT_MODEL_NAME)
+model.eval()
+
+
+@lru_cache(maxsize=4)
+def _load_model(model_name: str) -> tuple[TrOCRProcessor, VisionEncoderDecoderModel]:
+    """Return cached TrOCR processor/model instances for ``model_name``."""
+
+    if model_name == DEFAULT_MODEL_NAME:
+        return processor, model
+    loaded_processor = TrOCRProcessor.from_pretrained(model_name)
+    loaded_model = VisionEncoderDecoderModel.from_pretrained(model_name)
+    loaded_model.eval()
+    return loaded_processor, loaded_model
+
+
+def transcribe_image(img_path: Path, model_name: str = DEFAULT_MODEL_NAME) -> str:
+    image = Image.open(img_path).convert("RGB")
+    trocr_processor, trocr_model = _load_model(model_name)
+    pixel_values = trocr_processor(image, return_tensors="pt").pixel_values
+    with torch.no_grad():
+        generated_ids = trocr_model.generate(pixel_values)
+    transcription = trocr_processor.batch_decode(
+        generated_ids, skip_special_tokens=True
+    )[0]
+    return transcription.strip()
 
 
 @dataclass
@@ -42,59 +76,25 @@ def _iter_ready_images() -> Iterable[Path]:
     return images
 
 
-def _default_kraken_model() -> Path | None:
-    if not kraken_available():
-        return None
-    models_dir = PROJECT_ROOT / "models"
-    if not models_dir.exists():
-        return None
-    candidates = sorted(models_dir.glob("*.mlmodel"))
-    if not candidates:
-        return None
-    return candidates[0]
-
-
-def _transcribe_with_kraken(image_path: Path, model_path: Path) -> str:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-    tmp_path = Path(tmp.name)
-    tmp.close()
+def _transcribe_image(image_path: Path, *, model_name: str) -> str:
     try:
-        kraken_ocr(image_path, model_path, tmp_path)
-        return tmp_path.read_text(encoding="utf-8").strip()
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
+        logging.debug("Running TrOCR (%s) for %s", model_name, image_path.name)
+        return transcribe_image(image_path, model_name=model_name)
+    except Exception as exc:  # pragma: no cover - runtime safeguard
+        logging.exception("TrOCR failed for %s: %s", image_path.name, exc)
+        logging.info("Falling back to pytesseract for %s", image_path.name)
+        return ocr_image(image_path)
 
 
-def _transcribe_image(image_path: Path) -> str:
-    model_path = _default_kraken_model()
-    if model_path is not None:
-        logging.info("Using Kraken model %s for %s", model_path.name, image_path.name)
-        try:
-            return _transcribe_with_kraken(image_path, model_path)
-        except Exception as exc:  # pragma: no cover - runtime safeguard
-            logging.exception("Kraken OCR failed for %s: %s", image_path.name, exc)
-    logging.info("Falling back to pytesseract for %s", image_path.name)
-    return ocr_image(image_path)
-
-
-def _parse_notebook_and_page(stem: str) -> tuple[str, str]:
-    match = re.match(r"(?P<notebook>.+?)_(?P<page>\d+)$", stem)
-    if match:
-        notebook = match.group("notebook")
-        page = str(int(match.group("page")))
-    else:
-        notebook = stem
-        page = "?"
-    return notebook, page
-
-
-def _append_annotation_log(notebook: str, page: str, image_name: str, transcript_path: Path) -> None:
+def _append_annotation_log(page: str, transcription: str) -> None:
     timestamp = datetime.now(timezone.utc).isoformat()
-    relative_transcript = transcript_path.relative_to(PROJECT_ROOT)
-    line = f"[{timestamp}] {notebook} {page} {image_name} {relative_transcript.as_posix()}\n"
-    with ANNOTATION_LOG.open("a", encoding="utf-8") as fh:
-        fh.write(line)
+    ANNOTATION_LOG.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = ANNOTATION_LOG.exists()
+    with ANNOTATION_LOG.open("a", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        if not file_exists:
+            writer.writerow(["page", "transcription", "timestamp"])
+        writer.writerow([page, transcription, timestamp])
 
 
 def _zip_raw_transcripts() -> Path:
@@ -107,7 +107,9 @@ def _zip_raw_transcripts() -> Path:
     return READY_ZIP
 
 
-def agentic_batch_transcribe(*, rerun_failed: bool = False, force: bool = False) -> AgenticBatchResult:
+def agentic_batch_transcribe(
+    *, rerun_failed: bool = False, force: bool = False, model_name: str = DEFAULT_MODEL_NAME
+) -> AgenticBatchResult:
     """Process scans in :mod:`uploads/ready_for_agent` and prepare transcripts."""
 
     TRANSCRIPTS_RAW_DIR.mkdir(parents=True, exist_ok=True)
@@ -124,15 +126,18 @@ def agentic_batch_transcribe(*, rerun_failed: bool = False, force: bool = False)
                 skipped += 1
                 continue
 
-        text = _transcribe_image(image_path)
+        text = _transcribe_image(image_path, model_name=model_name)
         transcript_path.write_text(text, encoding="utf-8")
-        notebook, page = _parse_notebook_and_page(image_path.stem)
-        _append_annotation_log(notebook, page, image_path.name, transcript_path)
+        _append_annotation_log(image_path.name, text)
         processed += 1
 
     zip_path = _zip_raw_transcripts()
     logging.info(
-        "Packaged %d transcript(s) (%d skipped) into %s", processed, skipped, zip_path.name
+        "[TrOCR] Processed %d file(s), skipped %d. Archive: %s. Log: %s",
+        processed,
+        skipped,
+        zip_path.name,
+        ANNOTATION_LOG.relative_to(PROJECT_ROOT),
     )
     return AgenticBatchResult(processed=processed, skipped=skipped, zip_path=zip_path)
 
@@ -159,6 +164,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL_NAME,
+        help=(
+            "Hugging Face model identifier for TrOCR (default:"
+            f" {DEFAULT_MODEL_NAME})."
+        ),
+    )
     return parser
 
 
@@ -178,7 +191,9 @@ def main(argv: list[str] | None = None) -> None:
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
 
-    result = agentic_batch_transcribe(rerun_failed=args.rerun_failed, force=args.force)
+    result = agentic_batch_transcribe(
+        rerun_failed=args.rerun_failed, force=args.force, model_name=args.model
+    )
     logging.info(
         "Processed %d file(s), skipped %d. Archive available at %s",
         result.processed,
