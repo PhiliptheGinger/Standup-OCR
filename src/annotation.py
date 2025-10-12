@@ -969,7 +969,10 @@ class AnnotationApp:
         self._drag_start = None
 
         left, top, right, bottom = coords
-        if abs(right - left) < 5 or abs(bottom - top) < 5:
+        left, right = sorted((left, right))
+        top, bottom = sorted((top, bottom))
+
+        if (right - left) < 5 or (bottom - top) < 5:
             return
 
         base_bbox = self._to_base_bbox((left, top, right, bottom))
@@ -1383,6 +1386,31 @@ def _train_model(*args, **kwargs):  # pragma: no cover
     return _impl(*args, **kwargs)
 
 
+def _load_annotation_items(
+    sources: Iterable[Path],
+    transcripts_dir: Optional[Path],
+) -> List[AnnotationItem]:
+    items: List[AnnotationItem] = []
+    transcripts_path = Path(transcripts_dir) if transcripts_dir is not None else None
+
+    for raw_path in sources:
+        path = Path(raw_path)
+        item = AnnotationItem(path)
+
+        if transcripts_path is not None:
+            transcript_file = transcripts_path / f"{path.stem}.txt"
+            if transcript_file.exists():
+                try:
+                    item.label = transcript_file.read_text(encoding="utf8")
+                    item.status = "loaded"
+                except OSError as exc:  # pragma: no cover - logging only
+                    logging.warning("Could not read transcript %s: %s", transcript_file, exc)
+
+        items.append(item)
+
+    return items
+
+
 def annotate_images(
     sources: Iterable[Path],
     train_dir: Path,
@@ -1392,7 +1420,7 @@ def annotate_images(
     auto_train_config: Optional[AnnotationAutoTrainConfig] = None,
     transcripts_dir: Optional[Path] = None,
 ) -> None:
-    items = [AnnotationItem(Path(path)) for path in sources]
+    items = _load_annotation_items(sources, transcripts_dir)
     if not items:
         raise ValueError("No images found to annotate.")
 
