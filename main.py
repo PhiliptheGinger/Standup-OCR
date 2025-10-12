@@ -68,6 +68,14 @@ def add_gpt_arguments(parser: argparse.ArgumentParser) -> None:
         default=256,
         help="Maximum number of tokens ChatGPT may return per transcription (default: 256).",
     )
+    parser.add_argument(
+        "--gpt-max-images",
+        type=int,
+        help=(
+            "Upper bound on how many images should be sent to ChatGPT for transcription. "
+            "Remaining samples fall back to filename labels."
+        ),
+    )
 
 
 def handle_train(args: argparse.Namespace) -> None:
@@ -100,6 +108,7 @@ def handle_train(args: argparse.Namespace) -> None:
         gpt_prompt=args.gpt_prompt,
         gpt_cache_dir=args.gpt_cache_dir,
         gpt_max_output_tokens=args.gpt_max_output_tokens,
+        gpt_max_images=args.gpt_max_images,
     )
     logging.info("Model saved to %s", model_path)
 
@@ -221,6 +230,7 @@ def handle_review(args: argparse.Namespace) -> None:
                 gpt_prompt=args.gpt_prompt,
                 gpt_cache_dir=args.gpt_cache_dir,
                 gpt_max_output_tokens=args.gpt_max_output_tokens,
+                gpt_max_images=args.gpt_max_images,
             )
             logging.info("Updated model saved to %s", model_path)
             last_trained_count += args.auto_train
@@ -277,6 +287,7 @@ def handle_annotate(args: argparse.Namespace) -> None:
             gpt_prompt=args.gpt_prompt,
             gpt_cache_dir=args.gpt_cache_dir,
             gpt_max_output_tokens=args.gpt_max_output_tokens,
+            gpt_max_images=args.gpt_max_images,
         )
 
     if args.engine == "kraken" and args.seg == "auto" and not kraken_available():

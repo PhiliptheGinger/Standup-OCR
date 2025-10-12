@@ -121,6 +121,7 @@ def train_model(
     gpt_prompt: Optional[str] = None,
     gpt_cache_dir: Optional[PathLike] = None,
     gpt_max_output_tokens: int = 256,
+    gpt_max_images: Optional[int] = None,
 ) -> Path:
     """Fine-tune a Tesseract model using handwriting samples.
 
@@ -164,6 +165,10 @@ def train_model(
     gpt_max_output_tokens:
         Maximum number of tokens ChatGPT may return for each transcription
         request.
+    gpt_max_images:
+        Optional upper bound on how many images should be transcribed with
+        ChatGPT. Once the limit is reached the remaining samples fall back to
+        file-name derived labels so you can cap API usage.
 
     Returns
     -------
@@ -180,8 +185,12 @@ def train_model(
 
     logging.info("Starting Tesseract training with %d images", len(images))
 
+    if gpt_max_images is not None:
+        if gpt_max_images < 0:
+            raise ValueError("gpt_max_images must be zero or a positive integer")
+
     transcriber: Optional[GPTTranscriber] = None
-    if use_gpt_ocr:
+    if use_gpt_ocr and (gpt_max_images is None or gpt_max_images != 0):
         transcriber_kwargs: dict[str, object] = {"model": gpt_model, "max_output_tokens": gpt_max_output_tokens}
         if gpt_prompt is not None:
             transcriber_kwargs["prompt"] = gpt_prompt
@@ -193,12 +202,28 @@ def train_model(
             raise RuntimeError(f"Unable to initialise ChatGPT OCR: {exc}") from exc
 
     lstmf_paths: List[Path] = []
-    for image_path in images:
+    gpt_transcriptions = 0
+    gpt_limit_reached = False
+    for index, image_path in enumerate(images):
+        use_transcriber = False
         if transcriber is not None:
+            if gpt_max_images is None or gpt_transcriptions < gpt_max_images:
+                use_transcriber = True
+            elif not gpt_limit_reached:
+                remaining = len(images) - index
+                logging.info(
+                    "GPT OCR limit of %d image(s) reached; falling back to file-name labels for the remaining %d image(s).",
+                    gpt_max_images,
+                    remaining,
+                )
+                gpt_limit_reached = True
+
+        if use_transcriber:
             try:
                 label = transcriber.transcribe(image_path)
             except GPTTranscriptionError as exc:
                 raise RuntimeError(f"ChatGPT OCR failed for {image_path.name}: {exc}") from exc
+            gpt_transcriptions += 1
         else:
             label = _extract_label(image_path)
 

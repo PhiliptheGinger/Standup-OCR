@@ -1341,6 +1341,7 @@ class AnnotationAutoTrainConfig:
     gpt_prompt: Optional[str] = None
     gpt_cache_dir: Optional[Path] = None
     gpt_max_output_tokens: int = 256
+    gpt_max_images: Optional[int] = None
 
 
 @dataclass
@@ -1379,6 +1380,7 @@ class AnnotationTrainer:
                     gpt_prompt=self.config.gpt_prompt,
                     gpt_cache_dir=self.config.gpt_cache_dir,
                     gpt_max_output_tokens=self.config.gpt_max_output_tokens,
+                    gpt_max_images=self.config.gpt_max_images,
                 )
                 logging.info("Updated model saved to %s", model_path)
             except Exception:
