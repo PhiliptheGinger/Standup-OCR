@@ -23,11 +23,19 @@ from PIL import Image, ImageOps, ImageTk
 
 try:  # pragma: no cover - allow running as a package or script
     from .exporters import save_line_crops, save_pagexml
-    from .kraken_adapter import is_available as kraken_available, segment_lines
+    from .kraken_adapter import (
+        is_available as kraken_available,
+        ocr_to_string,
+        segment_lines,
+    )
     from .line_store import Line
 except ImportError:  # pragma: no cover
     from exporters import save_line_crops, save_pagexml
-    from kraken_adapter import is_available as kraken_available, segment_lines
+    from kraken_adapter import (
+        is_available as kraken_available,
+        ocr_to_string,
+        segment_lines,
+    )
     from line_store import Line
 
 
@@ -731,19 +739,30 @@ class AnnotationApp:
         options = getattr(self, "options", AnnotationOptions())
         if not options.prefill_enabled:
             return ""
-        ocr_impl = _get_prefill_ocr()
-        if ocr_impl is None:
-            return ""
-        try:
-            text = ocr_impl(
-                path,
-                model_path=options.prefill_model,
-                tessdata_dir=options.prefill_tessdata,
-                psm=options.prefill_psm,
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logging.debug("Prefill OCR failed for %s: %s", path, exc)
-            return ""
+        prefill_model = Path(options.prefill_model) if options.prefill_model else None
+        if prefill_model and prefill_model.suffix.lower() == ".mlmodel":
+            if not kraken_available():
+                logging.debug("Kraken prefill requested but Kraken is not available.")
+                return ""
+            try:
+                text = ocr_to_string(path, prefill_model)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logging.debug("Kraken prefill failed for %s: %s", path, exc)
+                return ""
+        else:
+            ocr_impl = _get_prefill_ocr()
+            if ocr_impl is None:
+                return ""
+            try:
+                text = ocr_impl(
+                    path,
+                    model_path=options.prefill_model,
+                    tessdata_dir=options.prefill_tessdata,
+                    psm=options.prefill_psm,
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logging.debug("Prefill OCR failed for %s: %s", path, exc)
+                return ""
         return text.strip()
 
     def _extract_tokens(self, image: Image.Image) -> List[OcrToken]:
