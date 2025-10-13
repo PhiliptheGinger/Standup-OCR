@@ -87,6 +87,55 @@ class GPTTranscriber:
             cache_path.mkdir(parents=True, exist_ok=True)
             self.cache_dir = cache_path
 
+    def generate(
+        self,
+        image_path: Path,
+        *,
+        prompt: Optional[str] = None,
+        hint_text: Optional[str] = None,
+        response_format: Optional[dict] = None,
+        temperature: Optional[float] = None,
+        max_output_tokens: Optional[int] = None,
+    ):
+        """Execute a multimodal completion request for ``image_path``."""
+
+        image_path = Path(image_path)
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+
+        encoded, mime_type = self._encode_image(image_path)
+
+        prompt_text = self.prompt if prompt is None else prompt
+        content = []
+        if prompt_text:
+            content.append({"type": "input_text", "text": prompt_text})
+        if hint_text:
+            content.append({"type": "input_text", "text": hint_text})
+        content.append({
+            "type": "input_image",
+            "image_url": f"data:{mime_type};base64,{encoded}",
+        })
+
+        request: dict = {
+            "model": self.model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ],
+            "max_output_tokens": max_output_tokens or self.max_output_tokens,
+        }
+        if response_format is not None:
+            request["response_format"] = response_format
+        if temperature is not None:
+            request["temperature"] = temperature
+
+        try:
+            return self._client.responses.create(**request)
+        except OpenAIError as exc:  # pragma: no cover - network failure
+            raise GPTTranscriptionError(f"OpenAI request failed: {exc}") from exc
+
     def transcribe(self, image_path: Path) -> str:
         """Return the transcription produced by ChatGPT for ``image_path``."""
 
@@ -99,27 +148,7 @@ class GPTTranscriber:
             if cached.exists():
                 return cached.read_text(encoding="utf-8").strip()
 
-        encoded, mime_type = self._encode_image(image_path)
-        try:
-            response = self._client.responses.create(
-                model=self.model,
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": self.prompt},
-                            {
-                                "type": "input_image",
-                                "image_url": f"data:{mime_type};base64,{encoded}",
-                            },
-                        ],
-                    }
-                ],
-                max_output_tokens=self.max_output_tokens,
-            )
-        except OpenAIError as exc:  # pragma: no cover - network failure
-            raise GPTTranscriptionError(f"OpenAI request failed: {exc}") from exc
-
+        response = self.generate(image_path)
         text = response.output_text.strip()
         if not text:
             raise GPTTranscriptionError("Received an empty transcription from ChatGPT.")
