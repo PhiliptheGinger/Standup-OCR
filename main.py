@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 from typing import Iterable, List
@@ -10,8 +11,10 @@ import pandas as pd
 
 from src.annotation import AnnotationAutoTrainConfig, AnnotationOptions, annotate_images
 from src.ocr import ocr_image
+from src.gpt_ocr import GPTTranscriber
 from src.review import ReviewAborted, ReviewConfig, ReviewSession
 from src.training import SUPPORTED_EXTENSIONS, train_model
+from src.refine import DEFAULT_REFINE_PROMPT, run_refinement
 from src.kraken_adapter import is_available as kraken_available, ocr as kraken_ocr, train as kraken_train
 
 
@@ -19,6 +22,7 @@ DEFAULT_TRAIN_DIR = Path("train")
 DEFAULT_MODEL_DIR = Path("models")
 DEFAULT_RESULTS_FILE = Path("results.csv")
 DEFAULT_TRANSCRIPTS_DIR = Path("transcripts") / "raw"
+DEFAULT_REFINED_DIR = Path("transcripts") / "refined"
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -189,6 +193,71 @@ def handle_ocr(args: argparse.Namespace) -> None:
         )
         out_txt = output_dir / f"{image_path.stem}.txt"
         out_txt.write_text(text, encoding="utf8")
+
+
+def handle_refine(args: argparse.Namespace) -> None:
+    source = Path(args.source)
+    if not source.exists():
+        raise FileNotFoundError(f"Source not found: {source}")
+
+    if source.is_dir():
+        images = list(iter_images(source))
+        if not images:
+            logging.warning("No images found in %s", source)
+    else:
+        images = [source]
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt = args.gpt_prompt or DEFAULT_REFINE_PROMPT
+    transcriber = GPTTranscriber(
+        model=args.gpt_model,
+        prompt=prompt,
+        max_output_tokens=args.gpt_max_output_tokens,
+        cache_dir=args.gpt_cache_dir,
+    )
+
+    results = run_refinement(
+        images,
+        transcriber=transcriber,
+        engine=args.engine,
+        tesseract_model=args.tesseract_model,
+        tessdata_dir=args.tessdata_dir,
+        psm=args.psm,
+        kraken_model=args.kraken_model,
+        temperature=args.gpt_temperature,
+        max_output_tokens=args.gpt_max_output_tokens,
+    )
+
+    for result in results:
+        payload = {
+            "image": result.image.name,
+            "image_path": str(result.image),
+            "engine": result.engine,
+            "rough_text": result.rough_text,
+            "corrected_text": result.corrected_text,
+            "confidence": result.confidence,
+            "notes": result.notes,
+            "tokens": result.tokens,
+        }
+        json_path = output_dir / f"{result.image.stem}.json"
+        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        txt_path = output_dir / f"{result.image.stem}.txt"
+        txt_path.write_text(result.corrected_text.strip() + "\n", encoding="utf-8")
+        if result.notes:
+            logging.info(
+                "Refined %s with confidence %.2f (notes: %s)",
+                result.image.name,
+                result.confidence,
+                result.notes,
+            )
+        else:
+            logging.info(
+                "Refined %s with confidence %.2f",
+                result.image.name,
+                result.confidence,
+            )
 
 
 def handle_review(args: argparse.Namespace) -> None:
@@ -490,6 +559,71 @@ def build_parser() -> argparse.ArgumentParser:
         help="Tesseract page segmentation mode when using --engine tesseract (default: 6).",
     )
     ocr_parser.set_defaults(func=handle_ocr)
+
+    refine_parser = subparsers.add_parser(
+        "refine",
+        help="Refine OCR output by combining baseline recognition with GPT cleanup.",
+    )
+    refine_parser.add_argument("source", type=Path, help="Image or directory to refine.")
+    refine_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_REFINED_DIR,
+        help="Directory where refined transcripts will be written (default: transcripts/refined).",
+    )
+    refine_parser.add_argument(
+        "--engine",
+        choices=["tesseract", "kraken"],
+        default="tesseract",
+        help="Baseline OCR engine providing the rough hint (default: tesseract).",
+    )
+    refine_parser.add_argument(
+        "--tesseract-model",
+        type=Path,
+        help="Optional .traineddata used when extracting Tesseract tokens for hints.",
+    )
+    refine_parser.add_argument(
+        "--tessdata-dir",
+        type=Path,
+        help="Tessdata directory accompanying --tesseract-model when using Tesseract hints.",
+    )
+    refine_parser.add_argument(
+        "--psm",
+        type=int,
+        default=6,
+        help="Tesseract page segmentation mode for hint extraction (default: 6).",
+    )
+    refine_parser.add_argument(
+        "--kraken-model",
+        type=Path,
+        help="Kraken model to use for the rough transcription when --engine kraken is selected.",
+    )
+    refine_parser.add_argument(
+        "--gpt-model",
+        default="gpt-4o-mini",
+        help="ChatGPT model identifier used for refinement (default: gpt-4o-mini).",
+    )
+    refine_parser.add_argument(
+        "--gpt-prompt",
+        help="Override the default refinement prompt sent to ChatGPT.",
+    )
+    refine_parser.add_argument(
+        "--gpt-cache-dir",
+        type=Path,
+        help="Directory for caching ChatGPT responses (optional).",
+    )
+    refine_parser.add_argument(
+        "--gpt-max-output-tokens",
+        type=int,
+        default=512,
+        help="Maximum number of tokens ChatGPT may return per refinement (default: 512).",
+    )
+    refine_parser.add_argument(
+        "--gpt-temperature",
+        type=float,
+        help="Optional temperature passed to ChatGPT for refinement sampling.",
+    )
+    refine_parser.set_defaults(func=handle_refine)
 
     review_parser = subparsers.add_parser(
         "review",
