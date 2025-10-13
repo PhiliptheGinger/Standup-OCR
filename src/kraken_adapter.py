@@ -584,3 +584,23 @@ def ocr(image_path: Path, model_path: Path, out_txt: Path) -> None:
         raise RuntimeError(f"kraken executable not found: {exc}") from exc
     except subprocess.CalledProcessError as exc:  # pragma: no cover
         raise RuntimeError(f"kraken ocr failed with exit code {exc.returncode}") from exc
+
+
+def ocr_to_string(image_path: Path, model_path: Path) -> str:
+    """Run Kraken OCR on ``image_path`` and return the recognised text."""
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as handle:
+        out_path = Path(handle.name)
+
+    try:
+        ocr(image_path, model_path, out_path)
+        try:
+            return out_path.read_text(encoding="utf8").strip()
+        except OSError as exc:  # pragma: no cover - best effort read
+            log.debug("Failed to read Kraken OCR output %s: %s", out_path, exc)
+            return ""
+    finally:
+        try:
+            out_path.unlink()
+        except OSError:  # pragma: no cover - file may already be gone
+            pass

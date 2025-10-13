@@ -12,7 +12,7 @@ from PIL import Image
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 import annotation
-from annotation import AnnotationApp, AnnotationItem, _prepare_image
+from annotation import AnnotationApp, AnnotationItem, AnnotationOptions, _prepare_image
 from annotation import _load_annotation_items
 
 
@@ -139,6 +139,28 @@ def test_confirm_updates_transcript_file(tmp_path):
     transcript_path = app.transcripts_dir / "scan1.txt"
     assert transcript_path.exists()
     assert transcript_path.read_text(encoding="utf8") == "Updated transcription"
+
+
+def test_suggest_label_uses_kraken_prefill(monkeypatch, tmp_path):
+    """Supplying a Kraken model should route prefill requests through Kraken OCR."""
+
+    app = AnnotationApp.__new__(AnnotationApp)
+    app.options = AnnotationOptions(prefill_model=tmp_path / "model.mlmodel")
+
+    calls: list[tuple[Path, Path]] = []
+
+    monkeypatch.setattr(annotation, "kraken_available", lambda: True)
+
+    def fake_kraken_prefill(image_path: Path, model_path: Path) -> str:
+        calls.append((image_path, model_path))
+        return "Kraken text"
+
+    monkeypatch.setattr(annotation, "ocr_to_string", fake_kraken_prefill)
+
+    recognised = AnnotationApp._suggest_label(app, tmp_path / "page.png")
+
+    assert recognised == "Kraken text"
+    assert calls and calls[0][1] == app.options.prefill_model
 
 
 def test_finish_manual_overlay_normalises_coordinates():
