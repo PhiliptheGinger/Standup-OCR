@@ -91,6 +91,9 @@ Key behaviour:
 * The confirmed transcription is also written to
   ``transcripts/raw/<image>.txt`` (configurable via ``--transcripts-dir``) so
   that subsequent packaging steps include your corrections.
+* Pass ``--prefill-model`` with a Kraken ``.mlmodel`` file (for example
+  ``--prefill-model models/kraken.mlmodel``) to see your handwriting model's
+  transcription pre-filled directly in the Tkinter interface.
 * Images are automatically rotated based on their embedded EXIF orientation so
   the preview and saved snippet share the correct layout.
 * Use **Skip** to omit an image or **Unsure** to log it without saving a copy.
