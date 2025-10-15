@@ -76,6 +76,16 @@ def _discover_images(train_dir: Path) -> List[Path]:
     if images:
         return images
 
+    lines_dir = train_dir / "lines"
+    if lines_dir.exists():
+        nested_images = [
+            p
+            for p in sorted(lines_dir.rglob("*"))
+            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
+        if nested_images:
+            return nested_images
+
     sample = _bootstrap_sample_training_image(train_dir)
     logging.info(
         "No training images found in %s; created starter sample %s. Replace this image with your own handwriting to continue training.",
