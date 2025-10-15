@@ -72,3 +72,24 @@ def test_discover_images_prefers_lines_directory(tmp_path):
 
     assert images == [handwriting]
     assert not (train_dir / "word_sample.png").exists()
+
+
+def test_discover_images_ignores_bootstrap_when_real_samples_exist(tmp_path):
+    train_dir = tmp_path / "train"
+    lines_dir = train_dir / "lines"
+    lines_dir.mkdir(parents=True)
+
+    bootstrap = train_dir / "word_sample.png"
+    bootstrap.write_bytes(b"placeholder")
+
+    handwriting = lines_dir / "another_sample.png"
+    handwriting.write_bytes(b"content")
+
+    extra = train_dir / "root_sample.png"
+    extra.write_bytes(b"root content")
+
+    images = training._discover_images(train_dir)
+
+    assert handwriting in images
+    assert extra in images
+    assert bootstrap not in images

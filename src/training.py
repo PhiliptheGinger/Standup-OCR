@@ -68,13 +68,25 @@ def _discover_images(train_dir: Path) -> List[Path]:
     """Return a sorted list of image paths inside ``train_dir``."""
 
     train_dir.mkdir(parents=True, exist_ok=True)
-    images = [
-        p
-        for p in sorted(train_dir.iterdir())
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
-    ]
-    if images:
-        return images
+    supported = (
+        lambda p: p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
+
+    root_images = [p for p in train_dir.iterdir() if supported(p)]
+
+    lines_dir = train_dir / "lines"
+    nested_images: list[Path] = []
+    if lines_dir.exists():
+        nested_images = [p for p in lines_dir.rglob("*") if supported(p)]
+
+    candidate_images = set(root_images)
+    candidate_images.update(nested_images)
+
+    if candidate_images:
+        sample_path = train_dir / "word_sample.png"
+        if sample_path in candidate_images and len(candidate_images) > 1:
+            candidate_images.remove(sample_path)
+        return sorted(candidate_images)
 
     lines_dir = train_dir / "lines"
     if lines_dir.exists():
