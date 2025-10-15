@@ -1,0 +1,158 @@
+[
+  {
+    "line": 1,
+    "image": "20250930_122218_line01.png",
+    "text_file": "20250930_122218_line01.gt.txt",
+    "text": "Introvert.Extravert        3",
+    "bbox": {
+      "left": 757,
+      "top": 681,
+      "right": 2500,
+      "bottom": 885
+    },
+    "is_manual": false
+  },
+  {
+    "line": 2,
+    "image": "20250930_122218_line02.png",
+    "text_file": "20250930_122218_line02.gt.txt",
+    "text": "It's way worse being an awkward extravert",
+    "bbox": {
+      "left": 620,
+      "top": 913,
+      "right": 2486,
+      "bottom": 1044
+    },
+    "is_manual": true
+  },
+  {
+    "line": 3,
+    "image": "20250930_122218_line03.png",
+    "text_file": "20250930_122218_line03.gt.txt",
+    "text": "than an awkward introvert",
+    "bbox": {
+      "left": 984,
+      "top": 1035,
+      "right": 2029,
+      "bottom": 1128
+    },
+    "is_manual": true
+  },
+  {
+    "line": 4,
+    "image": "20250930_122218_line04.png",
+    "text_file": "20250930_122218_line04.gt.txt",
+    "text": "- It's not a good idea to bank on",
+    "bbox": {
+      "left": 723,
+      "top": 1119,
+      "right": 2173,
+      "bottom": 1249
+    },
+    "is_manual": true
+  },
+  {
+    "line": 5,
+    "image": "20250930_122218_line05.png",
+    "text_file": "20250930_122218_line05.gt.txt",
+    "text": "the other guy being weird",
+    "bbox": {
+      "left": 778,
+      "top": 1235,
+      "right": 1819,
+      "bottom": 1352
+    },
+    "is_manual": true
+  },
+  {
+    "line": 6,
+    "image": "20250930_122218_line06.png",
+    "text_file": "20250930_122218_line06.gt.txt",
+    "text": "- Guy that's never seen you not be an awkward",
+    "bbox": {
+      "left": 723,
+      "top": 1324,
+      "right": 2234,
+      "bottom": 1478
+    },
+    "is_manual": true
+  },
+  {
+    "line": 7,
+    "image": "20250930_122218_line07.png",
+    "text_file": "20250930_122218_line07.gt.txt",
+    "text": "awkward piece of shit.",
+    "bbox": {
+      "left": 765,
+      "top": 1468,
+      "right": 1562,
+      "bottom": 1552
+    },
+    "is_manual": true
+  },
+  {
+    "line": 8,
+    "image": "20250930_122218_line08.png",
+    "text_file": "20250930_122218_line08.gt.txt",
+    "text": "- I wish I believed cancel culture was",
+    "bbox": {
+      "left": 723,
+      "top": 1529,
+      "right": 2197,
+      "bottom": 1655
+    },
+    "is_manual": true
+  },
+  {
+    "line": 9,
+    "image": "20250930_122218_line09.png",
+    "text_file": "20250930_122218_line09.gt.txt",
+    "text": "a thing,",
+    "bbox": {
+      "left": 802,
+      "top": 1655,
+      "right": 1203,
+      "bottom": 1781
+    },
+    "is_manual": true
+  },
+  {
+    "line": 10,
+    "image": "20250930_122218_line10.png",
+    "text_file": "20250930_122218_line10.gt.txt",
+    "text": "-",
+    "bbox": {
+      "left": 727,
+      "top": 1771,
+      "right": 806,
+      "bottom": 1869
+    },
+    "is_manual": true
+  },
+  {
+    "line": 11,
+    "image": "20250930_122218_line11.png",
+    "text_file": "20250930_122218_line11.gt.txt",
+    "text": "Did I just learn how to",
+    "bbox": {
+      "left": 1208,
+      "top": 1748,
+      "right": 2229,
+      "bottom": 1879
+    },
+    "is_manual": true
+  },
+  {
+    "line": 12,
+    "image": "20250930_122218_line12.png",
+    "text_file": "20250930_122218_line12.gt.txt",
+    "text": "talk using duolingo?",
+    "bbox": {
+      "left": 802,
+      "top": 1874,
+      "right": 1595,
+      "bottom": 2056
+    },
+    "is_manual": true
+  }
+]

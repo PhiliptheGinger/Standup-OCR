@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.so
+*.dll
+
+# Virtual environment
+venv/
+.env/
+.venv/
+env/
+ENV/
+
+# Logs and cache
+*.log
+*.tmp
+*.bak
+*.swp
+*.DS_Store
+*.cache/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Tesseract / OCR output
+*.lstmf
+*.traineddata
+*.box
+*.tif
+*.tiff
+*.jpeg
+*.jpg
+*.png
+output/
+models/
+temp/
+tessdata/
+
+# Annotation or training data
+train/*.gt.txt
+train/*.box
+train/*.lstmf
+train/*.txt
+train/lines/
+train/output/
+annotation_log.csv
+filelist.txt
+
+# IDE / Editor
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS-specific
+Thumbs.db
+desktop.ini
+
+# Build / distribution
+build/
+dist/
+*.spec
+
+# Checkpoints / experiments
+*.ckpt
+*.pt
+*.h5
+runs/
+logs/
