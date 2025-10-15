@@ -135,22 +135,40 @@ def _prepare_ground_truth(image_path: Path, label: str, work_dir: Path) -> Tuple
     return processed_path, gt_file
 
 
-def _generate_lstmf(processed_image: Path, work_dir: Path) -> Path:
-    """Invoke Tesseract to create the .lstmf feature file from an image."""
-    base = work_dir / processed_image.stem
-    command = [
+def _generate_lstmf(image_path: Path, work_dir: Path) -> Path:
+    """Generate .lstmf file for a single training pair.
+    Works with either .gt.txt or .box training files."""
+
+    image_path = Path(image_path)
+    base_name = image_path.stem
+    gt_txt = image_path.with_suffix(".gt.txt")
+    lstmf_path = work_dir / f"{base_name}.lstmf"
+
+    if lstmf_path.exists():
+        return lstmf_path  # skip if already generated
+
+    cmd = [
         "tesseract",
-        str(processed_image),
-        str(base),
+        str(image_path),
+        str(work_dir / base_name),
         "--psm",
         "6",
         "--oem",
         "1",
-        "nobatch",
-        "lstm.train",
     ]
-    _run_command(command)
-    lstmf_path = base.with_suffix(".lstmf")
+
+    # Prefer .gt.txt if available
+    if gt_txt.exists():
+        cmd += ["--train_from_boxes", "false", "nobatch", "lstm.train"]
+    else:
+        cmd += ["nobatch", "lstm.train"]
+
+    logging.info("Running: %s", " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception as e:  # pragma: no cover - surface the Tesseract error context
+        raise RuntimeError(f"Tesseract training failed for {image_path}: {e}")
+
     if not lstmf_path.exists():
         raise RuntimeError(f"Tesseract did not produce {lstmf_path}")
     return lstmf_path
