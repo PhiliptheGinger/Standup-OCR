@@ -14,6 +14,36 @@ from PIL import Image, ImageDraw, ImageFont
 from .preprocessing import preprocess_image
 from .gpt_ocr import GPTTranscriber, GPTTranscriptionError
 
+
+def _run_tesseract_lstm_train(img_path: Path) -> Path:
+    """Run Tesseract LSTM training for a single image and return the .lstmf path."""
+
+    img_path = img_path.resolve()
+    out_base = img_path.with_suffix("")
+    lstmf = out_base.with_suffix(".lstmf")
+
+    cmd = [
+        r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+        str(img_path),
+        str(out_base),
+        "--psm",
+        "6",
+        "--oem",
+        "1",
+        "-l",
+        "eng",
+        "lstm.train",
+    ]
+
+    log_path = out_base.with_suffix(".tlog.txt")
+    with open(log_path, "w", encoding="utf-8") as err:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=err)
+
+    if not lstmf.exists():
+        raise RuntimeError(f"Tesseract did not produce {lstmf}; see {log_path}")
+
+    return lstmf
+
 PathLike = str | os.PathLike[str]
 
 
@@ -135,43 +165,11 @@ def _prepare_ground_truth(image_path: Path, label: str, work_dir: Path) -> Tuple
     return processed_path, gt_file
 
 
-def _generate_lstmf(image_path: Path, work_dir: Path) -> Path:
-    """Generate .lstmf file for a single training pair.
-    Works with either .gt.txt or .box training files."""
+def _generate_lstmf(processed_path: Path, work_dir: Path) -> Path:
+    """Generate .lstmf file for a single training pair."""
 
-    image_path = Path(image_path)
-    base_name = image_path.stem
-    gt_txt = image_path.with_suffix(".gt.txt")
-    lstmf_path = work_dir / f"{base_name}.lstmf"
-
-    if lstmf_path.exists():
-        return lstmf_path  # skip if already generated
-
-    cmd = [
-        "tesseract",
-        str(image_path),
-        str(work_dir / base_name),
-        "--psm",
-        "6",
-        "--oem",
-        "1",
-    ]
-
-    # Prefer .gt.txt if available
-    if gt_txt.exists():
-        cmd += ["nobatch", "lstm.train"]
-    else:
-        cmd += ["nobatch", "lstm.train"]
-
-    logging.info("Running: %s", " ".join(cmd))
-    try:
-        subprocess.run(cmd, check=True)
-    except Exception as e:  # pragma: no cover - surface the Tesseract error context
-        raise RuntimeError(f"Tesseract training failed for {image_path}: {e}")
-
-    if not lstmf_path.exists():
-        raise RuntimeError(f"Tesseract did not produce {lstmf_path}")
-    return lstmf_path
+    _ = work_dir  # preserved for backward compatibility
+    return _run_tesseract_lstm_train(processed_path)
 
 
 def _resolve_tessdata_dir(tessdata_dir: Optional[PathLike]) -> Path:
