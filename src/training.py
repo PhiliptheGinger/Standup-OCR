@@ -159,7 +159,7 @@ def _generate_lstmf(image_path: Path, work_dir: Path) -> Path:
 
     # Prefer .gt.txt if available
     if gt_txt.exists():
-        cmd += ["--train_from_boxes", "false", "nobatch", "lstm.train"]
+        cmd += ["nobatch", "lstm.train"]
     else:
         cmd += ["nobatch", "lstm.train"]
 
