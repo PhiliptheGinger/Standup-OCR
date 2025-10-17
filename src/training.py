@@ -124,7 +124,8 @@ def _prepare_ground_truth(image_path: Path, label: str, work_dir: Path) -> Tuple
         raise ValueError(f"Empty transcription supplied for {image_path}")
     base_name = image_path.stem
     gt_file = work_dir / f"{base_name}.gt.txt"
-    gt_file.write_text(label + "\n", encoding="utf-8")
+    with gt_file.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(label + "\n")
 
     # Optionally save a preprocessed version alongside the original.
     processed = preprocess_image(image_path)
@@ -135,7 +136,7 @@ def _prepare_ground_truth(image_path: Path, label: str, work_dir: Path) -> Tuple
     return processed_path, gt_file
 
 
-def _generate_lstmf(image_path: Path, work_dir: Path) -> Path:
+def _generate_lstmf(image_path: Path, work_dir: Path, base_lang: str) -> Path:
     """Generate .lstmf file for a single training pair.
     Works with either .gt.txt or .box training files."""
 
@@ -143,9 +144,67 @@ def _generate_lstmf(image_path: Path, work_dir: Path) -> Path:
     base_name = image_path.stem
     gt_txt = image_path.with_suffix(".gt.txt")
     lstmf_path = work_dir / f"{base_name}.lstmf"
+    box_path = work_dir / f"{base_name}.box"
 
     if lstmf_path.exists():
         return lstmf_path  # skip if already generated
+
+    if not gt_txt.exists():
+        raise FileNotFoundError(f"Missing ground truth file for {image_path}")
+
+    makebox_cmd = [
+        "tesseract",
+        str(image_path),
+        str(work_dir / base_name),
+        "-l",
+        base_lang,
+        "--psm",
+        "7",
+        "makebox",
+    ]
+
+    logging.info("Running: %s", " ".join(makebox_cmd))
+    try:
+        subprocess.run(makebox_cmd, check=True)
+    except subprocess.CalledProcessError as exc:  # pragma: no cover - surface context
+        output = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(
+            f"Tesseract makebox failed for {image_path}: {output or exc.returncode}"
+        ) from exc
+
+    if not box_path.exists():
+        raise RuntimeError(
+            f"Tesseract did not produce {box_path}. Check that the training tools are installed."
+        )
+
+    gt_text = gt_txt.read_text(encoding="utf-8").replace("\r", "").rstrip("\n")
+    box_lines = box_path.read_text(encoding="utf-8").splitlines()
+    if len(box_lines) < len(gt_text):
+        raise RuntimeError(
+            f"Ground truth for {image_path.name} has {len(gt_text)} characters but the generated box file contains {len(box_lines)} entries."
+        )
+
+    trimmed_lines = box_lines[: len(gt_text)]
+    fixed_lines: list[str] = []
+    for character, line in zip(gt_text, trimmed_lines):
+        parts = line.rsplit(" ", 5)
+        if len(parts) != 6:
+            raise RuntimeError(
+                f"Unexpected box format for {box_path}: '{line}'. Tesseract produced an invalid entry."
+            )
+        _, left, bottom, right, top, page = parts
+        fixed_lines.append(
+            f"{character if character != '\n' else ''} {left} {bottom} {right} {top} {page}"
+        )
+
+    if len(box_lines) > len(gt_text):
+        logging.info(
+            "Discarded %d extra box entries for %s to match the ground truth length.",
+            len(box_lines) - len(gt_text),
+            image_path.name,
+        )
+
+    box_path.write_text("\n".join(fixed_lines) + "\n", encoding="utf-8")
 
     cmd = [
         "tesseract",
@@ -155,22 +214,39 @@ def _generate_lstmf(image_path: Path, work_dir: Path) -> Path:
         "6",
         "--oem",
         "1",
+        "-l",
+        base_lang,
+        "lstm.train",
     ]
-
-    # Prefer .gt.txt if available
-    if gt_txt.exists():
-        cmd += ["nobatch", "lstm.train"]
-    else:
-        cmd += ["nobatch", "lstm.train"]
 
     logging.info("Running: %s", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True)
-    except Exception as e:  # pragma: no cover - surface the Tesseract error context
-        raise RuntimeError(f"Tesseract training failed for {image_path}: {e}")
+    except subprocess.CalledProcessError as exc:  # pragma: no cover - surface context
+        output = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(
+            f"Tesseract training failed for {image_path}: {output or exc.returncode}"
+        ) from exc
 
     if not lstmf_path.exists():
-        raise RuntimeError(f"Tesseract did not produce {lstmf_path}")
+        exe_path = shutil.which("tesseract")
+        if exe_path:
+            abs_cmd = [exe_path, *cmd[1:]]
+            logging.info(
+                "Retrying with absolute Tesseract path: %s", " ".join(abs_cmd)
+            )
+            try:
+                subprocess.run(abs_cmd, check=True)
+            except subprocess.CalledProcessError as exc:  # pragma: no cover
+                output = (exc.stderr or exc.stdout or "").strip()
+                raise RuntimeError(
+                    f"Tesseract training failed for {image_path} when using {exe_path}: {output or exc.returncode}"
+                ) from exc
+
+    if not lstmf_path.exists():
+        raise RuntimeError(
+            f"Tesseract did not produce {lstmf_path}. Ensure the language data and training tools are installed."
+        )
     return lstmf_path
 
 
@@ -246,6 +322,41 @@ def _resolve_tessdata_dir(tessdata_dir: Optional[PathLike]) -> Path:
         "Unable to locate tessdata directory. Set TESSDATA_PREFIX, install Tesseract, "
         "or pass tessdata_dir explicitly (see README for details)."
     )
+
+
+def _is_fast_model(base_lang: str, base_traineddata: Path, extracted_dir: Path) -> bool:
+    """Return True if the base model is integer-only (fast) and cannot be continued."""
+
+    config_path = extracted_dir / f"{base_lang}.config"
+    hints: list[str] = []
+
+    if config_path.exists():
+        try:
+            hints.append(config_path.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            logging.debug("Unable to read %s to inspect int_mode flag", config_path)
+
+    try:
+        result = subprocess.run(
+            ["combine_tessdata", "-d", str(base_traineddata)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        result = None
+    else:
+        hints.extend([result.stdout, result.stderr])
+
+    combined_hints = "\n".join(hints).lower()
+    fast_tokens = (
+        "int_mode 1",
+        "int_mode true",
+        "modeltype int",
+        "network type: int",
+        "integer mode",
+    )
+    return any(token in combined_hints for token in fast_tokens)
 
 
 def train_model(
@@ -368,7 +479,7 @@ def train_model(
             label = _extract_label(image_path)
 
         processed_path, _ = _prepare_ground_truth(image_path, label, work_dir)
-        lstmf_path = _generate_lstmf(processed_path, work_dir)
+        lstmf_path = _generate_lstmf(processed_path, work_dir, base_lang)
         lstmf_paths.append(lstmf_path)
 
     list_file = work_dir / "training_files.txt"
@@ -397,21 +508,80 @@ def train_model(
         raise RuntimeError("combine_tessdata did not produce the .lstm file")
 
     checkpoint_prefix = work_dir / f"{output_model}_checkpoint"
-    _run_command(
-        [
-            "lstmtraining",
-            "--continue_from",
-            str(lstm_path),
-            "--model_output",
-            str(checkpoint_prefix),
-            "--traineddata",
-            str(base_traineddata),
-            "--train_listfile",
-            str(list_file),
-            "--max_iterations",
-            str(max_iterations),
-        ]
+    fast_model = _is_fast_model(base_lang, base_traineddata, extracted_dir)
+
+    def _run_lstmtraining(command: list[str]) -> subprocess.CompletedProcess[str]:
+        logging.info("Running: %s", " ".join(str(p) for p in command))
+        result = subprocess.run(command, capture_output=True, text=True)
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        if stdout:
+            logging.debug(stdout)
+        if stderr:
+            logging.debug(stderr)
+        return result
+
+    def _ensure_success(result: subprocess.CompletedProcess[str], description: str) -> None:
+        if result.returncode == 0:
+            return
+        output = ((result.stderr or "") + (result.stdout or "")).strip()
+        message = output or f"exit code {result.returncode}"
+        raise RuntimeError(f"{description} failed: {message}")
+
+    continue_cmd = [
+        "lstmtraining",
+        "--continue_from",
+        str(lstm_path),
+        "--model_output",
+        str(checkpoint_prefix),
+        "--traineddata",
+        str(base_traineddata),
+        "--train_listfile",
+        str(list_file),
+        "--max_iterations",
+        str(max_iterations),
+    ]
+
+    scratch_cmd = [
+        "lstmtraining",
+        "--net_spec",
+        "[1,48,0,1 Lfx128 O1c1]",
+        "--model_output",
+        str(checkpoint_prefix),
+        "--traineddata",
+        str(base_traineddata),
+        "--train_listfile",
+        str(list_file),
+        "--max_iterations",
+        str(max_iterations),
+    ]
+
+    continue_error_tokens = (
+        "failed to deserialize lstmtrainer",
+        "failed to read continue from network",
+        "deserialize header failed",
     )
+
+    if fast_model:
+        logging.info(
+            "Detected integer-only base model %s; training from scratch.",
+            base_traineddata.name,
+        )
+        result = _run_lstmtraining(scratch_cmd)
+        _ensure_success(result, "Training (fresh network)")
+    else:
+        result = _run_lstmtraining(continue_cmd)
+        if result.returncode != 0:
+            output = ((result.stderr or "") + (result.stdout or "")).lower()
+            if any(token in output for token in continue_error_tokens):
+                logging.warning(
+                    "Base model %s cannot be continued. Falling back to training from scratch.",
+                    lstm_path,
+                )
+                result = _run_lstmtraining(scratch_cmd)
+                _ensure_success(result, "Training (fresh network)")
+            else:
+                _ensure_success(result, "Training")
 
     checkpoint_file = checkpoint_prefix.with_suffix(".checkpoint")
     if not checkpoint_file.exists():
