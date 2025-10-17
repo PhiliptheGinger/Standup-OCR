@@ -153,6 +153,21 @@ python main.py train --train-dir train --output-model handwriting \
 > directory that the binary uses internally. Point `TESSDATA_PREFIX` to that
 > location if the training command cannot find it automatically.
 
+#### Windows training prerequisites
+
+Windows installers for Tesseract often omit the LSTM training utilities. Before
+invoking `python main.py train ...` on Windows:
+
+1. Install the full training tools package (for example the Mannheim builds)
+   so that `lstmtraining`, `combine_tessdata`, and `text2image` are available.
+2. Add the directory that contains these executables to your `PATH`.
+3. Ensure the desired language pack (such as `eng.traineddata`) lives inside
+   `<Tesseract>\tessdata`.
+4. Open a new terminal and confirm each tool runs (e.g. `lstmtraining --help`).
+
+Once these steps succeed you can run the training command from this project
+without silent failures caused by missing binaries.
+
 ### ChatGPT-powered transcription
 
 Set the `OPENAI_API_KEY` environment variable to enable ChatGPT's multimodal

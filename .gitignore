@@ -1,0 +1,14 @@
+# Python and virtualenv
+__pycache__/
+*.py[cod]
+*.pyd
+venv/
+
+# Models and training artifacts
+models/
+*.lstmf
+*.traineddata
+
+# Logs and cache
+*.log
+*.cache/
