@@ -193,8 +193,9 @@ def _generate_lstmf(image_path: Path, work_dir: Path, base_lang: str) -> Path:
                 f"Unexpected box format for {box_path}: '{line}'. Tesseract produced an invalid entry."
             )
         _, left, bottom, right, top, page = parts
+        normalized_character = "" if character == "\n" else character
         fixed_lines.append(
-            f"{character if character != '\n' else ''} {left} {bottom} {right} {top} {page}"
+            f"{normalized_character} {left} {bottom} {right} {top} {page}"
         )
 
     if len(box_lines) > len(gt_text):
