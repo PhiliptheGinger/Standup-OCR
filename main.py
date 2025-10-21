@@ -5,13 +5,13 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import pandas as pd
 
 from src.annotation import AnnotationAutoTrainConfig, AnnotationOptions, annotate_images
 from src.ocr import ocr_image
-from src.gpt_ocr import GPTTranscriber
+from src.gpt_ocr import GPTTranscriber, GPTTranscriptionError
 from src.review import ReviewAborted, ReviewConfig, ReviewSession
 from src.training import SUPPORTED_EXTENSIONS, train_model
 from src.refine import DEFAULT_REFINE_PROMPT, run_refinement
@@ -277,6 +277,25 @@ def handle_review(args: argparse.Namespace) -> None:
     )
     session: ReviewSession
     last_trained_count = 0
+    gpt_max_images = args.gpt_max_images
+    transcriber: Optional[GPTTranscriber] = None
+
+    if gpt_max_images is not None and gpt_max_images < 0:
+        raise ValueError("--gpt-max-images must be zero or a positive integer")
+
+    if not args.no_gpt_ocr and (gpt_max_images is None or gpt_max_images != 0):
+        transcriber_kwargs: dict[str, object] = {
+            "model": args.gpt_model,
+            "max_output_tokens": args.gpt_max_output_tokens,
+        }
+        if args.gpt_prompt is not None:
+            transcriber_kwargs["prompt"] = args.gpt_prompt
+        if args.gpt_cache_dir is not None:
+            transcriber_kwargs["cache_dir"] = Path(args.gpt_cache_dir)
+        try:
+            transcriber = GPTTranscriber(**transcriber_kwargs)
+        except GPTTranscriptionError as exc:
+            raise RuntimeError(f"Unable to initialise ChatGPT OCR: {exc}") from exc
 
     def maybe_train() -> None:
         nonlocal last_trained_count
@@ -304,7 +323,12 @@ def handle_review(args: argparse.Namespace) -> None:
             logging.info("Updated model saved to %s", model_path)
             last_trained_count += args.auto_train
 
-    session = ReviewSession(config, on_sample_saved=lambda *_args: maybe_train())
+    session = ReviewSession(
+        config,
+        on_sample_saved=lambda *_args: maybe_train(),
+        transcriber=transcriber,
+        gpt_max_images=gpt_max_images,
+    )
 
     try:
         paths: List[Path]

@@ -136,25 +136,45 @@ class GPTTranscriber:
         except OpenAIError as exc:  # pragma: no cover - network failure
             raise GPTTranscriptionError(f"OpenAI request failed: {exc}") from exc
 
-    def transcribe(self, image_path: Path) -> str:
-        """Return the transcription produced by ChatGPT for ``image_path``."""
+    def transcribe(
+        self,
+        image_path: Path,
+        *,
+        hint_text: Optional[str] = None,
+        use_cache: bool = True,
+    ) -> str:
+        """Return the transcription produced by ChatGPT for ``image_path``.
+
+        Parameters
+        ----------
+        image_path:
+            Image that should be transcribed.
+        hint_text:
+            Optional extra context appended to the prompt (for example the
+            result of a different OCR engine). The hint is ignored when empty.
+        use_cache:
+            When ``True`` and ``cache_dir`` is configured, cached transcriptions
+            are reused on subsequent calls. Disable to force a fresh request.
+        """
 
         image_path = Path(image_path)
         if not image_path.exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
 
-        if self.cache_dir is not None:
+        cached: Optional[Path] = None
+        if use_cache and self.cache_dir is not None:
             cached = self._cache_path(image_path)
             if cached.exists():
                 return cached.read_text(encoding="utf-8").strip()
 
-        response = self.generate(image_path)
+        response = self.generate(image_path, hint_text=hint_text)
         text = response.output_text.strip()
         if not text:
             raise GPTTranscriptionError("Received an empty transcription from ChatGPT.")
 
-        if self.cache_dir is not None:
-            cached = self._cache_path(image_path)
+        if use_cache and self.cache_dir is not None:
+            if cached is None:
+                cached = self._cache_path(image_path)
             cached.write_text(text, encoding="utf-8")
 
         return text
