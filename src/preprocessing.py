@@ -6,6 +6,7 @@ from typing import Union
 
 import cv2
 import numpy as np
+from PIL import Image, ExifTags
 
 import logging
 
@@ -45,6 +46,35 @@ def preprocess_image(image_path: PathLike, *, resize_width: int = 1800, adaptive
     image = cv2.imread(str(image_path))
     if image is None:
         raise FileNotFoundError(f"Unable to load image: {image_path}")
+
+    # Attempt to orient the image according to any available EXIF metadata.
+    try:
+        with Image.open(image_path) as pil_img:
+            orientation_tag = next(
+                (
+                    tag
+                    for tag, name in ExifTags.TAGS.items()
+                    if name == "Orientation"
+                ),
+                None,
+            )
+            if orientation_tag is not None:
+                exif = pil_img._getexif()
+                if exif is not None:
+                    orientation_value = exif.get(orientation_tag, 1)
+                    if orientation_value == 3:
+                        image = cv2.rotate(image, cv2.ROTATE_180)
+                    elif orientation_value == 6:
+                        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+                    elif orientation_value == 8:
+                        image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    except Exception:
+        # If EXIF data is unavailable or unreadable, proceed without rotating.
+        pass
+
+    # Normalize orientation so that images are landscape when possible.
+    if image.shape[0] > image.shape[1]:
+        image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
