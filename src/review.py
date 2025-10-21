@@ -15,6 +15,7 @@ from PIL import Image
 from .ocr import ocr_detailed
 from .preprocessing import preprocess_image
 from .training import SUPPORTED_EXTENSIONS
+from .gpt_ocr import GPTTranscriber, GPTTranscriptionError
 
 
 class ReviewAborted(RuntimeError):
@@ -42,6 +43,8 @@ class ReviewSession:
         *,
         log_path: Optional[Path] = None,
         on_sample_saved: Optional[Callable[[Path, str, Path], None]] = None,
+        transcriber: Optional[GPTTranscriber] = None,
+        gpt_max_images: Optional[int] = None,
     ) -> None:
         self.config = config
         self.train_dir = Path(config.train_dir)
@@ -51,6 +54,12 @@ class ReviewSession:
         self._load_log()
         self.saved_samples = 0
         self._on_sample_saved = on_sample_saved
+        self._transcriber = transcriber
+        if gpt_max_images is not None and gpt_max_images < 0:
+            raise ValueError("gpt_max_images must be zero or a positive integer")
+        self._gpt_max_images = gpt_max_images
+        self._gpt_transcriptions = 0
+        self._gpt_limit_logged = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -113,15 +122,36 @@ class ReviewSession:
             if snippet.size == 0:
                 continue
 
-            recognised = row.get("text", "")
+            tesseract_guess = row.get("text", "")
+            recognised = tesseract_guess
+            gpt_guess = self._maybe_transcribe_with_gpt(snippet, image_path, tesseract_guess)
+            if gpt_guess:
+                recognised = gpt_guess
+
             preview_location = self._preview_snippet(snippet)
-            prompt = self._build_prompt(image_path, row, preview_location)
+            prompt = self._build_prompt(
+                image_path,
+                row,
+                preview_location,
+                recognised,
+                tesseract_guess,
+                gpt_guess,
+            )
             corrected = self._prompt_for_text(prompt, recognised)
             if corrected is None:
                 continue
 
             snippet_path = self._save_snippet(snippet, image_path, corrected)
-            self._append_log(key, image_path, bbox, recognised, corrected, snippet_path)
+            self._append_log(
+                key,
+                image_path,
+                bbox,
+                recognised,
+                corrected,
+                snippet_path,
+                tesseract_guess=tesseract_guess,
+                gpt_guess=gpt_guess,
+            )
             saved += 1
             self.saved_samples += 1
             logging.info("Saved %s with label '%s'", snippet_path.name, corrected)
@@ -183,13 +213,26 @@ class ReviewSession:
             logging.info("Preview saved to %s", temp_path)
             return temp_path
 
-    def _build_prompt(self, image_path: Path, row, preview: Optional[Path]) -> str:
+    def _build_prompt(
+        self,
+        image_path: Path,
+        row,
+        preview: Optional[Path],
+        recognised: str,
+        tesseract_guess: str,
+        gpt_guess: Optional[str],
+    ) -> str:
         parts = [
             f"Image: {image_path.name}",
             f"Confidence: {row.get('confidence', 'n/a')}",
-            f"Recognised: '{row.get('text', '')}'",
-            "Enter corrected text, [s]kip, or [q]uit.",
         ]
+        if gpt_guess:
+            parts.append(f"Suggested (ChatGPT): '{gpt_guess}'")
+            if tesseract_guess and tesseract_guess != gpt_guess:
+                parts.append(f"Tesseract OCR: '{tesseract_guess}'")
+        else:
+            parts.append(f"Recognised: '{tesseract_guess}'")
+        parts.append("Enter corrected text, [s]kip, or [q]uit.")
         if preview:
             parts.append(f"Preview saved to: {preview}")
         return "\n".join(parts) + "\n> "
@@ -252,6 +295,9 @@ class ReviewSession:
         recognised: str,
         corrected: str,
         snippet_path: Path,
+        *,
+        tesseract_guess: Optional[str] = None,
+        gpt_guess: Optional[str] = None,
     ) -> None:
         entry = {
             "key": key,
@@ -266,6 +312,10 @@ class ReviewSession:
             "corrected": corrected,
             "snippet": str(snippet_path),
         }
+        if tesseract_guess is not None:
+            entry["tesseract"] = tesseract_guess
+        if gpt_guess is not None:
+            entry["gpt_guess"] = gpt_guess
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
         self._processed_keys.add(key)
@@ -282,6 +332,67 @@ class ReviewSession:
         for path in sorted(folder.iterdir()):
             if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
                 yield path
+
+    def _maybe_transcribe_with_gpt(
+        self,
+        snippet: np.ndarray,
+        image_path: Path,
+        tesseract_guess: str,
+    ) -> Optional[str]:
+        if not self._should_use_gpt():
+            return None
+
+        temp_path: Optional[Path] = None
+        try:
+            with NamedTemporaryFile(suffix=".png", delete=False) as handle:
+                success = cv2.imwrite(handle.name, snippet)
+                temp_path = Path(handle.name)
+            if not success or temp_path is None:
+                return None
+            hint = f"Tesseract OCR guess: {tesseract_guess}" if tesseract_guess else None
+            text = self._transcriber.transcribe(temp_path, hint_text=hint, use_cache=False)
+        except GPTTranscriptionError as exc:
+            logging.error(
+                "ChatGPT OCR failed for snippet from %s: %s",
+                image_path.name,
+                exc,
+            )
+            return None
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+        text = text.strip()
+        if not text:
+            return None
+
+        self._gpt_transcriptions += 1
+        logging.info(
+            "ChatGPT OCR suggestion for %s: %s",
+            image_path.name,
+            text,
+        )
+        return text
+
+    def _should_use_gpt(self) -> bool:
+        if self._transcriber is None:
+            return False
+        if self._gpt_max_images is None:
+            return True
+        if self._gpt_max_images <= 0:
+            return False
+        if self._gpt_transcriptions < self._gpt_max_images:
+            return True
+        if not self._gpt_limit_logged:
+            logging.info(
+                "ChatGPT OCR limit of %d snippet(s) reached; falling back to Tesseract suggestions.",
+                self._gpt_max_images,
+            )
+            self._gpt_limit_logged = True
+        return False
 
 
 __all__ = ["ReviewConfig", "ReviewSession", "ReviewAborted"]
