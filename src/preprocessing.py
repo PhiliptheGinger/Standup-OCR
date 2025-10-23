@@ -14,7 +14,13 @@ import logging
 PathLike = Union[str, Path]
 
 
-def preprocess_image(image_path: PathLike, *, resize_width: int = 1800, adaptive: bool = True) -> np.ndarray:
+def preprocess_image(
+    image_path: PathLike,
+    *,
+    resize_width: int = 1800,
+    adaptive: bool = True,
+    force_landscape: bool = False,
+) -> np.ndarray:
     """Load and preprocess an image so it is ready for OCR.
 
     Parameters
@@ -32,6 +38,10 @@ def preprocess_image(image_path: PathLike, *, resize_width: int = 1800, adaptive
     adaptive:
         If ``True`` (default) use adaptive thresholding, otherwise fall back to
         Otsu's global threshold.
+    force_landscape:
+        When ``True`` rotate portrait images counterclockwise so that the output
+        is landscape oriented. Portrait images remain upright by default unless
+        EXIF metadata explicitly requests a rotation.
 
     Returns
     -------
@@ -72,8 +82,8 @@ def preprocess_image(image_path: PathLike, *, resize_width: int = 1800, adaptive
         # If EXIF data is unavailable or unreadable, proceed without rotating.
         pass
 
-    # Normalize orientation so that images are landscape when possible.
-    if image.shape[0] > image.shape[1]:
+    # Optionally normalize orientation so that images are landscape.
+    if force_landscape and image.shape[0] > image.shape[1]:
         image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
