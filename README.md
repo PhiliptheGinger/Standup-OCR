@@ -60,6 +60,10 @@ Key behaviour:
 * Use `--no-preview` on headless systems to disable image previews. Otherwise
   the tool attempts to display each snippet using `PIL.Image.show()` and falls
   back to logging the path of a temporary PNG file when required.
+* When ChatGPT OCR is enabled the review tool first requests a full-page
+  transcription so each snippet defaults to coherent text. Pass
+  `--no-full-image-gpt` to skip that pass or `--full-image-gpt` to force it
+  when disabled globally.
 
 During review you can:
 
