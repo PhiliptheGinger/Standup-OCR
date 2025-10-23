@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Callable, Iterable, Iterator, Optional, Set
+from typing import Callable, Iterable, Iterator, Optional, Sequence, Set
 
 import cv2
 import numpy as np
@@ -32,6 +33,7 @@ class ReviewConfig:
     psm: int = 6
     train_dir: Path = Path("train")
     preview: bool = True
+    full_image_gpt: bool = True
 
 
 class ReviewSession:
@@ -109,6 +111,22 @@ class ReviewSession:
 
         saved = 0
         image_height, image_width = processed.shape[:2]
+        full_image_tokens = self._prepare_full_image_suggestions(
+            image_path, processed, detailed
+        )
+        full_image_index = 0
+
+        def consume_full_image_suggestion() -> Optional[str]:
+            nonlocal full_image_index
+            if not full_image_tokens:
+                return None
+            while full_image_index < len(full_image_tokens):
+                suggestion = full_image_tokens[full_image_index].strip()
+                full_image_index += 1
+                if suggestion:
+                    return suggestion
+            return None
+
         for _, row in candidates.iterrows():
             bbox = self._extract_bbox(row, image_width, image_height)
             if bbox is None:
@@ -124,9 +142,16 @@ class ReviewSession:
 
             tesseract_guess = row.get("text", "")
             recognised = tesseract_guess
+            full_image_guess = consume_full_image_suggestion()
             gpt_guess = self._maybe_transcribe_with_gpt(snippet, image_path, tesseract_guess)
             if gpt_guess:
                 recognised = gpt_guess
+            elif full_image_guess and (
+                not recognised or len(recognised) <= 2
+            ):
+                recognised = full_image_guess
+            elif not recognised and full_image_guess:
+                recognised = full_image_guess
 
             preview_location = self._preview_snippet(snippet)
             prompt = self._build_prompt(
@@ -136,6 +161,7 @@ class ReviewSession:
                 recognised,
                 tesseract_guess,
                 gpt_guess,
+                full_image_guess,
             )
             corrected = self._prompt_for_text(prompt, recognised)
             if corrected is None:
@@ -151,6 +177,7 @@ class ReviewSession:
                 snippet_path,
                 tesseract_guess=tesseract_guess,
                 gpt_guess=gpt_guess,
+                full_image_guess=full_image_guess,
             )
             saved += 1
             self.saved_samples += 1
@@ -221,6 +248,7 @@ class ReviewSession:
         recognised: str,
         tesseract_guess: str,
         gpt_guess: Optional[str],
+        full_image_guess: Optional[str],
     ) -> str:
         parts = [
             f"Image: {image_path.name}",
@@ -229,6 +257,10 @@ class ReviewSession:
         if gpt_guess:
             parts.append(f"Suggested (ChatGPT): '{gpt_guess}'")
             if tesseract_guess and tesseract_guess != gpt_guess:
+                parts.append(f"Tesseract OCR: '{tesseract_guess}'")
+        elif full_image_guess:
+            parts.append(f"Suggested (Full image GPT): '{full_image_guess}'")
+            if tesseract_guess and tesseract_guess != full_image_guess:
                 parts.append(f"Tesseract OCR: '{tesseract_guess}'")
         else:
             parts.append(f"Recognised: '{tesseract_guess}'")
@@ -298,6 +330,7 @@ class ReviewSession:
         *,
         tesseract_guess: Optional[str] = None,
         gpt_guess: Optional[str] = None,
+        full_image_guess: Optional[str] = None,
     ) -> None:
         entry = {
             "key": key,
@@ -316,6 +349,8 @@ class ReviewSession:
             entry["tesseract"] = tesseract_guess
         if gpt_guess is not None:
             entry["gpt_guess"] = gpt_guess
+        if full_image_guess is not None:
+            entry["full_image_guess"] = full_image_guess
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
         self._processed_keys.add(key)
@@ -372,6 +407,89 @@ class ReviewSession:
         self._gpt_transcriptions += 1
         logging.info(
             "ChatGPT OCR suggestion for %s: %s",
+            image_path.name,
+            text,
+        )
+        return text
+
+    def _prepare_full_image_suggestions(
+        self,
+        image_path: Path,
+        processed: np.ndarray,
+        detailed,
+    ) -> Optional[Sequence[str]]:
+        if not self.config.full_image_gpt:
+            return None
+        if self._transcriber is None:
+            logging.debug(
+                "Full-image GPT transcription skipped for %s because GPT OCR is disabled.",
+                image_path,
+            )
+            return None
+        hint_text = self._build_full_image_hint(detailed)
+        text = self._transcribe_full_image(processed, image_path, hint_text)
+        if not text:
+            return None
+        tokens = [token for token in re.split(r"\s+", text) if token]
+        if not tokens:
+            return None
+        return tokens
+
+    def _build_full_image_hint(self, detailed) -> Optional[str]:
+        if detailed is None or detailed.empty:
+            return None
+        texts = [
+            str(value).strip()
+            for value in detailed.get("text", [])
+            if isinstance(value, str) and value.strip()
+        ]
+        if not texts:
+            return None
+        joined = " ".join(texts)
+        return f"Tesseract OCR full text: {joined}"
+
+    def _transcribe_full_image(
+        self,
+        image: np.ndarray,
+        image_path: Path,
+        hint_text: Optional[str],
+    ) -> Optional[str]:
+        if not self._should_use_gpt():
+            return None
+
+        temp_path: Optional[Path] = None
+        try:
+            with NamedTemporaryFile(suffix=".png", delete=False) as handle:
+                success = cv2.imwrite(handle.name, image)
+                temp_path = Path(handle.name)
+            if not success or temp_path is None:
+                return None
+            text = self._transcriber.transcribe(
+                temp_path,
+                hint_text=hint_text,
+                use_cache=False,
+            )
+        except GPTTranscriptionError as exc:
+            logging.error(
+                "ChatGPT OCR failed for %s during full-image pass: %s",
+                image_path.name,
+                exc,
+            )
+            return None
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+        text = text.strip()
+        if not text:
+            return None
+
+        self._gpt_transcriptions += 1
+        logging.info(
+            "ChatGPT OCR full-image suggestion for %s: %s",
             image_path.name,
             text,
         )

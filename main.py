@@ -274,6 +274,9 @@ def handle_review(args: argparse.Namespace) -> None:
         psm=args.psm,
         train_dir=args.train_dir,
         preview=not args.no_preview,
+        full_image_gpt=(
+            args.full_image_gpt if args.full_image_gpt is not None else True
+        ),
     )
     session: ReviewSession
     last_trained_count = 0
@@ -719,6 +722,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable snippet previews (useful on headless systems).",
     )
+    full_image_group = review_parser.add_mutually_exclusive_group()
+    full_image_group.add_argument(
+        "--full-image-gpt",
+        dest="full_image_gpt",
+        action="store_true",
+        help=(
+            "Request a ChatGPT transcription of the entire page before reviewing "
+            "individual snippets."
+        ),
+    )
+    full_image_group.add_argument(
+        "--no-full-image-gpt",
+        dest="full_image_gpt",
+        action="store_false",
+        help=(
+            "Skip the ChatGPT full-image transcription pass and only suggest per-snippet "
+            "guesses."
+        ),
+    )
+    review_parser.set_defaults(full_image_gpt=None)
     add_gpt_arguments(review_parser)
     review_parser.set_defaults(func=handle_review)
 
