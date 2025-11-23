@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Fine-tune the Standup-OCR model on a structured JSON dataset."""
+
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -127,84 +130,84 @@ def prepare_training_pairs(entries: list, images_dir: Path, train_dir: Path, off
 
 
 def split_dataset(paths: list[Path], validation_split: float, seed: int) -> tuple[list[Path], list[Path]]:
-	"""Split the dataset into train and validation subsets."""
-	if not 0.0 < validation_split < 1.0:
-		return paths, []
-	random.seed(seed)
-	random.shuffle(paths)
-	cutoff = int(len(paths) * (1.0 - validation_split))
-	return paths[:cutoff], paths[cutoff:]
+    """Split the dataset into train and validation subsets."""
+    if not 0.0 < validation_split < 1.0:
+        return paths, []
+    random.seed(seed)
+    random.shuffle(paths)
+    cutoff = int(len(paths) * (1.0 - validation_split))
+    return paths[:cutoff], paths[cutoff:]
 
 
 def relocate_validation_pairs(validation_pairs: list[Path], train_dir: Path) -> list[Path]:
-	"""Move validation samples to a dedicated folder to keep training data clean."""
-	if not validation_pairs:
-		return []
-	val_dir = train_dir / "validation"
-	val_dir.mkdir(parents=True, exist_ok=True)
-	moved: list[Path] = []
-	for image_path in validation_pairs:
-		destination = val_dir / image_path.name
-		shutil.move(image_path, destination)
-		gt_src = image_path.with_suffix(".gt.txt")
-		gt_dest = destination.with_suffix(".gt.txt")
-		if gt_src.exists():
-			shutil.move(gt_src, gt_dest)
-		moved.append(destination)
-	return moved
+    """Move validation samples to a dedicated folder to keep training data clean."""
+    if not validation_pairs:
+        return []
+    val_dir = train_dir / "validation"
+    val_dir.mkdir(parents=True, exist_ok=True)
+    moved: list[Path] = []
+    for image_path in validation_pairs:
+        destination = val_dir / image_path.name
+        shutil.move(image_path, destination)
+        gt_src = image_path.with_suffix(".gt.txt")
+        gt_dest = destination.with_suffix(".gt.txt")
+        if gt_src.exists():
+            shutil.move(gt_src, gt_dest)
+        moved.append(destination)
+    return moved
 
 
 def evaluate_model(model_name: str, model_dir: Path, validation_pairs: list[Path]) -> float:
-	"""Run Tesseract on validation images and return average character accuracy."""
-	if not validation_pairs:
-		return 0.0
-	correct = 0
-	total = 0
-	for image_path in validation_pairs:
-		gt_path = image_path.with_suffix(".gt.txt")
-		if not gt_path.exists():
-			logging.warning("Missing GT file for validation image %s", image_path.name)
-			continue
-		ground_truth = gt_path.read_text(encoding="utf-8").replace("\r", "").strip()
-		try:
-			predicted = run_tesseract_ocr(image_path, model_name, model_dir)
-		except RuntimeError as exc:
-			logging.warning("Tesseract evaluation failed for %s: %s", image_path.name, exc)
-			continue
-		if not ground_truth:
-			continue
-		correct += count_matching_characters(ground_truth, predicted)
-		total += len(ground_truth)
-	if total == 0:
-		return 0.0
-	return correct / total
+    """Run Tesseract on validation images and return average character accuracy."""
+    if not validation_pairs:
+        return 0.0
+    correct = 0
+    total = 0
+    for image_path in validation_pairs:
+        gt_path = image_path.with_suffix(".gt.txt")
+        if not gt_path.exists():
+            logging.warning("Missing GT file for validation image %s", image_path.name)
+            continue
+        ground_truth = gt_path.read_text(encoding="utf-8").replace("\r", "").strip()
+        try:
+            predicted = run_tesseract_ocr(image_path, model_name, model_dir)
+        except RuntimeError as exc:
+            logging.warning("Tesseract evaluation failed for %s: %s", image_path.name, exc)
+            continue
+        if not ground_truth:
+            continue
+        correct += count_matching_characters(ground_truth, predicted)
+        total += len(ground_truth)
+    if total == 0:
+        return 0.0
+    return correct / total
 
 
 def run_tesseract_ocr(image_path: Path, model_name: str, model_dir: Path) -> str:
-	"""Run Tesseract with the fine-tuned model and return the OCR text."""
-	command = [
-		"tesseract",
-		str(image_path),
-		"stdout",
-		"-l",
-		model_name,
-		"--tessdata-dir",
-		str(model_dir),
-		"--psm",
-		"6",
-	]
-	try:
-		result = subprocess.run(command, capture_output=True, text=True)
-	except FileNotFoundError as exc:
-		raise RuntimeError("Tesseract is not installed or not in PATH") from exc
-	if result.returncode != 0:
-		raise RuntimeError((result.stderr or result.stdout or "").strip())
-	return (result.stdout or "").replace("\r", "").strip()
+    """Run Tesseract with the fine-tuned model and return the OCR text."""
+    command = [
+        "tesseract",
+        str(image_path),
+        "stdout",
+        "-l",
+        model_name,
+        "--tessdata-dir",
+        str(model_dir),
+        "--psm",
+        "6",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("Tesseract is not installed or not in PATH") from exc
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "").strip())
+    return (result.stdout or "").replace("\r", "").strip()
 
 
 def count_matching_characters(reference: str, candidate: str) -> int:
-	"""Count character-level matches between two strings."""
-	return sum(1 for ref_char, cand_char in zip(reference, candidate) if ref_char == cand_char)
+    """Count character-level matches between two strings."""
+    return sum(1 for ref_char, cand_char in zip(reference, candidate) if ref_char == cand_char)
 
 
 def parse_args() -> argparse.Namespace:
@@ -223,59 +226,59 @@ def parse_args() -> argparse.Namespace:
 
 
 def derive_model_paths(output_dir: Path) -> tuple[str, Path]:
-	"""Return the output model name and parent directory."""
-	output_dir = output_dir.resolve()
-	if output_dir.suffix:
-		return output_dir.stem, output_dir.parent
-	return output_dir.name, output_dir.parent
+    """Return the output model name and parent directory."""
+    output_dir = output_dir.resolve()
+    if output_dir.suffix:
+        return output_dir.stem, output_dir.parent
+    return output_dir.name, output_dir.parent
 
 
 def resolve_base_lang_and_dir(base_model_arg: str) -> tuple[str, Path | None]:
-	"""Derive the base language code and tessdata directory from CLI input."""
-	base_path = Path(base_model_arg)
-	if base_path.suffix:
-		return base_path.stem, base_path.parent if base_path.parent != Path("") else None
-	return base_model_arg, None
+    """Derive the base language code and tessdata directory from CLI input."""
+    base_path = Path(base_model_arg)
+    if base_path.suffix:
+        return base_path.stem, base_path.parent if base_path.parent != Path("") else None
+    return base_model_arg, None
 
 
 def main() -> None:
-	args = parse_args()
-	logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s: %(message)s")
-	logging.info("Loading dataset from %s", args.json)
-	entries = load_pages(args.json)
-	logging.info("Loaded %d page entries", len(entries))
+    args = parse_args()
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s: %(message)s")
+    logging.info("Loading dataset from %s", args.json)
+    entries = load_pages(args.json)
+    logging.info("Loaded %d page entries", len(entries))
 
 	train_dir = args.train_dir
 	prepared_images = prepare_training_pairs(entries, args.images, train_dir, args.offset)
 
-	train_subset, val_subset = split_dataset(prepared_images, args.validation_split, args.seed)
-	if val_subset:
-		val_subset = relocate_validation_pairs(val_subset, train_dir)
-		logging.info("Reserved %d sample(s) for validation", len(val_subset))
-	if train_subset != prepared_images:
-		logging.info("Using %d sample(s) for training", len(train_subset))
+    train_subset, val_subset = split_dataset(prepared_images, args.validation_split, args.seed)
+    if val_subset:
+        val_subset = relocate_validation_pairs(val_subset, train_dir)
+        logging.info("Reserved %d sample(s) for validation", len(val_subset))
+    if train_subset != prepared_images:
+        logging.info("Using %d sample(s) for training", len(train_subset))
 
-	output_model, model_dir = derive_model_paths(args.output_dir)
-	base_lang, tessdata_dir = resolve_base_lang_and_dir(args.base_model)
+    output_model, model_dir = derive_model_paths(args.output_dir)
+    base_lang, tessdata_dir = resolve_base_lang_and_dir(args.base_model)
 
-	train_result = train_model(
-		train_dir=train_dir,
-		output_model=output_model,
-		model_dir=model_dir if str(model_dir) else None,
-		base_lang=base_lang,
-		max_iterations=args.max_iter,
-		use_gpt_ocr=False,
-		tessdata_dir=tessdata_dir,
-	)
+    train_result = train_model(
+        train_dir=train_dir,
+        output_model=output_model,
+        model_dir=model_dir if str(model_dir) else None,
+        base_lang=base_lang,
+        max_iterations=args.max_iter,
+        use_gpt_ocr=False,
+        tessdata_dir=tessdata_dir,
+    )
 
-	logging.info("Training finished: %s", train_result)
+    logging.info("Training finished: %s", train_result)
 
-	if val_subset:
-		accuracy = evaluate_model(output_model, model_dir, val_subset)
-		logging.info("Validation character accuracy: %.2f%%", accuracy * 100)
+    if val_subset:
+        accuracy = evaluate_model(output_model, model_dir, val_subset)
+        logging.info("Validation character accuracy: %.2f%%", accuracy * 100)
 
-	logging.info("Processed %d training pair(s) from %s", len(prepared_images), args.json)
+    logging.info("Processed %d training pair(s) from %s", len(prepared_images), args.json)
 
 
 if __name__ == "__main__":
-	main()
+    main()
