@@ -15,58 +15,103 @@ SUPPORTED_EXTENSIONS: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff
 
 
 def load_pages(json_path: Path) -> list:
-	"""Load and return page entries from the dataset JSON file."""
-	with json_path.open("r", encoding="utf-8") as handle:
-		return json.load(handle)
+        """Load and return page entries from the dataset JSON file.
+
+        Supports both a bare list of entries and the structured format that
+        wraps entries inside a top-level object containing metadata such as
+        notebooks/file_numbers.
+        """
+
+        with json_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+
+        if isinstance(data, list):
+                return data
+
+        if isinstance(data, dict) and isinstance(data.get("entries"), list):
+                return data["entries"]
+
+        raise ValueError("JSON format not recognized: expected a list or an object with an 'entries' list")
 
 
 def build_training_text(entry: dict) -> str:
 	"""Construct the training string from a single page entry."""
+
+	indent_levels = {
+		"main": 0,
+		"sub": 1,
+		"subsub": 2,
+		"sub3": 3,
+	}
+
 	segments: List[str] = []
-	if entry.get("title"):
-		segments.append(str(entry["title"]))
+	title = entry.get("title")
+	if title:
+		segments.append(str(title))
 	for line in entry.get("lines", []):
 		arrow = line.get("arrow", "main")
 		text = line.get("text", "")
 		if not text:
 			continue
-		prefix = "	" if arrow != "main" else ""
+		level = indent_levels.get(arrow, 1 if arrow != "main" else 0)
+		prefix = "	" * level
 		segments.append(f"{prefix}{text}")
 	return "\n".join(segments)
 
+def _numeric_candidates(number: int | None, fallback_index: int) -> Iterable[str]:
+	"""Yield common numeric filename variants for a page or file number."""
 
-def _candidate_names(page: int | None, index: int) -> Iterable[str]:
-	if page is None:
-		base_num = index + 1
-		yield f"page{base_num:03d}"
-		yield f"page{base_num}"
-		yield str(base_num)
-		return
-	base = f"page{page:03d}"
-	yield base
-	yield f"page{page}"
-	yield str(page)
+	if number is None:
+		number = fallback_index + 1
+
+	yield f"{number}"
+	yield f"{number:03d}"
+	yield f"page{number}"
+	yield f"page{number:03d}"
 
 
-def locate_image(entry: dict, images_dir: Path, index: int) -> Path:
+
+def locate_image(entry: dict, images_dir: Path, index: int, offset: int) -> Path:
 	"""Find the matching image file for a dataset entry."""
+
 	images_dir = images_dir.resolve()
 	page_value = entry.get("page")
-	for name in _candidate_names(page_value, index):
+
+	file_number = entry.get("file_number")
+	if isinstance(file_number, int):
+		actual_number = file_number + offset
+	else:
+		actual_number = None
+
+	candidate_names: list[str] = []
+	if actual_number is not None:
+		candidate_names.extend(_numeric_candidates(actual_number, index))
+	candidate_names.extend(_numeric_candidates(page_value if isinstance(page_value, int) else None, index))
+
+	for name in candidate_names:
 		for ext in SUPPORTED_EXTENSIONS:
 			candidate = images_dir / f"{name}{ext}"
 			if candidate.exists():
 				return candidate
-	raise FileNotFoundError(f"Could not find image for entry {index + 1} (page={page_value}) in {images_dir}")
+
+	raise FileNotFoundError(
+		f"Could not find image for entry {index + 1} (page={page_value}, file_number={file_number}) in {images_dir}"
+	)
 
 
-def prepare_training_pairs(entries: list, images_dir: Path, train_dir: Path) -> list[Path]:
+
+def prepare_training_pairs(entries: list, images_dir: Path, train_dir: Path, offset: int) -> list[Path]:
 	"""Write .gt.txt files and copy images to the training directory."""
+
 	train_dir.mkdir(parents=True, exist_ok=True)
 	written: list[Path] = []
 	for idx, entry in enumerate(entries):
+		if not isinstance(entry, dict):
+			logging.warning("Skipping non-dictionary entry at index %d", idx)
+			continue
+
 		logging.info("Processing entry %d", idx + 1)
-		image_path = locate_image(entry, images_dir, idx)
+		image_path = locate_image(entry, images_dir, idx, offset)
 		text = build_training_text(entry)
 		if not text.strip():
 			logging.warning("Skipping empty transcription for entry %d (%s)", idx + 1, image_path.name)
@@ -163,17 +208,18 @@ def count_matching_characters(reference: str, candidate: str) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-	parser = argparse.ArgumentParser(description="Fine-tune the Standup-OCR model on a structured dataset")
-	parser.add_argument("--json", required=True, type=Path, help="Path to standup_option_c.json")
-	parser.add_argument("--images", required=True, type=Path, help="Directory containing page images")
-	parser.add_argument("--train-dir", default=Path("data/train/images"), type=Path, help="Output directory for training pairs")
-	parser.add_argument("--output-dir", required=True, type=Path, help="Directory (and model name) for training artefacts, e.g. models/finetuned")
-	parser.add_argument("--base-model", default="eng.traineddata", help="Base traineddata file or language code")
-	parser.add_argument("--max-iter", type=int, default=1000, help="Maximum training iterations")
-	parser.add_argument("--validation-split", type=float, default=0.0, help="Optional validation split (0-1)")
-	parser.add_argument("--seed", type=int, default=42, help="Random seed for shuffling")
-	parser.add_argument("--log-level", default="INFO", help="Logging level")
-	return parser.parse_args()
+        parser = argparse.ArgumentParser(description="Fine-tune the Standup-OCR model on a structured dataset")
+        parser.add_argument("--json", required=True, type=Path, help="Path to standup_option_c.json")
+        parser.add_argument("--images", required=True, type=Path, help="Directory containing page images")
+        parser.add_argument("--train-dir", default=Path("data/train/images"), type=Path, help="Output directory for training pairs")
+        parser.add_argument("--offset", type=int, default=0, help="Offset to add to file_number when deriving image filenames")
+        parser.add_argument("--output-dir", required=True, type=Path, help="Directory (and model name) for training artefacts, e.g. models/finetuned")
+        parser.add_argument("--base-model", default="eng.traineddata", help="Base traineddata file or language code")
+        parser.add_argument("--max-iter", type=int, default=1000, help="Maximum training iterations")
+        parser.add_argument("--validation-split", type=float, default=0.0, help="Optional validation split (0-1)")
+        parser.add_argument("--seed", type=int, default=42, help="Random seed for shuffling")
+        parser.add_argument("--log-level", default="INFO", help="Logging level")
+        return parser.parse_args()
 
 
 def derive_model_paths(output_dir: Path) -> tuple[str, Path]:
@@ -200,7 +246,7 @@ def main() -> None:
 	logging.info("Loaded %d page entries", len(entries))
 
 	train_dir = args.train_dir
-	prepared_images = prepare_training_pairs(entries, args.images, train_dir)
+	prepared_images = prepare_training_pairs(entries, args.images, train_dir, args.offset)
 
 	train_subset, val_subset = split_dataset(prepared_images, args.validation_split, args.seed)
 	if val_subset:
