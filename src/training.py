@@ -398,7 +398,9 @@ def _is_fast_model(base_lang: str, base_traineddata: Path, extracted_dir: Path) 
     return any(token in combined_hints for token in fast_tokens)
 
 
-def _get_unicharset_size(base_traineddata: Path) -> Optional[int]:
+def _get_unicharset_size(
+    base_traineddata: Path, extracted_dir: Path, base_lang: str
+) -> Optional[int]:
     """Return the number of characters in the traineddata unicharset if available."""
 
     try:
@@ -409,11 +411,28 @@ def _get_unicharset_size(base_traineddata: Path) -> Optional[int]:
             check=True,
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
+        result = None
+    else:
+        output = (result.stdout or "") + (result.stderr or "")
+        match = re.search(r"unicharset size:\s*(\d+)", output, re.IGNORECASE)
+        if match:
+            size = int(match.group(1))
+            logging.debug("Detected unicharset size %s from combine_tessdata", size)
+            return size
 
-    output = (result.stdout or "") + (result.stderr or "")
-    match = re.search(r"unicharset size:\s*(\d+)", output, re.IGNORECASE)
-    return int(match.group(1)) if match else None
+    unicharset_path = extracted_dir / f"{base_lang}.lstm-unicharset"
+    if unicharset_path.exists():
+        try:
+            lines = [line for line in unicharset_path.read_text(errors="ignore").splitlines() if line.strip()]
+        except OSError:
+            logging.debug("Unable to read %s to determine unicharset size", unicharset_path)
+        else:
+            if lines:
+                size = len(lines)
+                logging.debug("Detected unicharset size %s from %s", size, unicharset_path)
+                return size
+
+    return None
 
 
 def train_model(
@@ -568,7 +587,7 @@ def train_model(
 
     checkpoint_prefix = work_dir / f"{output_model}_checkpoint"
     fast_model = _is_fast_model(base_lang, base_traineddata, extracted_dir)
-    unicharset_size = _get_unicharset_size(base_traineddata)
+    unicharset_size = _get_unicharset_size(base_traineddata, extracted_dir, base_lang)
 
     def _run_lstmtraining(command: list[str]) -> subprocess.CompletedProcess[str]:
         logging.info("Running: %s", " ".join(str(p) for p in command))
