@@ -17,7 +17,7 @@ from src.training import train_model
 SUPPORTED_EXTENSIONS: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
 
-def load_pages(json_path: Path) -> list[dict]:
+def load_pages(json_path: Path) -> tuple[list[dict], list[int]]:
     """Load and normalize page entries from the dataset JSON file.
 
     Supports both a bare list of entries and the structured format that
@@ -31,8 +31,10 @@ def load_pages(json_path: Path) -> list[dict]:
 
     if isinstance(data, list):
         raw_entries = data
+        file_numbers: list[int] = []
     elif isinstance(data, dict) and isinstance(data.get("entries"), list):
         raw_entries = data["entries"]
+        file_numbers = [num for num in data.get("file_numbers", []) if isinstance(num, int)]
     else:
         raise ValueError("JSON format not recognized: expected a list or an object with an 'entries' list")
 
@@ -42,7 +44,7 @@ def load_pages(json_path: Path) -> list[dict]:
             logging.warning("Skipping non-dictionary entry at index %d in JSON", idx)
             continue
         entries.append(entry)
-    return entries
+    return entries, file_numbers
 
 
 def build_training_text(entry: dict) -> str:
@@ -82,7 +84,9 @@ def _numeric_candidates(number: int | None, fallback_index: int) -> Iterable[str
     yield f"page{number:03d}"
 
 
-def locate_image(entry: dict, images_dir: Path, index: int, offset: int) -> Path:
+def locate_image(
+    entry: dict, images_dir: Path, index: int, offset: int, file_numbers: list[int]
+) -> Path:
     """Find the matching image file for a dataset entry."""
 
     images_dir = images_dir.resolve()
@@ -92,12 +96,17 @@ def locate_image(entry: dict, images_dir: Path, index: int, offset: int) -> Path
     page_value = entry.get("page")
 
     file_number = entry.get("file_number")
-    if isinstance(file_number, int):
-        actual_number = file_number + offset
-    else:
-        actual_number = None
+    actual_number = file_number + offset if isinstance(file_number, int) else None
+
+    mapped_number = None
+    if isinstance(file_number, int) and file_numbers:
+        index_key = file_number - 1 if file_number > 0 else file_number
+        if 0 <= index_key < len(file_numbers):
+            mapped_number = file_numbers[index_key]
 
     candidate_names: list[str] = []
+    if mapped_number is not None:
+        candidate_names.extend(_numeric_candidates(mapped_number, index))
     if actual_number is not None:
         candidate_names.extend(_numeric_candidates(actual_number, index))
     candidate_names.extend(_numeric_candidates(page_value if isinstance(page_value, int) else None, index))
@@ -113,7 +122,9 @@ def locate_image(entry: dict, images_dir: Path, index: int, offset: int) -> Path
     )
 
 
-def prepare_training_pairs(entries: list, images_dir: Path, train_dir: Path, offset: int) -> list[Path]:
+def prepare_training_pairs(
+    entries: list, images_dir: Path, train_dir: Path, offset: int, file_numbers: list[int]
+) -> list[Path]:
     """Write .gt.txt files and copy images to the training directory."""
 
     train_dir.mkdir(parents=True, exist_ok=True)
@@ -124,7 +135,7 @@ def prepare_training_pairs(entries: list, images_dir: Path, train_dir: Path, off
             continue
 
         logging.info("Processing entry %d", idx + 1)
-        image_path = locate_image(entry, images_dir, idx, offset)
+        image_path = locate_image(entry, images_dir, idx, offset, file_numbers)
         text = build_training_text(entry)
         if not text.strip():
             logging.warning("Skipping empty transcription for entry %d (%s)", idx + 1, image_path.name)
@@ -295,11 +306,13 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s: %(message)s")
     logging.info("Loading dataset from %s", args.json)
-    entries = load_pages(args.json)
+    entries, file_numbers = load_pages(args.json)
     logging.info("Loaded %d page entries", len(entries))
 
     train_dir = args.train_dir
-    prepared_images = prepare_training_pairs(entries, args.images, train_dir, args.offset)
+    prepared_images = prepare_training_pairs(
+        entries, args.images, train_dir, args.offset, file_numbers
+    )
 
     train_subset, val_subset = split_dataset(prepared_images, args.validation_split, args.seed)
     if val_subset:
