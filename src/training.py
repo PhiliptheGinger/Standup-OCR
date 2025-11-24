@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import os
 import shutil
 import subprocess
@@ -392,8 +393,27 @@ def _is_fast_model(base_lang: str, base_traineddata: Path, extracted_dir: Path) 
         "modeltype int",
         "network type: int",
         "integer mode",
+        "integer (fast) model",
     )
     return any(token in combined_hints for token in fast_tokens)
+
+
+def _get_unicharset_size(base_traineddata: Path) -> Optional[int]:
+    """Return the number of characters in the traineddata unicharset if available."""
+
+    try:
+        result = subprocess.run(
+            ["combine_tessdata", "-d", str(base_traineddata)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+    output = (result.stdout or "") + (result.stderr or "")
+    match = re.search(r"unicharset size:\s*(\d+)", output, re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
 
 def train_model(
@@ -548,6 +568,7 @@ def train_model(
 
     checkpoint_prefix = work_dir / f"{output_model}_checkpoint"
     fast_model = _is_fast_model(base_lang, base_traineddata, extracted_dir)
+    unicharset_size = _get_unicharset_size(base_traineddata)
 
     def _run_lstmtraining(command: list[str]) -> subprocess.CompletedProcess[str]:
         logging.info("Running: %s", " ".join(str(p) for p in command))
@@ -581,10 +602,19 @@ def train_model(
         str(max_iterations),
     ]
 
+    if unicharset_size is None:
+        logging.warning(
+            "Unable to determine unicharset size from %s; using a 1-output scratch network.",
+            base_traineddata,
+        )
+        net_spec = "[1,48,0,1 Lfx128 O1c1]"
+    else:
+        net_spec = f"[1,48,0,1 Lfx128 O1c{unicharset_size}]"
+
     scratch_cmd = [
         "lstmtraining",
         "--net_spec",
-        "[1,48,0,1 Lfx128 O1c1]",
+        net_spec,
         "--model_output",
         str(checkpoint_prefix),
         "--traineddata",
@@ -599,6 +629,7 @@ def train_model(
         "failed to deserialize lstmtrainer",
         "failed to read continue from network",
         "deserialize header failed",
+        "integer (fast) model",
     )
 
     if fast_model:
@@ -613,10 +644,16 @@ def train_model(
         if result.returncode != 0:
             output = ((result.stderr or "") + (result.stdout or "")).lower()
             if any(token in output for token in continue_error_tokens):
-                logging.warning(
-                    "Base model %s cannot be continued. Falling back to training from scratch.",
-                    lstm_path,
-                )
+                if "integer (fast) model" in output:
+                    logging.warning(
+                        "Base model %s is integer-only according to training output; starting from scratch.",
+                        lstm_path,
+                    )
+                else:
+                    logging.warning(
+                        "Base model %s cannot be continued. Falling back to training from scratch.",
+                        lstm_path,
+                    )
                 result = _run_lstmtraining(scratch_cmd)
                 _ensure_success(result, "Training (fresh network)")
             else:
