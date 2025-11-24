@@ -392,6 +392,7 @@ def _is_fast_model(base_lang: str, base_traineddata: Path, extracted_dir: Path) 
         "modeltype int",
         "network type: int",
         "integer mode",
+        "integer (fast) model",
     )
     return any(token in combined_hints for token in fast_tokens)
 
@@ -599,6 +600,7 @@ def train_model(
         "failed to deserialize lstmtrainer",
         "failed to read continue from network",
         "deserialize header failed",
+        "integer (fast) model",
     )
 
     if fast_model:
@@ -613,10 +615,16 @@ def train_model(
         if result.returncode != 0:
             output = ((result.stderr or "") + (result.stdout or "")).lower()
             if any(token in output for token in continue_error_tokens):
-                logging.warning(
-                    "Base model %s cannot be continued. Falling back to training from scratch.",
-                    lstm_path,
-                )
+                if "integer (fast) model" in output:
+                    logging.warning(
+                        "Base model %s is integer-only according to training output; starting from scratch.",
+                        lstm_path,
+                    )
+                else:
+                    logging.warning(
+                        "Base model %s cannot be continued. Falling back to training from scratch.",
+                        lstm_path,
+                    )
                 result = _run_lstmtraining(scratch_cmd)
                 _ensure_success(result, "Training (fresh network)")
             else:
