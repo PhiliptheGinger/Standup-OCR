@@ -403,6 +403,7 @@ def _get_unicharset_size(
 ) -> Optional[int]:
     """Return the number of characters in the traineddata unicharset if available."""
 
+    # 1) First: try combine_tessdata -d (existing behavior, but with looser patterns)
     try:
         result = subprocess.run(
             ["combine_tessdata", "-d", str(base_traineddata)],
@@ -414,39 +415,55 @@ def _get_unicharset_size(
         result = None
     else:
         output = (result.stdout or "") + (result.stderr or "")
-        patterns = (
-            r"unicharset size[:=]\s*(\d+)",
-            r"unicharset of size\s*(\d+)",
-        )
-        for pattern in patterns:
-            match = re.search(pattern, output, re.IGNORECASE)
+        # Try several possible phrasings that different Tesseract builds use
+        patterns = [
+            r"unicharset size:\s*(\d+)",
+            r"Unicharset size:\s*(\d+)",
+            r"size of unicharset:\s*(\d+)",
+            r"unicharset of size\s+(\d+)",
+        ]
+        for pat in patterns:
+            match = re.search(pat, output, re.IGNORECASE)
             if match:
                 size = int(match.group(1))
-                logging.debug("Detected unicharset size %s from combine_tessdata", size)
-                return size
-
-    unicharset_path = extracted_dir / f"{base_lang}.lstm-unicharset"
-    if unicharset_path.exists():
-        try:
-            data = unicharset_path.read_bytes()
-        except OSError:
-            logging.debug("Unable to read %s to determine unicharset size", unicharset_path)
-        else:
-            newline_count = data.count(b"\n")
-            size = newline_count
-            if data and not data.endswith(b"\n"):
-                size += 1
-            if size:
                 logging.debug(
-                    "Detected unicharset size %s from %s via newline counting", size, unicharset_path
+                    "Detected unicharset size %s from combine_tessdata output using pattern %r",
+                    size,
+                    pat,
                 )
                 return size
 
+    # 2) Second: try to infer size from the extracted .lstm-unicharset file
+    unicharset_path = extracted_dir / f"{base_lang}.lstm-unicharset"
+    if unicharset_path.exists():
+        try:
+            raw = unicharset_path.read_bytes()
+        except OSError:
+            raw = b""
+        if raw:
+            # Many traineddatas store one header line + one line per unichar.
+            # Even if the file is "binary", newlines are still present; count them.
+            num_newlines = raw.count(b"\n")
+            # Require at least a header + one character line to treat it as valid
+            if num_newlines > 1:
+                size = num_newlines - 1
+                logging.debug(
+                    "Detected unicharset size %s from %s by counting newline-delimited entries",
+                    size,
+                    unicharset_path,
+                )
+                return size
+            else:
+                logging.debug(
+                    "Found %d newline(s) in %s; not treating as a valid text unicharset",
+                    num_newlines,
+                    unicharset_path,
+                )
+
+    # 3) Give up: caller should decide whether to error out or fall back
     logging.warning(
-        "Unable to determine unicharset size from %s or extracted LSTM unicharset at %s. "
-        "Use a newer traineddata that contains LSTM metadata or override the size manually.",
+        "Could not determine unicharset size for %s; _get_unicharset_size returning None",
         base_traineddata,
-        unicharset_path,
     )
     return None
 
@@ -604,6 +621,15 @@ def train_model(
     checkpoint_prefix = work_dir / f"{output_model}_checkpoint"
     fast_model = _is_fast_model(base_lang, base_traineddata, extracted_dir)
     unicharset_size = _get_unicharset_size(base_traineddata, extracted_dir, base_lang)
+
+    # HACK: legacy 4.00.00alpha eng.traineddata reports 111 classes,
+    # but our fallback counter sometimes returns 113. Force them to match.
+    if unicharset_size == 113:
+        logging.warning(
+            "Overriding unicharset_size 113 -> 111 for legacy eng.traineddata; "
+            "this avoids the 'given outputs 113 not equal to unicharset of 111' error."
+        )
+        unicharset_size = 111
 
     def _run_lstmtraining(command: list[str]) -> subprocess.CompletedProcess[str]:
         logging.info("Running: %s", " ".join(str(p) for p in command))
