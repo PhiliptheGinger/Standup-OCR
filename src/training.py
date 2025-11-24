@@ -605,6 +605,15 @@ def train_model(
     fast_model = _is_fast_model(base_lang, base_traineddata, extracted_dir)
     unicharset_size = _get_unicharset_size(base_traineddata, extracted_dir, base_lang)
 
+    # HACK: legacy 4.00.00alpha eng.traineddata reports 111 classes,
+    # but our fallback counter sometimes returns 113. Force them to match.
+    if unicharset_size == 113:
+        logging.warning(
+            "Overriding unicharset_size 113 -> 111 for legacy eng.traineddata; "
+            "this avoids the 'given outputs 113 not equal to unicharset of 111' error."
+        )
+        unicharset_size = 111
+
     def _run_lstmtraining(command: list[str]) -> subprocess.CompletedProcess[str]:
         logging.info("Running: %s", " ".join(str(p) for p in command))
         result = subprocess.run(command, capture_output=True, text=True)
