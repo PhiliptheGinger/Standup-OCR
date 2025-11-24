@@ -414,24 +414,40 @@ def _get_unicharset_size(
         result = None
     else:
         output = (result.stdout or "") + (result.stderr or "")
-        match = re.search(r"unicharset size:\s*(\d+)", output, re.IGNORECASE)
-        if match:
-            size = int(match.group(1))
-            logging.debug("Detected unicharset size %s from combine_tessdata", size)
-            return size
+        patterns = (
+            r"unicharset size[:=]\s*(\d+)",
+            r"unicharset of size\s*(\d+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, output, re.IGNORECASE)
+            if match:
+                size = int(match.group(1))
+                logging.debug("Detected unicharset size %s from combine_tessdata", size)
+                return size
 
     unicharset_path = extracted_dir / f"{base_lang}.lstm-unicharset"
     if unicharset_path.exists():
         try:
-            lines = [line for line in unicharset_path.read_text(errors="ignore").splitlines() if line.strip()]
+            data = unicharset_path.read_bytes()
         except OSError:
             logging.debug("Unable to read %s to determine unicharset size", unicharset_path)
         else:
-            if lines:
-                size = len(lines)
-                logging.debug("Detected unicharset size %s from %s", size, unicharset_path)
+            newline_count = data.count(b"\n")
+            size = newline_count
+            if data and not data.endswith(b"\n"):
+                size += 1
+            if size:
+                logging.debug(
+                    "Detected unicharset size %s from %s via newline counting", size, unicharset_path
+                )
                 return size
 
+    logging.warning(
+        "Unable to determine unicharset size from %s or extracted LSTM unicharset at %s. "
+        "Use a newer traineddata that contains LSTM metadata or override the size manually.",
+        base_traineddata,
+        unicharset_path,
+    )
     return None
 
 
@@ -622,13 +638,14 @@ def train_model(
     ]
 
     if unicharset_size is None:
-        logging.warning(
-            "Unable to determine unicharset size from %s; using a 1-output scratch network.",
-            base_traineddata,
+        message = (
+            "Unable to determine unicharset size from the base traineddata. "
+            "Provide a newer traineddata that includes the LSTM unicharset or override the size manually."
         )
-        net_spec = "[1,48,0,1 Lfx128 O1c1]"
-    else:
-        net_spec = f"[1,48,0,1 Lfx128 O1c{unicharset_size}]"
+        logging.error(message)
+        raise RuntimeError(message)
+
+    net_spec = f"[1,48,0,1 Lfx128 O1c{unicharset_size}]"
 
     scratch_cmd = [
         "lstmtraining",
