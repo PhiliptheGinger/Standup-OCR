@@ -136,7 +136,9 @@ def _prepare_ground_truth(image_path: Path, label: str, work_dir: Path) -> Tuple
     return processed_path, gt_file
 
 
-def _generate_lstmf(image_path: Path, work_dir: Path, base_lang: str) -> Path:
+def _generate_lstmf(
+    image_path: Path, work_dir: Path, base_lang: str
+) -> Optional[Path]:
     """Generate .lstmf file for a single training pair.
     Works with either .gt.txt or .box training files."""
 
@@ -152,33 +154,67 @@ def _generate_lstmf(image_path: Path, work_dir: Path, base_lang: str) -> Path:
     if not gt_txt.exists():
         raise FileNotFoundError(f"Missing ground truth file for {image_path}")
 
-    makebox_cmd = [
-        "tesseract",
-        str(image_path),
-        str(work_dir / base_name),
-        "-l",
-        base_lang,
-        "--psm",
-        "7",
-        "makebox",
-    ]
+    gt_text = gt_txt.read_text(encoding="utf-8").replace("\r", "")
+    has_layout = "\n" in gt_text or "\t" in gt_text
+    primary_psm = "6" if has_layout else "7"
+    alternate_psm = "7" if primary_psm == "6" else "6"
 
-    logging.info("Running: %s", " ".join(makebox_cmd))
-    try:
-        subprocess.run(makebox_cmd, check=True)
-    except subprocess.CalledProcessError as exc:  # pragma: no cover - surface context
-        output = (exc.stderr or exc.stdout or "").strip()
-        raise RuntimeError(
-            f"Tesseract makebox failed for {image_path}: {output or exc.returncode}"
-        ) from exc
-
-    if not box_path.exists():
-        raise RuntimeError(
-            f"Tesseract did not produce {box_path}. Check that the training tools are installed."
+    if has_layout:
+        logging.info(
+            "Using layout-aware PSM %s for %s because ground truth contains multiple lines or tabs.",
+            primary_psm,
+            image_path.name,
         )
 
-    gt_text = gt_txt.read_text(encoding="utf-8").replace("\r", "").rstrip("\n")
-    box_lines = box_path.read_text(encoding="utf-8").splitlines()
+    def _run_makebox(psm: str) -> list[str]:
+        box_path.unlink(missing_ok=True)
+        makebox_cmd = [
+            "tesseract",
+            str(image_path),
+            str(work_dir / base_name),
+            "-l",
+            base_lang,
+            "--psm",
+            psm,
+            "makebox",
+        ]
+
+        logging.info("Running makebox (PSM %s): %s", psm, " ".join(makebox_cmd))
+        try:
+            subprocess.run(makebox_cmd, check=True)
+        except subprocess.CalledProcessError as exc:  # pragma: no cover - surface context
+            output = (exc.stderr or exc.stdout or "").strip()
+            raise RuntimeError(
+                f"Tesseract makebox failed for {image_path}: {output or exc.returncode}"
+            ) from exc
+
+        if not box_path.exists():
+            return []
+        return box_path.read_text(encoding="utf-8").splitlines()
+
+    box_lines = _run_makebox(primary_psm)
+    used_psm = primary_psm
+
+    if not box_lines:
+        logging.info(
+            "No box output for %s with PSM %s; retrying with PSM %s.",
+            image_path.name,
+            primary_psm,
+            alternate_psm,
+        )
+        box_lines = _run_makebox(alternate_psm)
+        used_psm = alternate_psm if box_lines else primary_psm
+
+    if not box_lines:
+        logging.warning(
+            "Skipping %s: Tesseract makebox produced no boxes with PSM %s or %s.",
+            image_path.name,
+            primary_psm,
+            alternate_psm,
+        )
+        return None
+
+    gt_text = gt_text.rstrip("\n")
     if len(box_lines) < len(gt_text):
         raise RuntimeError(
             f"Ground truth for {image_path.name} has {len(gt_text)} characters but the generated box file contains {len(box_lines)} entries."
@@ -212,7 +248,7 @@ def _generate_lstmf(image_path: Path, work_dir: Path, base_lang: str) -> Path:
         str(image_path),
         str(work_dir / base_name),
         "--psm",
-        "6",
+        used_psm,
         "--oem",
         "1",
         "-l",
@@ -220,7 +256,7 @@ def _generate_lstmf(image_path: Path, work_dir: Path, base_lang: str) -> Path:
         "lstm.train",
     ]
 
-    logging.info("Running: %s", " ".join(cmd))
+    logging.info("Running training with PSM %s: %s", used_psm, " ".join(cmd))
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as exc:  # pragma: no cover - surface context
@@ -481,6 +517,8 @@ def train_model(
 
         processed_path, _ = _prepare_ground_truth(image_path, label, work_dir)
         lstmf_path = _generate_lstmf(processed_path, work_dir, base_lang)
+        if lstmf_path is None:
+            continue
         lstmf_paths.append(lstmf_path)
 
     list_file = work_dir / "training_files.txt"
