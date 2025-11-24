@@ -90,6 +90,20 @@ def locate_image(
     """Find the matching image file for a dataset entry."""
 
     images_dir = images_dir.resolve()
+    if not images_dir.exists():
+        raise FileNotFoundError(
+            f"Images directory does not exist: {images_dir}. Check the --images argument."
+        )
+    if not images_dir.is_dir():
+        raise FileNotFoundError(
+            f"Images path is not a directory: {images_dir}. Check the --images argument."
+        )
+
+    available = [
+        path.name for path in images_dir.iterdir() if path.suffix.lower() in SUPPORTED_EXTENSIONS
+    ]
+    if not available:
+        logging.warning("No image files found under %s", images_dir)
     if not isinstance(entry, dict):
         raise TypeError(f"Entry at index {index} is not a dictionary; received {type(entry).__name__}")
 
@@ -111,14 +125,20 @@ def locate_image(
         candidate_names.extend(_numeric_candidates(actual_number, index))
     candidate_names.extend(_numeric_candidates(page_value if isinstance(page_value, int) else None, index))
 
+    tried: list[str] = []
     for name in candidate_names:
         for ext in SUPPORTED_EXTENSIONS:
             candidate = images_dir / f"{name}{ext}"
+            tried.append(candidate.name)
             if candidate.exists():
                 return candidate
 
     raise FileNotFoundError(
-        f"Could not find image for entry {index + 1} (page={page_value}, file_number={file_number}) in {images_dir}"
+        "Could not find image for entry "
+        f"{index + 1} (page={page_value}, file_number={file_number}) in {images_dir}. "
+        "Tried: "
+        + ", ".join(dict.fromkeys(tried))
+        + (f". Found {len(available)} image(s) in directory." if available else "")
     )
 
 
