@@ -1,0 +1,51 @@
+{
+  "source_image": "data\\train\\images\\038.jpg",
+  "line_index": 1,
+  "bbox": {
+    "left": 0,
+    "top": 16,
+    "right": 30,
+    "bottom": 55
+  },
+  "baseline": [
+    [
+      3,
+      38
+    ],
+    [
+      18,
+      37
+    ]
+  ],
+  "boundary": [
+    [
+      3,
+      38
+    ],
+    [
+      3,
+      43
+    ],
+    [
+      18,
+      43
+    ],
+    [
+      18,
+      37
+    ],
+    [
+      16,
+      28
+    ],
+    [
+      1,
+      28
+    ],
+    [
+      3,
+      38
+    ]
+  ],
+  "id": "_ab0a734b-5f4f-43cd-bb45-24ea5da8ffa5"
+}
