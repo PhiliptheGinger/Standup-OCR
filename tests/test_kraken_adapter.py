@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import subprocess
@@ -256,3 +257,160 @@ def test_train_forces_utf8_stdio(monkeypatch, tmp_path):
     assert envs[-1] is not None
     assert envs[-1]["PYTHONIOENCODING"] == "utf-8"
     assert envs[-1]["PYTHONUTF8"] == "1"
+
+
+def test_train_sets_requested_progress_env(monkeypatch, tmp_path):
+    help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
+    _, envs = _setup_monkeypatch(monkeypatch, help_text)
+
+    dataset_dir = _dataset_with_line(tmp_path)
+    model_out = tmp_path / "model.mlmodel"
+
+    kraken_adapter.train(dataset_dir, model_out, epochs=1, val_split=0.1, progress="plain")
+
+    assert envs[-1]["KRAKEN_PROGRESS"] == "plain"
+
+
+def test_train_defaults_progress_when_helper_requests_it(monkeypatch, tmp_path):
+    help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
+    _, envs = _setup_monkeypatch(monkeypatch, help_text)
+
+    monkeypatch.setattr(kraken_adapter, "_default_kraken_progress", lambda: "plain")
+    monkeypatch.delenv("KRAKEN_PROGRESS", raising=False)
+
+    dataset_dir = _dataset_with_line(tmp_path)
+    model_out = tmp_path / "model.mlmodel"
+
+    kraken_adapter.train(dataset_dir, model_out, epochs=1, val_split=0.1)
+
+    assert envs[-1]["KRAKEN_PROGRESS"] == "plain"
+
+
+def test_train_respects_none_progress_override(monkeypatch, tmp_path):
+    help_text = "Usage: ketos train [OPTIONS]\n\nOptions:\n  --partition FLOAT"
+    _, envs = _setup_monkeypatch(monkeypatch, help_text)
+
+    monkeypatch.setenv("KRAKEN_PROGRESS", "rich")
+
+    dataset_dir = _dataset_with_line(tmp_path)
+    model_out = tmp_path / "model.mlmodel"
+
+    kraken_adapter.train(dataset_dir, model_out, epochs=1, val_split=0.1, progress="none")
+
+    assert "KRAKEN_PROGRESS" not in envs[-1]
+
+
+def test_segment_pages_with_kraken_exports_crops(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("L", (100, 80), color=200).save(page)
+
+    captured_pagexml: list[Path | None] = []
+
+    def fake_get_segmentation(
+        image_path,
+        *,
+        model=None,
+        out_pagexml=None,
+        global_cli_args=None,
+        segment_cli_args=None,
+    ):
+        captured_pagexml.append(out_pagexml)
+        return {
+            "lines": [
+                {
+                    "id": "l1",
+                    "boundary": [[10, 10], [90, 10], [90, 30], [10, 30]],
+                },
+                {
+                    "id": "l2",
+                    "baseline": [[20, 50], [80, 52]],
+                },
+            ]
+        }
+
+    monkeypatch.setattr(kraken_adapter, "_get_segmentation", fake_get_segmentation)
+
+    out_dir = tmp_path / "lines"
+    xml_dir = tmp_path / "pagexml"
+    stats = kraken_adapter.segment_pages_with_kraken(
+        [page],
+        out_dir,
+        pagexml_dir=xml_dir,
+        padding=5,
+        min_width=10,
+        min_height=10,
+    )
+
+    assert stats.pages == 1
+    assert stats.lines == 2
+    assert stats.errors == 0
+    assert stats.skipped == 0
+
+    first_line = out_dir / "page_line001.png"
+    assert first_line.exists()
+    first_gt = first_line.with_suffix(".gt.txt")
+    assert first_gt.exists()
+    assert first_gt.read_text(encoding="utf8") == ""
+    metadata = json.loads(first_line.with_suffix(".boxes.json").read_text(encoding="utf8"))
+    assert metadata["line_index"] == 1
+    assert metadata["id"] == "l1"
+
+    second_line = out_dir / "page_line002.png"
+    assert second_line.exists()
+
+    pagexml_file = xml_dir / "page.xml"
+    assert captured_pagexml[-1] == pagexml_file
+
+
+def test_segment_via_cli_uses_correct_command(monkeypatch, tmp_path):
+    image = tmp_path / "page.png"
+    image.write_bytes(b"data")
+
+    tmp_root = tmp_path / "cli-tmp"
+
+    class DummyTempDir:
+        def __enter__(self):
+            tmp_root.mkdir(parents=True, exist_ok=True)
+            return str(tmp_root)
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(kraken_adapter.tempfile, "TemporaryDirectory", lambda: DummyTempDir())
+    monkeypatch.setattr(kraken_adapter.shutil, "which", lambda name: "/usr/bin/kraken" if name == "kraken" else None)
+
+    captured_cmd: list[str] = []
+
+    def fake_run(cmd, check):
+        captured_cmd.extend(cmd)
+        (tmp_root / "segmentation.json").write_text(json.dumps({"lines": []}), encoding="utf-8")
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(kraken_adapter.subprocess, "run", fake_run)
+
+    result = kraken_adapter._segment_via_cli(
+        image,
+        model="seg.mlmodel",
+        global_cli_args=["--device", "cuda:0", "--threads", "2"],
+        segment_cli_args=["--baseline", "--text-direction", "vertical-rl"],
+    )
+
+    expected_json = tmp_root / "segmentation.json"
+    assert result == {"lines": []}
+    assert captured_cmd == [
+        "/usr/bin/kraken",
+        "--device",
+        "cuda:0",
+        "--threads",
+        "2",
+        "-i",
+        str(image),
+        str(expected_json),
+        "binarize",
+        "segment",
+        "--model",
+        "seg.mlmodel",
+        "--baseline",
+        "--text-direction",
+        "vertical-rl",
+    ]

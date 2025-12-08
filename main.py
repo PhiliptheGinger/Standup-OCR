@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -15,7 +16,13 @@ from src.gpt_ocr import GPTTranscriber, GPTTranscriptionError
 from src.review import ReviewAborted, ReviewConfig, ReviewSession
 from src.training import SUPPORTED_EXTENSIONS, train_model
 from src.refine import DEFAULT_REFINE_PROMPT, run_refinement
-from src.kraken_adapter import is_available as kraken_available, ocr as kraken_ocr, train as kraken_train
+from src.kraken_adapter import (
+    is_available as kraken_available,
+    ocr as kraken_ocr,
+    segment_pages_with_kraken,
+    train as kraken_train,
+)
+from src.kraken_dataset import sanitize_line_dataset
 
 
 DEFAULT_TRAIN_DIR = Path("train")
@@ -90,12 +97,20 @@ def handle_train(args: argparse.Namespace) -> None:
             )
         model_out = args.model if args.model else args.model_dir / "kraken.mlmodel"
         base_model = args.base_model
+        progress = None
+        if args.kraken_progress == "plain":
+            progress = "plain"
+        elif args.kraken_progress == "rich":
+            progress = "rich"
+        elif args.kraken_progress == "none":
+            progress = "none"
         model_path = kraken_train(
             args.train_dir,
             Path(model_out),
             epochs=args.epochs,
             val_split=args.val_split,
             base_model=base_model,
+            progress=progress,
         )
         logging.info("Kraken model saved to %s", model_path)
         return
@@ -107,14 +122,141 @@ def handle_train(args: argparse.Namespace) -> None:
         tessdata_dir=args.tessdata_dir,
         base_lang=args.base_lang,
         max_iterations=args.max_iterations,
+        unicharset_size_override=args.unicharset_size,
+        deserialize_check_limit=args.deserialize_check_limit,
         use_gpt_ocr=not args.no_gpt_ocr,
         gpt_model=args.gpt_model,
         gpt_prompt=args.gpt_prompt,
         gpt_cache_dir=args.gpt_cache_dir,
         gpt_max_output_tokens=args.gpt_max_output_tokens,
         gpt_max_images=args.gpt_max_images,
+        resume=not args.no_resume,
     )
     logging.info("Model saved to %s", model_path)
+
+
+def handle_kraken_lines(args: argparse.Namespace) -> None:
+    resize_width = args.resize_width if args.resize_width and args.resize_width > 0 else None
+    stats = sanitize_line_dataset(
+        args.source,
+        args.output,
+        adaptive=not args.no_adaptive,
+        force_landscape=not args.no_force_landscape,
+        resize_width=resize_width,
+    )
+    logging.info(
+        "Cleaned %d line crops (skipped %d missing GT, %d empty GT)",
+        stats.processed,
+        stats.missing_gt,
+        stats.empty_gt,
+    )
+
+
+def _build_kraken_segment_cli_args(args: argparse.Namespace) -> tuple[list[str], list[str]]:
+    global_args: list[str] = []
+    segment_args: list[str] = []
+
+    if args.segment_device:
+        global_args.extend(["--device", args.segment_device])
+    if args.segment_threads:
+        global_args.extend(["--threads", str(args.segment_threads)])
+    if args.segment_autocast:
+        global_args.append("--autocast")
+    if args.segment_no_legacy_polygons:
+        global_args.append("--no-legacy-polygons")
+
+    if args.segment_subline:
+        global_args.append("--subline-segmentation")
+    elif args.segment_no_subline:
+        global_args.append("--no-subline-segmentation")
+
+    if args.segment_global_arg:
+        global_args.extend(args.segment_global_arg)
+
+    if args.segment_strategy == "baseline":
+        segment_args.append("--baseline")
+    elif args.segment_strategy == "boxes":
+        segment_args.append("--boxes")
+
+    if args.segment_direction:
+        segment_args.extend(["--text-direction", args.segment_direction])
+    if args.segment_scale is not None:
+        segment_args.extend(["--scale", str(args.segment_scale)])
+    if args.segment_maxcolseps is not None:
+        segment_args.extend(["--maxcolseps", str(args.segment_maxcolseps)])
+    if args.segment_black_colseps:
+        segment_args.append("--black-colseps")
+    if args.segment_keep_hlines:
+        segment_args.append("--hlines")
+    if args.segment_pad:
+        left, right = args.segment_pad
+        segment_args.extend(["--pad", str(left), str(right)])
+    if args.segment_mask:
+        segment_args.extend(["--mask", str(args.segment_mask)])
+
+    if args.segment_cli_arg:
+        segment_args.extend(args.segment_cli_arg)
+
+    return global_args, segment_args
+
+
+def handle_kraken_segment(args: argparse.Namespace) -> None:
+    if not kraken_available():
+        raise RuntimeError(
+            "Kraken is not installed. Install it with 'pip install kraken[serve]' to run kraken-segment."
+        )
+
+    source = Path(args.source)
+    if not source.exists():
+        raise FileNotFoundError(f"Source not found: {source}")
+
+    if source.is_dir():
+        images = list(iter_images(source))
+    else:
+        images = [source]
+
+    if not images:
+        logging.warning("No images found in %s", source)
+        return
+
+    output_dir = Path(args.out_lines) if getattr(args, "out_lines", None) else Path(args.output)
+    pagexml_dir = Path(args.pagexml) if args.pagexml is not None else None
+
+    if output_dir.exists():
+        try:
+            has_content = any(output_dir.iterdir())
+        except OSError:
+            has_content = True
+
+        if has_content and not args.overwrite:
+            raise RuntimeError(
+                f"Output directory {output_dir} already exists. Re-run with --overwrite to replace its contents."
+            )
+        if args.overwrite:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    global_cli_args, segment_cli_args = _build_kraken_segment_cli_args(args)
+
+    stats = segment_pages_with_kraken(
+        images,
+        output_dir,
+        model=str(args.model) if args.model else None,
+        pagexml_dir=pagexml_dir,
+        padding=args.padding,
+        min_width=args.min_width,
+        min_height=args.min_height,
+        global_cli_args=global_cli_args or None,
+        segment_cli_args=segment_cli_args or None,
+    )
+
+    logging.info(
+        "Segmented %d page(s) into %d line crops (%d skipped, %d errors). Output: %s",
+        stats.pages,
+        stats.lines,
+        stats.skipped,
+        stats.errors,
+        output_dir,
+    )
 
 
 def handle_test(args: argparse.Namespace) -> None:
@@ -316,12 +458,15 @@ def handle_review(args: argparse.Namespace) -> None:
                 tessdata_dir=args.tessdata_dir,
                 base_lang=args.base_lang,
                 max_iterations=args.max_iterations,
+                unicharset_size_override=args.unicharset_size,
+                deserialize_check_limit=args.deserialize_check_limit,
                 use_gpt_ocr=not args.no_gpt_ocr,
                 gpt_model=args.gpt_model,
                 gpt_prompt=args.gpt_prompt,
                 gpt_cache_dir=args.gpt_cache_dir,
                 gpt_max_output_tokens=args.gpt_max_output_tokens,
                 gpt_max_images=args.gpt_max_images,
+                resume=not args.no_resume,
             )
             logging.info("Updated model saved to %s", model_path)
             last_trained_count += args.auto_train
@@ -384,6 +529,9 @@ def handle_annotate(args: argparse.Namespace) -> None:
             gpt_cache_dir=args.gpt_cache_dir,
             gpt_max_output_tokens=args.gpt_max_output_tokens,
             gpt_max_images=args.gpt_max_images,
+            resume=not args.no_resume,
+            deserialize_check_limit=args.deserialize_check_limit,
+            unicharset_size_override=args.unicharset_size,
         )
 
     if args.engine == "kraken" and args.seg == "auto" and not kraken_available():
@@ -474,6 +622,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Training iterations to run (default: 1000).",
     )
     train_parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Regenerate all .lstmf samples instead of reusing cached ones.",
+    )
+    train_parser.add_argument(
+        "--deserialize-check-limit",
+        type=int,
+        help=(
+            "Maximum number of .lstmf samples to sanity-check with Tesseract before training. "
+            "Omit to check all samples."
+        ),
+    )
+    train_parser.add_argument(
+        "--unicharset-size",
+        type=int,
+        help=(
+            "Override LSTM unicharset size used for network specification. "
+            "If not provided, the size is inferred from the base traineddata."
+        ),
+    )
+    train_parser.add_argument(
         "--epochs",
         type=int,
         default=50,
@@ -490,8 +659,195 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional base Kraken model to fine-tune.",
     )
+    train_parser.add_argument(
+        "--kraken-progress",
+        choices=["auto", "plain", "rich", "none"],
+        default="auto",
+        help=(
+            "Progress renderer passed to Kraken training. Use 'plain' to avoid Rich crashes on Windows, "
+            "'rich' for the default TTY experience, 'none' to leave the environment untouched, or keep 'auto' "
+            "(default) to fall back to a safe choice per platform."
+        ),
+    )
     add_gpt_arguments(train_parser)
     train_parser.set_defaults(func=handle_train)
+
+    kraken_lines_parser = subparsers.add_parser(
+        "kraken-lines",
+        help="Regenerate Kraken-ready line crops using the preprocessing pipeline.",
+    )
+    kraken_lines_parser.add_argument(
+        "--source",
+        type=Path,
+        default=DEFAULT_TRAIN_DIR / "lines",
+        help="Directory containing existing line crops (default: train/lines).",
+    )
+    kraken_lines_parser.add_argument(
+        "--output",
+        type=Path,
+        default=DEFAULT_TRAIN_DIR / "kraken_lines",
+        help="Directory where cleaned line crops will be written (default: train/kraken_lines).",
+    )
+    kraken_lines_parser.add_argument(
+        "--resize-width",
+        type=int,
+        default=0,
+        help="Optional width passed to the preprocessing pipeline (default: keep original width).",
+    )
+    kraken_lines_parser.add_argument(
+        "--no-force-landscape",
+        action="store_true",
+        help="Disable automatic rotation of portrait-oriented line crops.",
+    )
+    kraken_lines_parser.add_argument(
+        "--no-adaptive",
+        action="store_true",
+        help="Disable adaptive thresholding when cleaning line crops.",
+    )
+    kraken_lines_parser.set_defaults(func=handle_kraken_lines)
+
+    kraken_segment_parser = subparsers.add_parser(
+        "kraken-segment",
+        help="Use Kraken to auto-segment full pages into individual line crops.",
+    )
+    kraken_segment_parser.add_argument(
+        "--source",
+        type=Path,
+        default=DEFAULT_TRAIN_DIR / "images",
+        help="Image file or directory to segment (default: train/images).",
+    )
+    kraken_segment_parser.add_argument(
+        "--output",
+        type=Path,
+        default=DEFAULT_TRAIN_DIR / "kraken_auto_lines",
+        help="Directory where cropped line images will be saved (default: train/kraken_auto_lines).",
+    )
+    kraken_segment_parser.add_argument(
+        "--out-lines",
+        dest="out_lines",
+        type=Path,
+        help="Deprecated alias for --output (will be removed in a future release).",
+    )
+    kraken_segment_parser.add_argument(
+        "--pagexml",
+        type=Path,
+        help="Optional directory for PAGE-XML exports produced by Kraken.",
+    )
+    kraken_segment_parser.add_argument(
+        "--model",
+        type=Path,
+        help="Optional Kraken segmentation model (.mlmodel) to guide line detection.",
+    )
+    kraken_segment_parser.add_argument(
+        "--padding",
+        type=int,
+        default=12,
+        help="Pixel padding applied around each detected line before cropping (default: 12).",
+    )
+    kraken_segment_parser.add_argument(
+        "--min-width",
+        type=int,
+        default=24,
+        help="Skip cropped lines narrower than this many pixels (default: 24).",
+    )
+    kraken_segment_parser.add_argument(
+        "--min-height",
+        type=int,
+        default=16,
+        help="Skip cropped lines shorter than this many pixels (default: 16).",
+    )
+    kraken_segment_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete the output directory before writing new crops.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-device",
+        help="Device string passed to kraken (for example cpu or cuda:0).",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-threads",
+        type=int,
+        help="Thread count passed to kraken's --threads flag.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-autocast",
+        action="store_true",
+        help="Enable Kraken's --autocast flag to reduce GPU memory usage.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-no-legacy-polygons",
+        action="store_true",
+        help="Pass --no-legacy-polygons to Kraken to disable the legacy polygon extractor.",
+    )
+    subline_group = kraken_segment_parser.add_mutually_exclusive_group()
+    subline_group.add_argument(
+        "--segment-subline",
+        action="store_true",
+        help="Explicitly enable --subline-segmentation on the Kraken command.",
+    )
+    subline_group.add_argument(
+        "--segment-no-subline",
+        action="store_true",
+        help="Disable subline segmentation via --no-subline-segmentation.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-strategy",
+        choices=["baseline", "boxes"],
+        help="Switch between Kraken's baseline (--baseline) or legacy box (--boxes) segmenters.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-direction",
+        choices=["horizontal-lr", "horizontal-rl", "vertical-lr", "vertical-rl"],
+        help="Override Kraken's --text-direction option.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-scale",
+        type=float,
+        help="Override Kraken's --scale value.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-maxcolseps",
+        type=int,
+        help="Set Kraken's --maxcolseps value.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-black-colseps",
+        action="store_true",
+        help="Use Kraken's --black-colseps flag instead of the default white separators.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-keep-hlines",
+        action="store_true",
+        help="Preserve horizontal lines by passing --hlines.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-pad",
+        type=int,
+        nargs=2,
+        metavar=("LEFT", "RIGHT"),
+        help="Override Kraken's --pad <left> <right> values.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-mask",
+        type=Path,
+        help="Path to a segmentation mask passed as --mask.",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-global-arg",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="Additional raw argument inserted before '-i' in the Kraken command (repeatable).",
+    )
+    kraken_segment_parser.add_argument(
+        "--segment-cli-arg",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="Additional raw argument appended after 'kraken segment' (repeatable).",
+    )
+    kraken_segment_parser.set_defaults(func=handle_kraken_segment)
 
     test_parser = subparsers.add_parser(
         "test",
@@ -718,6 +1074,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Training iterations to run when auto-training (default: 1000).",
     )
     review_parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="When auto-training, regenerate all .lstmf samples instead of reusing cached ones.",
+    )
+    review_parser.add_argument(
+        "--unicharset-size",
+        type=int,
+        help="Override LSTM unicharset size when auto-training during review sessions.",
+    )
+    review_parser.add_argument(
+        "--deserialize-check-limit",
+        type=int,
+        help=(
+            "Maximum number of .lstmf samples to sanity-check with Tesseract before auto-training. "
+            "Omit to check all samples."
+        ),
+    )
+    review_parser.add_argument(
         "--no-preview",
         action="store_true",
         help="Disable snippet previews (useful on headless systems).",
@@ -805,6 +1179,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1000,
         help="Training iterations to run when auto-training (default: 1000).",
+    )
+    annotate_parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Regenerate all .lstmf samples during auto-training instead of reusing cached ones.",
+    )
+    annotate_parser.add_argument(
+        "--unicharset-size",
+        type=int,
+        help="Override LSTM unicharset size for auto-training sessions.",
+    )
+    annotate_parser.add_argument(
+        "--deserialize-check-limit",
+        type=int,
+        help=(
+            "Maximum number of .lstmf samples to sanity-check with Tesseract before auto-training. "
+            "Omit to check all samples."
+        ),
     )
     annotate_parser.add_argument(
         "--tessdata-dir",

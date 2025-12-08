@@ -3,12 +3,27 @@ __pycache__/
 *.py[cod]
 *.pyd
 venv/
+.env
 
-# Models and training artifacts
+# Training artifacts and models
 models/
-*.lstmf
+*.mlmodel
 *.traineddata
+*.lstmf
+*.box
 
 # Logs and cache
 *.log
 *.cache/
+
+# Large raw data
+data/train/images/
+train/kraken_auto_lines/
+train/lines_bad/
+
+# Temp files
+filelist.txt
+one.list
+tlog*.txt
+tmp_seg.json
+unicharset

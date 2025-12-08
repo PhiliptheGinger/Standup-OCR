@@ -37,6 +37,43 @@ Install the dependencies listed in `requirements.txt`, then invoke the CLI via
 python main.py --help
 ```
 
+### Kraken segmentation pipeline
+
+Use Kraken to turn whole-page scans into individual line crops before cleaning
+them for training:
+
+```bash
+# 1) Let Kraken detect baselines and export raw line crops + PAGE-XML
+python main.py kraken-segment --source data/train/images \
+  --output train/kraken_auto_lines --pagexml train/pagexml --overwrite
+
+# 2) Run the preprocessing pipeline over those crops to build a Kraken dataset
+python main.py kraken-lines --source train/kraken_auto_lines \
+  --output train/kraken_lines --resize-width 2048
+```
+
+`kraken-segment` accepts either a single image or a directory and stores each
+line as `<page>_lineNNN.png` alongside stub `.gt.txt` files and metadata in
+`.boxes.json`. Pass `--model path/to/segmentation.mlmodel` to force Kraken to
+use a custom segmentation network, `--pagexml dir` to save PAGE-XML exports, or
+adjust `--padding`, `--min-width`, and `--min-height` when you want to keep
+extra context around each crop. Re-run with `--overwrite` to clear an existing
+output directory, and `--out-lines` remains a backward-compatible alias for
+`--output`. Update the generated `.gt.txt` files with the true transcription
+(or review them via the GUI) before training.
+
+Advanced runners can fine-tune Kraken by passing `--segment-device` (to select
+`cuda:0`, `cpu`, etc.), `--segment-threads`, and sub-command flags like
+`--segment-direction vertical-rl`, `--segment-pad 24 24`, `--segment-mask path/to/mask.png`,
+or `--segment-strategy baseline`. Use `--segment-global-arg` / `--segment-cli-arg`
+when you need raw pass-through arguments that are not exposed directly.
+
+During training, `python main.py train --engine kraken --train-dir train/kraken_lines \
+  --model models/handwriting.mlmodel --kraken-progress plain` forces Kraken to use a
+plain-text progress bar. The CLI now defaults to that safer renderer on Windows,
+but you can explicitly select `plain`, `rich`, or leave the upstream value alone via
+`--kraken-progress` when a different experience is required.
+
 ### Reviewing OCR output
 
 Use the `review` subcommand to step through low-confidence tokens produced by

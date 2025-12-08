@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -13,14 +13,24 @@ import tempfile
 import threading
 from functools import lru_cache
 from pathlib import Path
-from types import ModuleType
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
 
 from PIL import Image, ImageOps
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+_PAGE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+
+
+@dataclass
+class KrakenSegmentationStats:
+    pages: int = 0
+    lines: int = 0
+    skipped: int = 0
+    errors: int = 0
 
 
 def _kraken_exe_in_venv() -> str | None:
@@ -245,65 +255,13 @@ def _prepare_line_images(
     return adjusted, tmpdir
 
 
-def _explain_import_error(exc: ImportError, previous_exc: ImportError | None = None) -> str:
-    """Return a user-facing explanation for Kraken import errors."""
-
-    message = str(exc)
-    if "kraken.blla is not a package" in message or "'kraken' is not a package" in message:
-        return (
-            "This Kraken installation no longer exposes the legacy 'kraken.blla' module. "
-            "Recent releases moved the segmentation API to 'kraken.lib.segmentation'. "
-            "Upgrade Standup-OCR or reinstall Kraken with 'pip install -U kraken[serve]' "
-            "to ensure the new module is available."
-        )
-
-    if previous_exc is not None:
-        previous_name = getattr(previous_exc, "name", "")
-        if previous_name == "kraken.lib.segmentation":
-            return (
-                "Kraken's modern segmentation API ('kraken.lib.segmentation') could not "
-                "be imported, and the legacy fallback also failed. Upgrade Kraken with "
-                "'pip install -U kraken[serve]' to obtain a compatible release."
-            )
-
-    if "not a package" in message:
-        return (
-            "Kraken could not be imported because another module named 'kraken' "
-            "is shadowing the official library. Rename or remove the conflicting "
-            "module (for example a local 'kraken.py' file) and reinstall the "
-            "package with 'pip install -U kraken[serve]'."
-        )
-
-    missing = getattr(exc, "name", "")
-    if missing in {"kraken", "kraken.blla", "kraken.lib.segmentation"}:
-        return (
-            "Kraken's Python API is unavailable. Ensure it is installed in the "
-            "current environment by running 'pip install -U kraken[serve]'."
-        )
-
-    return f"Kraken is installed but failed to load its segmentation API ({message})."
-
-
-def _load_segmentation_module() -> ModuleType:
-    """Load Kraken's segmentation module with support for multiple versions."""
-
-    lib_exc: ImportError | None = None
-    try:
-        from kraken.lib import segmentation as segmentation_mod  # type: ignore
-
-        return segmentation_mod
-    except ImportError as exc:
-        lib_exc = exc
-
-    try:
-        from kraken import blla as segmentation_mod  # type: ignore
-
-        return segmentation_mod
-    except ImportError as exc:
-        raise RuntimeError(_explain_import_error(exc, lib_exc)) from exc
-
-
-def _segment_via_cli(image_path: Path) -> Dict[str, Any]:
+def _segment_via_cli(
+    image_path: Path,
+    model: Optional[str] = None,
+    *,
+    global_cli_args: Optional[Sequence[str]] = None,
+    segment_cli_args: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
     """Call the Kraken CLI to obtain segmentation data as JSON."""
 
     kraken_cli = shutil.which("kraken")
@@ -315,13 +273,17 @@ def _segment_via_cli(image_path: Path) -> Dict[str, Any]:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_json = Path(tmpdir) / "segmentation.json"
-        cmd = [
-            kraken_cli,
-            "segment",
-            "-i",
-            str(image_path),
-            str(output_json),
-        ]
+        cmd: list[str] = [kraken_cli]
+        if global_cli_args:
+            cmd.extend(global_cli_args)
+        cmd.extend(["-i", str(image_path), str(output_json), "binarize"])
+
+        segment_cmd: list[str] = ["segment"]
+        if model:
+            segment_cmd.extend(["--model", model])
+        if segment_cli_args:
+            segment_cmd.extend(segment_cli_args)
+        cmd.extend(segment_cmd)
         log.info("Running kraken segmentation: %s", " ".join(cmd))
         try:
             subprocess.run(cmd, check=True)
@@ -339,64 +301,123 @@ def _segment_via_cli(image_path: Path) -> Dict[str, Any]:
             raise RuntimeError(f"Failed to parse Kraken CLI segmentation output: {exc}") from exc
 
 
-def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[List[Tuple[float, float]]]:
-    """Run Kraken's baseline segmenter and return a list of baselines."""
+def _coerce_points(candidate: Any) -> list[tuple[float, float]] | None:
+    """Best-effort conversion of Kraken boundary/baseline payloads into points."""
+
+    if candidate is None:
+        return None
+
+    if isinstance(candidate, dict):
+        if "points" in candidate:
+            return _coerce_points(candidate["points"])
+        if {"x", "y"}.issubset(candidate.keys()):
+            return [(float(candidate["x"]), float(candidate["y"]))]
+        numeric_keys = {"x0", "y0", "x1", "y1"}
+        if numeric_keys.issubset(candidate.keys()):
+            return [
+                (float(candidate["x0"]), float(candidate["y0"])),
+                (float(candidate["x1"]), float(candidate["y1"])),
+            ]
+        bbox_keys = {"left", "top", "right", "bottom"}
+        if bbox_keys.issubset(candidate.keys()):
+            return [
+                (float(candidate["left"]), float(candidate["top"])),
+                (float(candidate["right"]), float(candidate["bottom"])),
+            ]
+        return None
+
+    if isinstance(candidate, (list, tuple)):
+        if not candidate:
+            return None
+        first = candidate[0]
+        if isinstance(first, (list, tuple, dict)):
+            points: list[tuple[float, float]] = []
+            for entry in candidate:
+                if isinstance(entry, dict):
+                    if {"x", "y"}.issubset(entry.keys()):
+                        points.append((float(entry["x"]), float(entry["y"])))
+                elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    points.append((float(entry[0]), float(entry[1])))
+            return points or None
+        if len(candidate) >= 4 and all(isinstance(value, (int, float)) for value in candidate[:4]):
+            return [
+                (float(candidate[0]), float(candidate[1])),
+                (float(candidate[2]), float(candidate[3])),
+            ]
+
+    return None
+
+
+def _bbox_from_points(
+    points: list[tuple[float, float]],
+    *,
+    padding: int = 8,
+    extra_vertical: int = 0,
+) -> tuple[int, int, int, int]:
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    left = math.floor(min(xs) - padding)
+    top = math.floor(min(ys) - padding - extra_vertical)
+    right = math.ceil(max(xs) + padding)
+    bottom = math.ceil(max(ys) + padding + extra_vertical)
+    return left, top, right, bottom
+
+
+def _line_bbox(line: Dict[str, Any], padding: int = 8) -> tuple[int, int, int, int] | None:
+    bbox_candidate = line.get("bbox")
+    points = _coerce_points(bbox_candidate)
+    if points:
+        return _bbox_from_points(points, padding=padding)
+
+    boundary = _coerce_points(line.get("boundary") or line.get("polygon"))
+    if boundary:
+        return _bbox_from_points(boundary, padding=padding)
+
+    baseline = _coerce_points(line.get("baseline"))
+    if baseline:
+        extra = max(padding, 12)
+        return _bbox_from_points(baseline, padding=padding, extra_vertical=extra)
+
+    return None
+
+
+def _clamp_box(
+    box: tuple[int, int, int, int], image_size: tuple[int, int]
+) -> tuple[int, int, int, int] | None:
+    left, top, right, bottom = box
+    width, height = image_size
+    left = max(0, min(width, left))
+    top = max(0, min(height, top))
+    right = max(0, min(width, right))
+    bottom = max(0, min(height, bottom))
+    if right - left <= 1 or bottom - top <= 1:
+        return None
+    return left, top, right, bottom
+
+
+def _get_segmentation(
+    image_path: Path,
+    *,
+    model: Optional[str] = None,
+    out_pagexml: Optional[Path] = None,
+    global_cli_args: Optional[Sequence[str]] = None,
+    segment_cli_args: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Return Kraken's segmentation dictionary for ``image_path``."""
 
     _require_kraken()
-    try:
-        segmentation_module = _load_segmentation_module()
-    except RuntimeError:
-        raise
-    except Exception as exc:  # pragma: no cover - only triggered when API fails
-        raise RuntimeError("Kraken is installed but the segmentation API is unavailable") from exc
-
-    segmentation: Optional[Dict[str, Any]] = None
-
-    with Image.open(image_path) as image:
-        img = image.convert("L")
-        try:
-            if hasattr(segmentation_module, "segment"):
-                segment_fn = getattr(segmentation_module, "segment")
-                kwargs: Dict[str, Any] = {}
-                signature = inspect.signature(segment_fn)
-                if "text_direction" in signature.parameters:
-                    kwargs["text_direction"] = "ltr"
-                if "script" in signature.parameters:
-                    kwargs["script"] = "latin"
-                if "model" in signature.parameters:
-                    kwargs["model"] = None
-                segmentation = segment_fn(img, **kwargs)
-            elif hasattr(segmentation_module, "segment_image"):
-                segment_fn = getattr(segmentation_module, "segment_image")
-                kwargs = {}
-                signature = inspect.signature(segment_fn)
-                if "model" in signature.parameters:
-                    kwargs["model"] = None
-                segmentation = segment_fn(img, **kwargs)
-            else:  # pragma: no cover - defensive
-                raise RuntimeError(
-                    "Unsupported Kraken segmentation API: expected 'segment' or 'segment_image'."
-                )
-        except RuntimeError:
-            raise
-        except Exception as exc:  # pragma: no cover - segmentation errors only at runtime
-            raise RuntimeError(f"Kraken segmentation failed: {exc}") from exc
-
-    if segmentation is None:
-        segmentation = _segment_via_cli(image_path)
+    segmentation = _segment_via_cli(
+        image_path,
+        model=model,
+        global_cli_args=global_cli_args,
+        segment_cli_args=segment_cli_args,
+    )
 
     if not isinstance(segmentation, dict):
         if hasattr(segmentation, "to_dict"):
             segmentation = segmentation.to_dict()
         else:  # pragma: no cover - fallback when API returns a list-like structure
             segmentation = {"lines": segmentation}
-
-    baselines: List[List[Tuple[float, float]]] = []
-    for line in segmentation.get("lines", []):
-        baseline = line.get("baseline")
-        if not baseline:
-            continue
-        baselines.append([(float(x), float(y)) for x, y in baseline])
 
     if out_pagexml is not None:
         try:
@@ -407,7 +428,136 @@ def segment_lines(image_path: Path, out_pagexml: Optional[Path] = None) -> List[
         except Exception as exc:  # pragma: no cover - serialisation is best-effort
             log.warning("Failed to serialise PAGE-XML via Kraken: %s", exc)
 
+    return segmentation
+
+
+def segment_lines(
+    image_path: Path,
+    out_pagexml: Optional[Path] = None,
+    *,
+    model: Optional[str] = None,
+) -> List[List[Tuple[float, float]]]:
+    """Run Kraken's baseline segmenter and return a list of baselines."""
+
+    segmentation = _get_segmentation(image_path, model=model, out_pagexml=out_pagexml)
+
+    baselines: List[List[Tuple[float, float]]] = []
+    for line in segmentation.get("lines", []):
+        baseline = line.get("baseline")
+        if not baseline:
+            continue
+        baselines.append([(float(x), float(y)) for x, y in baseline])
+
     return baselines
+
+
+def segment_pages_with_kraken(
+    images: Iterable[Path],
+    output_dir: Path,
+    *,
+    model: Optional[str] = None,
+    pagexml_dir: Optional[Path] = None,
+    padding: int = 12,
+    min_width: int = 12,
+    min_height: int = 12,
+    global_cli_args: Optional[Sequence[str]] = None,
+    segment_cli_args: Optional[Sequence[str]] = None,
+) -> KrakenSegmentationStats:
+    """Segment ``images`` with Kraken and export individual line crops."""
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    pagexml_path: Optional[Path] = None
+    if pagexml_dir is not None:
+        pagexml_dir = Path(pagexml_dir)
+        pagexml_dir.mkdir(parents=True, exist_ok=True)
+
+    stats = KrakenSegmentationStats()
+
+    for image_path in images:
+        image_path = Path(image_path)
+        if not image_path.exists() or not image_path.is_file():
+            log.warning("Skipping %s (not a file)", image_path)
+            stats.skipped += 1
+            continue
+        if image_path.suffix.lower() not in _PAGE_IMAGE_EXTENSIONS:
+            log.debug("Skipping %s (unsupported extension)", image_path)
+            continue
+
+        stats.pages += 1
+        pagexml_path = pagexml_dir / f"{image_path.stem}.xml" if pagexml_dir else None
+
+        try:
+            segmentation = _get_segmentation(
+                image_path,
+                model=model,
+                out_pagexml=pagexml_path,
+                global_cli_args=global_cli_args,
+                segment_cli_args=segment_cli_args,
+            )
+        except Exception as exc:  # pragma: no cover - runtime Kraken failures
+            log.error("Kraken segmentation failed for %s: %s", image_path, exc)
+            stats.errors += 1
+            continue
+
+        lines = segmentation.get("lines", []) or []
+        if not lines:
+            log.warning("No lines detected in %s", image_path)
+            continue
+
+        try:
+            with Image.open(image_path) as im:
+                grayscale = im.convert("L")
+                width, height = grayscale.size
+                for index, line in enumerate(lines, start=1):
+                    bbox = _line_bbox(line, padding=padding)
+                    if not bbox:
+                        stats.skipped += 1
+                        continue
+                    clamped = _clamp_box(bbox, (width, height))
+                    if clamped is None:
+                        stats.skipped += 1
+                        continue
+                    left, top, right, bottom = clamped
+                    if (right - left) < min_width or (bottom - top) < min_height:
+                        stats.skipped += 1
+                        continue
+
+                    crop = grayscale.crop((left, top, right, bottom))
+                    out_name = f"{image_path.stem}_line{index:03d}.png"
+                    out_image = output_dir / out_name
+                    crop.save(out_image)
+
+                    label_path = out_image.with_suffix(".gt.txt")
+                    if not label_path.exists():
+                        label_path.write_text("", encoding="utf8")
+
+                    metadata = {
+                        "source_image": str(image_path),
+                        "line_index": index,
+                        "bbox": {
+                            "left": left,
+                            "top": top,
+                            "right": right,
+                            "bottom": bottom,
+                        },
+                        "baseline": line.get("baseline"),
+                        "boundary": line.get("boundary"),
+                        "id": line.get("id"),
+                    }
+                    metadata_path = out_image.with_suffix(".boxes.json")
+                    metadata_path.write_text(
+                        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf8",
+                    )
+
+                    stats.lines += 1
+        except Exception as exc:  # pragma: no cover - image IO failures
+            log.error("Failed to crop lines from %s: %s", image_path, exc)
+            stats.errors += 1
+
+    return stats
 
 
 def _run_with_live_output(
@@ -478,12 +628,21 @@ def _run_with_live_output(
     return stdout, stderr
 
 
+def _default_kraken_progress() -> Optional[str]:
+    """Return the safest progress renderer for the current platform."""
+
+    if os.name == "nt":
+        return "plain"
+    return None
+
+
 def train(
     dataset_dir: Path,
     model_out: Path,
     epochs: int = 50,
     val_split: float = 0.1,
     base_model: Optional[Path] = None,
+    progress: Optional[str] = None,
 ) -> Path:
     """Call ``ketos train`` with the given dataset directory."""
 
@@ -519,6 +678,14 @@ def train(
         env = os.environ.copy()
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")
+        if progress == "none":
+            env.pop("KRAKEN_PROGRESS", None)
+        elif progress:
+            env["KRAKEN_PROGRESS"] = progress
+        else:
+            default_progress = _default_kraken_progress()
+            if default_progress:
+                env.setdefault("KRAKEN_PROGRESS", default_progress)
 
         try:
             _run_with_live_output(cmd, env=env)

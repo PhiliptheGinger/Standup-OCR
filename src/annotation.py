@@ -1361,6 +1361,9 @@ class AnnotationAutoTrainConfig:
     gpt_cache_dir: Optional[Path] = None
     gpt_max_output_tokens: int = 256
     gpt_max_images: Optional[int] = None
+    resume: bool = True
+    deserialize_check_limit: Optional[int] = None
+    unicharset_size_override: Optional[int] = None
 
 
 @dataclass
@@ -1400,6 +1403,9 @@ class AnnotationTrainer:
                     gpt_cache_dir=self.config.gpt_cache_dir,
                     gpt_max_output_tokens=self.config.gpt_max_output_tokens,
                     gpt_max_images=self.config.gpt_max_images,
+                    resume=self.config.resume,
+                    deserialize_check_limit=self.config.deserialize_check_limit,
+                    unicharset_size_override=self.config.unicharset_size_override,
                 )
                 logging.info("Updated model saved to %s", model_path)
             except Exception:
