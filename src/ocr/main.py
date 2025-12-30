@@ -188,8 +188,10 @@ def main(argv: list[str] | None = None) -> None:
             "--agentic already processes new files; --rerun-failed will only re-run empty transcripts."
         )
 
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
+        level = logging.DEBUG if args.verbose else logging.INFO
+        logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
+        if not args.verbose:
+            logging.getLogger("PIL").setLevel(logging.WARNING)
 
     result = agentic_batch_transcribe(
         rerun_failed=args.rerun_failed, force=args.force, model_name=args.model

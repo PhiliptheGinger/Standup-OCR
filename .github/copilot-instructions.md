@@ -47,3 +47,5 @@ project-specific knowledge an AI assistant needs to be productive quickly.
   - Prefer small, focused CLI flag additions; mirror CLI help text in `README.md` if behaviour is visible to users.
 
 If any part of this feels incomplete or you want more examples (e.g. exact log messages, sample model files under `models/finetuned_training/`, or a short checklist for adding a new OCR backend), tell me which area to expand and I will iterate.
+
+When the user asks for a command, reply with the exact CLI invocation only (no prompt prefix) and wrap it in a fenced code block (triple backticks) so it’s directly copy/pasteable.

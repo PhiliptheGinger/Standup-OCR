@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Callable, Iterable, Iterator, Optional, Sequence, Set
+from typing import Callable, Iterable, Iterator, Optional, Protocol, Sequence, Set
 
 import cv2
 import numpy as np
@@ -36,6 +36,24 @@ class ReviewConfig:
     full_image_gpt: bool = True
 
 
+@dataclass
+class ReviewPromptContext:
+    image_path: Path
+    bbox: "ReviewSession.BoundingBox"
+    snippet: np.ndarray
+    recognised: str
+    tesseract_guess: str
+    gpt_guess: Optional[str]
+    full_image_guess: Optional[str]
+    confidence: float
+    preview: Optional[Path]
+
+
+class ReviewPromptHandler(Protocol):
+    def __call__(self, context: ReviewPromptContext) -> Optional[str]:
+        ...
+
+
 class ReviewSession:
     """Manage the lifecycle of an interactive review session."""
 
@@ -47,6 +65,7 @@ class ReviewSession:
         on_sample_saved: Optional[Callable[[Path, str, Path], None]] = None,
         transcriber: Optional[GPTTranscriber] = None,
         gpt_max_images: Optional[int] = None,
+        prompt_handler: Optional["ReviewPromptHandler"] = None,
     ) -> None:
         self.config = config
         self.train_dir = Path(config.train_dir)
@@ -62,6 +81,7 @@ class ReviewSession:
         self._gpt_max_images = gpt_max_images
         self._gpt_transcriptions = 0
         self._gpt_limit_logged = False
+        self._prompt_handler = prompt_handler
 
     # ------------------------------------------------------------------
     # Public API
@@ -153,17 +173,22 @@ class ReviewSession:
             elif not recognised and full_image_guess:
                 recognised = full_image_guess
 
-            preview_location = self._preview_snippet(snippet)
-            prompt = self._build_prompt(
-                image_path,
-                row,
-                preview_location,
-                recognised,
-                tesseract_guess,
-                gpt_guess,
-                full_image_guess,
+            preview_location: Optional[Path] = None
+            if self._prompt_handler is None:
+                preview_location = self._preview_snippet(snippet)
+
+            context = ReviewPromptContext(
+                image_path=image_path,
+                bbox=bbox,
+                snippet=snippet,
+                recognised=recognised,
+                tesseract_guess=tesseract_guess,
+                gpt_guess=gpt_guess,
+                full_image_guess=full_image_guess,
+                confidence=float(row.get("confidence", -1) or -1),
+                preview=preview_location,
             )
-            corrected = self._prompt_for_text(prompt, recognised)
+            corrected = self._prompt(context)
             if corrected is None:
                 continue
 
@@ -240,10 +265,24 @@ class ReviewSession:
             logging.info("Preview saved to %s", temp_path)
             return temp_path
 
+    def _prompt(self, context: ReviewPromptContext) -> Optional[str]:
+        if self._prompt_handler is not None:
+            return self._prompt_handler(context)
+        prompt = self._build_prompt(
+            context.image_path,
+            context.confidence,
+            context.preview,
+            context.recognised,
+            context.tesseract_guess,
+            context.gpt_guess,
+            context.full_image_guess,
+        )
+        return self._prompt_for_text(prompt, context.recognised)
+
     def _build_prompt(
         self,
         image_path: Path,
-        row,
+        confidence: float,
         preview: Optional[Path],
         recognised: str,
         tesseract_guess: str,
@@ -252,7 +291,7 @@ class ReviewSession:
     ) -> str:
         parts = [
             f"Image: {image_path.name}",
-            f"Confidence: {row.get('confidence', 'n/a')}",
+            f"Confidence: {confidence if confidence >= 0 else 'n/a'}",
         ]
         if gpt_guess:
             parts.append(f"Suggested (ChatGPT): '{gpt_guess}'")
@@ -513,4 +552,10 @@ class ReviewSession:
         return False
 
 
-__all__ = ["ReviewConfig", "ReviewSession", "ReviewAborted"]
+__all__ = [
+    "ReviewConfig",
+    "ReviewSession",
+    "ReviewAborted",
+    "ReviewPromptContext",
+    "ReviewPromptHandler",
+]

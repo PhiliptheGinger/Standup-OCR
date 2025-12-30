@@ -5,6 +5,8 @@ import argparse
 import json
 import logging
 import shutil
+import sys
+import time
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -17,12 +19,25 @@ from src.review import ReviewAborted, ReviewConfig, ReviewSession
 from src.training import SUPPORTED_EXTENSIONS, train_model
 from src.refine import DEFAULT_REFINE_PROMPT, run_refinement
 from src.kraken_adapter import (
+    DeskewConfig,
     is_available as kraken_available,
     ocr as kraken_ocr,
     segment_pages_with_kraken,
     train as kraken_train,
 )
 from src.kraken_dataset import sanitize_line_dataset
+from src.foreground_filter import (
+    DEFAULT_GPT_FILTER_MODEL,
+    DEFAULT_GPT_FILTER_PROMPT,
+    ForegroundFilterConfig,
+)
+from src.xnet import (
+    XNetController,
+    XNetConfig,
+    KrakenSegmenter,
+    KrakenRecognizer,
+    TesseractRecognizer,
+)
 
 
 DEFAULT_TRAIN_DIR = Path("train")
@@ -32,13 +47,53 @@ DEFAULT_TRANSCRIPTS_DIR = Path("transcripts") / "raw"
 DEFAULT_REFINED_DIR = Path("transcripts") / "refined"
 
 
+def notify_end(title: str, message: str) -> None:
+    """Best-effort end-of-run notification.
+
+    On Windows, attempts a toast notification if the optional `win10toast`
+    package is available; otherwise falls back to an audible beep.
+    Always emits a terminal bell as a fallback.
+    """
+
+    if sys.platform.startswith("win"):
+        try:
+            from win10toast import ToastNotifier  # type: ignore
+
+            ToastNotifier().show_toast(title, message, duration=6, threaded=True)
+            return
+        except Exception:
+            pass
+
+        try:
+            import winsound
+
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:
+            pass
+
+    try:
+        # Terminal bell fallback.
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+    logging.info("%s - %s", title, message)
+
+
 def setup_logging(verbose: bool = False) -> None:
     """Configure the root logger."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
         format="%(asctime)s - %(levelname)s - %(message)s",
+        force=True,
     )
+
+    # PIL can emit extremely verbose EXIF/TIFF debug logs when the root logger
+    # is configured for DEBUG elsewhere. Keep it quiet by default.
+    if not verbose:
+        logging.getLogger("PIL").setLevel(logging.WARNING)
 
 
 def iter_images(folder: Path) -> Iterable[Path]:
@@ -237,6 +292,23 @@ def handle_kraken_segment(args: argparse.Namespace) -> None:
 
     global_cli_args, segment_cli_args = _build_kraken_segment_cli_args(args)
 
+    filter_config: ForegroundFilterConfig | None = None
+    if args.filter_non_writing:
+        filter_config = ForegroundFilterConfig(
+            ink_ratio_threshold=args.filter_ink_threshold,
+            edge_density_threshold=args.filter_edge_threshold,
+            contrast_threshold=args.filter_contrast_threshold,
+        )
+
+    deskew_config = None
+    if not args.no_deskew:
+        deskew_config = DeskewConfig(
+            enabled=True,
+            max_skew=args.deskew_max_angle,
+            force_landscape=not args.deskew_allow_portrait,
+            force_upright=not args.deskew_allow_upside_down,
+        )
+
     stats = segment_pages_with_kraken(
         images,
         output_dir,
@@ -247,6 +319,12 @@ def handle_kraken_segment(args: argparse.Namespace) -> None:
         min_height=args.min_height,
         global_cli_args=global_cli_args or None,
         segment_cli_args=segment_cli_args or None,
+        filter_config=filter_config,
+        filter_use_gpt=args.filter_use_gpt,
+        filter_gpt_model=args.filter_gpt_model,
+        filter_gpt_prompt=args.filter_gpt_prompt,
+        filter_gpt_cache_dir=args.filter_gpt_cache_dir,
+        deskew_config=deskew_config,
     )
 
     logging.info(
@@ -267,6 +345,116 @@ def handle_test(args: argparse.Namespace) -> None:
         psm=args.psm,
     )
     print(text)
+
+
+def handle_xnet(args: argparse.Namespace) -> None:
+    source = Path(args.source)
+    if not source.exists():
+        raise FileNotFoundError(f"Source not found: {source}")
+
+    started = time.time()
+    processed = 0
+    accepted = 0
+    success = False
+
+    transcripts_dir = Path(args.output_dir)
+    transcripts_dir.mkdir(parents=True, exist_ok=True)
+
+    artifacts_dir = Path(args.artifacts_dir)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    segmenter = KrakenSegmenter(
+        model=str(args.kraken_model) if args.kraken_model else None,
+        pagexml_dir=Path(args.pagexml) if args.pagexml else None,
+        padding=args.padding,
+        min_width=args.min_width,
+        min_height=args.min_height,
+        deskew=not args.no_deskew,
+        deskew_max_angle=args.deskew_max_angle,
+        force_landscape=not args.deskew_allow_portrait,
+        force_upright=not args.deskew_allow_upside_down,
+    )
+
+    if getattr(args, "recognizer", "tesseract") == "kraken":
+        if args.kraken_ocr_model is None:
+            raise ValueError("--kraken-ocr-model is required when --recognizer kraken")
+        recognizer = KrakenRecognizer(model_path=Path(args.kraken_ocr_model))
+    else:
+        recognizer = TesseractRecognizer(
+            model_path=args.tesseract_model,
+            tessdata_dir=args.tessdata_dir,
+            psm=args.psm,
+            use_gpt_fallback=args.gpt_fallback,
+            gpt_model=args.gpt_model,
+            gpt_cache_dir=args.gpt_cache_dir,
+        )
+
+    config = XNetConfig(
+        min_confidence=args.min_confidence,
+        min_coherence=args.min_coherence,
+        min_similarity=args.min_similarity,
+        max_retries=args.max_retries,
+        auto_tune=not args.no_auto_tune,
+        segmenter=segmenter,
+        recognizer=recognizer,
+        ground_truth_page_dir=args.gt_page_dir,
+        write_report=args.write_report,
+    )
+    controller = XNetController(config)
+
+    images: List[Path]
+    if source.is_dir():
+        images = [p for p in sorted(source.iterdir()) if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS]
+    else:
+        images = [source]
+
+    if args.max_images is not None and args.max_images > 0:
+        images = images[: args.max_images]
+
+    try:
+        for image_path in images:
+            processed += 1
+            logging.info("XNet processing %s", image_path)
+            result = controller.run(image_path, output_dir=artifacts_dir / image_path.stem)
+            # Compose final page text from ordered lines
+            ordered = sorted(result.lines, key=lambda r: r.line.order_key)
+            page_text = "\n".join(rl.line.text for rl in ordered).strip()
+            if page_text and result.accepted:
+                accepted += 1
+                out_txt = transcripts_dir / f"{image_path.stem}.txt"
+                out_txt.write_text(page_text, encoding="utf8")
+                logging.info(
+                    "Wrote transcript %s (coherence=%.1f, attempts=%d, sim=%s)",
+                    out_txt,
+                    result.coherence,
+                    result.attempts,
+                    f"{result.similarity:.3f}" if result.similarity is not None else "n/a",
+                )
+            elif page_text and not result.accepted:
+                logging.warning(
+                    "Transcript rejected for %s (conf=%.1f coh=%.1f sim=%s, attempts=%d); skipping write.",
+                    image_path,
+                    result.avg_confidence,
+                    result.coherence,
+                    f"{result.similarity:.3f}" if result.similarity is not None else "n/a",
+                    result.attempts,
+                )
+            else:
+                logging.warning(
+                    "No transcript content for %s (coherence=%.1f, attempts=%d); skipping write.",
+                    image_path,
+                    result.coherence,
+                    result.attempts,
+                )
+        success = True
+    finally:
+        if getattr(args, "notify", False):
+            elapsed = time.time() - started
+            title = "Standup-OCR XNet finished" if success else "Standup-OCR XNet failed"
+            notify_end(
+                title,
+                f"Processed {processed} page(s); accepted {accepted}. Elapsed {elapsed:.1f}s.",
+            )
 
 
 def handle_batch(args: argparse.Namespace) -> None:
@@ -424,6 +612,8 @@ def handle_review(args: argparse.Namespace) -> None:
     last_trained_count = 0
     gpt_max_images = args.gpt_max_images
     transcriber: Optional[GPTTranscriber] = None
+    prompt_handler = None
+    tk_prompt = None
 
     if gpt_max_images is not None and gpt_max_images < 0:
         raise ValueError("--gpt-max-images must be zero or a positive integer")
@@ -471,11 +661,19 @@ def handle_review(args: argparse.Namespace) -> None:
             logging.info("Updated model saved to %s", model_path)
             last_trained_count += args.auto_train
 
+    if getattr(args, "gui", False):
+        from src.review_tk import TkReviewPrompt
+
+        tk_prompt = TkReviewPrompt()
+        prompt_handler = tk_prompt
+        config.preview = False
+
     session = ReviewSession(
         config,
         on_sample_saved=lambda *_args: maybe_train(),
         transcriber=transcriber,
         gpt_max_images=gpt_max_images,
+        prompt_handler=prompt_handler,
     )
 
     try:
@@ -493,6 +691,9 @@ def handle_review(args: argparse.Namespace) -> None:
     except ReviewAborted:
         logging.info("Review aborted by operator.")
         maybe_train()
+    finally:
+        if tk_prompt is not None:
+            tk_prompt.destroy()
 
 
 def handle_annotate(args: argparse.Namespace) -> None:
@@ -534,7 +735,15 @@ def handle_annotate(args: argparse.Namespace) -> None:
             unicharset_size_override=args.unicharset_size,
         )
 
-    if args.engine == "kraken" and args.seg == "auto" and not kraken_available():
+    # Validate pagexml_dir if load mode is specified
+    pagexml_dir = getattr(args, 'pagexml_dir', None)
+    if args.seg == "load":
+        if pagexml_dir is None:
+            raise ValueError("--seg load requires --pagexml-dir to be specified")
+        if not pagexml_dir.exists():
+            raise FileNotFoundError(f"PAGE-XML directory not found: {pagexml_dir}")
+
+    if args.seg == "auto" and args.engine == "kraken" and not kraken_available():
         logging.warning(
             "Kraken auto-segmentation requested but Kraken is not installed; falling back to manual mode."
         )
@@ -549,6 +758,7 @@ def handle_annotate(args: argparse.Namespace) -> None:
         prefill_model=args.prefill_model,
         prefill_tessdata=args.prefill_tessdata,
         prefill_psm=prefill_psm,
+        pagexml_dir=pagexml_dir,
     )
 
     transcripts_dir = None if args.skip_transcripts else args.transcripts_dir
@@ -847,6 +1057,76 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ARG",
         help="Additional raw argument appended after 'kraken segment' (repeatable).",
     )
+    kraken_segment_parser.add_argument(
+        "--no-deskew",
+        action="store_true",
+        help="Disable automatic deskew/orientation normalization before Kraken segmentation.",
+    )
+    kraken_segment_parser.add_argument(
+        "--deskew-max-angle",
+        type=float,
+        default=25.0,
+        help="Maximum absolute skew angle (degrees) corrected automatically (default: 25).",
+    )
+    kraken_segment_parser.add_argument(
+        "--deskew-allow-portrait",
+        action="store_true",
+        help="Keep portrait-oriented pages after deskew instead of rotating them to landscape.",
+    )
+    kraken_segment_parser.add_argument(
+        "--deskew-allow-upside-down",
+        action="store_true",
+        help="Skip the upright heuristic that flips pages appearing upside-down after deskew.",
+    )
+    kraken_segment_parser.add_argument(
+        "--filter-non-writing",
+        action="store_true",
+        help="Drop crops that look like blank background instead of handwriting.",
+    )
+    kraken_segment_parser.add_argument(
+        "--filter-ink-threshold",
+        type=float,
+        default=0.01,
+        metavar="RATIO",
+        help="Minimum ink ratio (0-1) required to keep a crop (default: 0.01).",
+    )
+    kraken_segment_parser.add_argument(
+        "--filter-edge-threshold",
+        type=float,
+        default=0.005,
+        metavar="RATIO",
+        help="Minimum edge density (0-1) required to keep a crop (default: 0.005).",
+    )
+    kraken_segment_parser.add_argument(
+        "--filter-contrast-threshold",
+        type=float,
+        default=5.0,
+        metavar="VALUE",
+        help="Minimum grayscale contrast needed to keep a crop (default: 5.0).",
+    )
+    kraken_segment_parser.add_argument(
+        "--filter-use-gpt",
+        action="store_true",
+        help="Ask ChatGPT to double-check borderline crops before discarding them.",
+    )
+    kraken_segment_parser.add_argument(
+        "--filter-gpt-model",
+        default=DEFAULT_GPT_FILTER_MODEL,
+        help=(
+            "ChatGPT model to use when --filter-use-gpt is enabled "
+            f"(default: {DEFAULT_GPT_FILTER_MODEL})."
+        ),
+    )
+    kraken_segment_parser.add_argument(
+        "--filter-gpt-prompt",
+        default=DEFAULT_GPT_FILTER_PROMPT,
+        help="Custom prompt passed to ChatGPT when vetting borderline crops.",
+    )
+    kraken_segment_parser.add_argument(
+        "--filter-gpt-cache-dir",
+        type=Path,
+        help="Optional cache directory reused across GPT foreground queries.",
+    )
     kraken_segment_parser.set_defaults(func=handle_kraken_segment)
 
     test_parser = subparsers.add_parser(
@@ -871,6 +1151,80 @@ def build_parser() -> argparse.ArgumentParser:
         help="Tesseract page segmentation mode (default: 6).",
     )
     test_parser.set_defaults(func=handle_test)
+
+    xnet_parser = subparsers.add_parser(
+        "xnet",
+        help="Goal-oriented OCR pipeline that sequences preprocess→segment→recognize→check→repair.",
+    )
+    xnet_parser.add_argument(
+        "--source",
+        type=Path,
+        default=Path("data") / "train" / "images",
+        help="Image file or directory to process (default: data/train/images).",
+    )
+    xnet_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_TRANSCRIPTS_DIR,
+        help="Directory where page transcripts will be written (default: transcripts/raw).",
+    )
+    xnet_parser.add_argument(
+        "--artifacts-dir",
+        type=Path,
+        default=Path("transcripts") / "xnet_artifacts",
+        help="Directory where per-page artifacts (normalized images, crops, reports) will be written (default: transcripts/xnet_artifacts).",
+    )
+    xnet_parser.add_argument(
+        "--write-report",
+        action="store_true",
+        help="Write a per-page report.json/report.txt into the per-page artifacts folder.",
+    )
+    xnet_parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send a best-effort desktop notification/beep when the run finishes.",
+    )
+    # Segmentation knobs (forwarded to KrakenSegmenter)
+    xnet_parser.add_argument("--kraken-model", type=Path, help="Optional Kraken segmentation model (.mlmodel).")
+    xnet_parser.add_argument("--pagexml", type=Path, help="Optional directory for PAGE-XML exports.")
+    xnet_parser.add_argument("--padding", type=int, default=12, help="Padding around lines before cropping.")
+    xnet_parser.add_argument("--min-width", type=int, default=24, help="Minimum crop width.")
+    xnet_parser.add_argument("--min-height", type=int, default=16, help="Minimum crop height.")
+    xnet_parser.add_argument("--no-deskew", action="store_true", help="Disable deskew before segmentation.")
+    xnet_parser.add_argument(
+        "--deskew-max-angle",
+        type=float,
+        default=25.0,
+        help="Maximum skew angle corrected automatically (default: 25).",
+    )
+    xnet_parser.add_argument("--deskew-allow-portrait", action="store_true", help="Keep portrait pages.")
+    xnet_parser.add_argument("--deskew-allow-upside-down", action="store_true", help="Allow upside-down pages.")
+    # Recognition knobs
+    xnet_parser.add_argument(
+        "--recognizer",
+        choices=["tesseract", "kraken"],
+        default="tesseract",
+        help="Recognizer backend for line crops (default: tesseract).",
+    )
+    xnet_parser.add_argument("--tesseract-model", type=Path, help="Optional .traineddata for Tesseract.")
+    xnet_parser.add_argument("--tessdata-dir", type=Path, help="Directory containing tessdata files.")
+    xnet_parser.add_argument("--psm", type=int, default=6, help="Tesseract page segmentation mode (default: 6).")
+    xnet_parser.add_argument(
+        "--kraken-ocr-model",
+        type=Path,
+        help="Kraken recognition model (.mlmodel) used when --recognizer kraken.",
+    )
+    xnet_parser.add_argument("--gpt-fallback", action="store_true", help="Use GPT vision fallback when needed.")
+    add_gpt_arguments(xnet_parser)
+    # Controller thresholds
+    xnet_parser.add_argument("--min-confidence", type=float, default=55.0, help="Minimum average line confidence.")
+    xnet_parser.add_argument("--min-coherence", type=float, default=60.0, help="Minimum language coherence score.")
+    xnet_parser.add_argument("--min-similarity", type=float, default=0.6, help="Minimum page-level similarity to ground truth (0-1).")
+    xnet_parser.add_argument("--max-retries", type=int, default=2, help="Maximum repair iterations.")
+    xnet_parser.add_argument("--no-auto-tune", action="store_true", help="Disable OCR parameter auto-tuning across retries.")
+    xnet_parser.add_argument("--max-images", type=int, help="Upper bound on how many images to process.")
+    xnet_parser.add_argument("--gt-page-dir", type=Path, help="Directory containing page-level ground truth .gt.txt files.")
+    xnet_parser.set_defaults(func=handle_xnet)
 
     batch_parser = subparsers.add_parser(
         "batch",
@@ -1117,6 +1471,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_parser.set_defaults(full_image_gpt=None)
     add_gpt_arguments(review_parser)
+    review_parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Launch the Tkinter-based reviewer instead of prompting in the console.",
+    )
     review_parser.set_defaults(func=handle_review)
 
     annotate_parser = subparsers.add_parser(
@@ -1131,9 +1490,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     annotate_parser.add_argument(
         "--seg",
-        choices=["auto", "manual"],
+        choices=["auto", "manual", "load"],
         default="auto",
-        help="Segmentation mode (default: auto).",
+        help=(
+            "Segmentation mode: 'auto' for automatic segmentation with Kraken, "
+            "'manual' for manual drawing, or 'load' to load from PAGE-XML files "
+            "(requires --pagexml-dir). Default: auto."
+        ),
     )
     annotate_parser.add_argument(
         "--export",
@@ -1243,6 +1606,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--prefill-psm",
         type=int,
         help="Tesseract page segmentation mode for prefill OCR (default: 6).",
+    )
+    annotate_parser.add_argument(
+        "--pagexml-dir",
+        type=Path,
+        help=(
+            "Directory containing pre-existing PAGE-XML annotations to load and edit. "
+            "When provided, enables 'load' segmentation mode where boxes are loaded from XML files "
+            "instead of auto-generated."
+        ),
     )
     add_gpt_arguments(annotate_parser)
     annotate_parser.set_defaults(func=handle_annotate)

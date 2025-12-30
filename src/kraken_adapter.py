@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import logging
 import math
@@ -13,16 +14,53 @@ import tempfile
 import threading
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from dataclasses import dataclass
+from xml.etree import ElementTree as ET
 
 from PIL import Image, ImageOps
 
 import numpy as np
 
+try:  # pragma: no cover - allow flat imports during tests
+    from .foreground_filter import (
+        DEFAULT_GPT_FILTER_MODEL,
+        DEFAULT_GPT_FILTER_PROMPT,
+        ForegroundFilterConfig,
+        GPTForegroundVerifier,
+        analyze_foreground,
+        compute_foreground_stats,
+    )
+    from .preprocessing import (
+        OrientationOptions,
+        load_normalized_image,
+        OrientationResult,
+        denormalize_coordinates,
+    )
+except ImportError:  # pragma: no cover
+    from foreground_filter import (  # type: ignore
+        DEFAULT_GPT_FILTER_MODEL,
+        DEFAULT_GPT_FILTER_PROMPT,
+        ForegroundFilterConfig,
+        GPTForegroundVerifier,
+        analyze_foreground,
+        compute_foreground_stats,
+    )
+    from preprocessing import (  # type: ignore
+        OrientationOptions,
+        load_normalized_image,
+        OrientationResult,
+        denormalize_coordinates,
+    )
+
 log = logging.getLogger(__name__)
 
 _PAGE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+_PAGE_XML_NAMESPACE = "http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15"
+
+
+def _pagexml_tag(tag: str) -> str:
+    return f"{{{_PAGE_XML_NAMESPACE}}}{tag}"
 
 
 @dataclass
@@ -31,6 +69,22 @@ class KrakenSegmentationStats:
     lines: int = 0
     skipped: int = 0
     errors: int = 0
+
+
+@dataclass
+class DeskewConfig:
+    enabled: bool = True
+    max_skew: float = 25.0
+    force_landscape: bool = True
+    force_upright: bool = True
+    skip_force_landscape: bool = False
+
+    def to_orientation_options(self) -> OrientationOptions:
+        return OrientationOptions(
+            max_skew=self.max_skew,
+            force_landscape=self.force_landscape and not self.skip_force_landscape,
+            force_upright=self.force_upright,
+        )
 
 
 def _kraken_exe_in_venv() -> str | None:
@@ -175,6 +229,40 @@ def _line_needs_center_padding(image_path: Path, target_height: int = 120) -> bo
         raise
 
     return False
+
+
+def _prepare_image_for_segmentation(
+    image_path: Path, deskew_config: DeskewConfig | None
+) -> tuple[Path, Optional[Callable[[], None]], OrientationResult | None]:
+    if deskew_config is None or not deskew_config.enabled:
+        return image_path, None, None
+
+    options = deskew_config.to_orientation_options()
+    try:
+        normalized, meta = load_normalized_image(image_path, options=options)
+    except Exception as exc:  # pragma: no cover - deskew best-effort only
+        log.warning("Deskew failed for %s: %s", image_path.name, exc)
+        return image_path, None, None
+
+    if not meta.applied:
+        return image_path, None, meta
+
+    tempdir = tempfile.TemporaryDirectory(prefix="standup-kraken-deskew-")
+    normalized_path = Path(tempdir.name) / image_path.name
+    normalized_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized.save(normalized_path)
+    log.debug(
+        "Deskewed %s (angle=%.2f, quadrants=%d, flipped=%s)",
+        image_path.name,
+        meta.angle,
+        meta.rotated_quadrants,
+        meta.flipped,
+    )
+
+    def cleanup() -> None:
+        tempdir.cleanup()
+
+    return normalized_path, cleanup, meta
 
 
 def _relative_to_dataset(path: Path, dataset_dir: Path) -> Path:
@@ -348,6 +436,243 @@ def _coerce_points(candidate: Any) -> list[tuple[float, float]] | None:
     return None
 
 
+def _infer_segmentation_type(payload: Dict[str, Any]) -> str:
+    seg_type = payload.get("type")
+    if isinstance(seg_type, str) and seg_type in {"bbox", "baselines"}:
+        return seg_type
+
+    lines = payload.get("lines", []) or []
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        line_type = line.get("type")
+        if isinstance(line_type, str) and line_type in {"bbox", "baselines"}:
+            return line_type
+        if _coerce_points(line.get("baseline")):
+            return "baselines"
+
+    return "bbox"
+
+
+def _resolve_segmentation_imagename(payload: Dict[str, Any]) -> str:
+    candidates = (
+        payload.get("imagename"),
+        payload.get("image"),
+        payload.get("image_filename"),
+        payload.get("imageFilename"),
+        payload.get("filename"),
+        payload.get("name"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, (str, Path)) and str(candidate).strip():
+            return str(candidate)
+
+    lines = payload.get("lines", []) or []
+    for line in lines:
+        if isinstance(line, dict):
+            candidate = line.get("imagename")
+            if isinstance(candidate, (str, Path)) and str(candidate).strip():
+                return str(candidate)
+
+    return "page"
+
+
+def _ensure_segmentation_container(segmentation: Dict[str, Any]):
+    from kraken.containers import Segmentation  # type: ignore
+
+    if isinstance(segmentation, Segmentation):
+        return segmentation
+
+    payload: Dict[str, Any] = dict(segmentation)
+    lines = list(payload.get("lines", []) or [])
+    payload["lines"] = lines
+    payload["regions"] = payload.get("regions") or {}
+    payload["line_orders"] = payload.get("line_orders") or []
+    payload["type"] = _infer_segmentation_type(payload)
+    payload["imagename"] = _resolve_segmentation_imagename(payload)
+    payload["text_direction"] = payload.get("text_direction") or "horizontal-lr"
+    has_tags = any(isinstance(line, dict) and line.get("tags") for line in lines)
+    script_detection = payload.get("script_detection")
+    if isinstance(script_detection, str):
+        script_detection = script_detection.strip().lower() in {"1", "true", "yes"}
+    payload["script_detection"] = bool(script_detection or has_tags)
+    payload.setdefault("language", None)
+
+    return Segmentation(**payload)
+
+
+def _serialize_with_kraken(
+    segmentation: Dict[str, Any],
+    image_size: tuple[int, int] | None = None,
+    imagename: str | None = None,
+) -> bytes:
+    from kraken.serialization import serialize  # type: ignore
+    from jinja2 import TemplateNotFound  # type: ignore
+
+    container = _ensure_segmentation_container(segmentation)
+    if imagename and str(imagename).strip():
+        try:
+            container.imagename = imagename
+        except Exception:
+            pass
+
+    def _render(template_name: str):
+        try:
+            if image_size:
+                return serialize(segmentation=container, template=template_name, image_size=image_size)
+            return serialize(segmentation=container, template=template_name)
+        except TypeError as exc:
+            message = str(exc)
+            if "unexpected keyword argument" in message and "segmentation" in message:
+                if image_size:
+                    return serialize(container, template=template_name, image_size=image_size)
+                return serialize(container, template=template_name)
+            raise
+
+    rendered = None
+    last_template_exc: Exception | None = None
+    for template_name in ("page", "pagexml"):
+        try:
+            rendered = _render(template_name)
+            break
+        except TemplateNotFound as exc:
+            last_template_exc = exc
+            continue
+
+    if rendered is None:
+        if last_template_exc is not None:
+            raise last_template_exc
+        raise RuntimeError("Kraken serialize() failed for templates: page, pagexml")
+
+    if isinstance(rendered, bytes):
+        return rendered
+    if isinstance(rendered, str):
+        return rendered.encode("utf-8")
+    raise TypeError(f"Kraken serialize() returned unsupported type: {type(rendered)!r}")
+
+
+def _clamp_points(
+    points: Iterable[tuple[float, float]],
+    image_size: tuple[int, int],
+) -> list[tuple[int, int]]:
+    width, height = image_size
+    max_x = max(0, width - 1)
+    max_y = max(0, height - 1)
+    clamped: list[tuple[int, int]] = []
+    for x, y in points:
+        cx = max(0, min(max_x, int(round(x))))
+        cy = max(0, min(max_y, int(round(y))))
+        clamped.append((cx, cy))
+    return clamped
+
+
+def _format_pagexml_points(points: Iterable[tuple[int, int]]) -> str:
+    return " ".join(f"{x},{y}" for x, y in points)
+
+
+def _fallback_baseline(
+    line: Dict[str, Any],
+    bbox: tuple[int, int, int, int] | None,
+    coords: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    baseline = _coerce_points(line.get("baseline"))
+    if baseline:
+        return [(int(round(x)), int(round(y))) for x, y in baseline]
+    if bbox is not None:
+        left, top, right, bottom = bbox
+        bottom = max(bottom - 1, top)
+        return [(left, bottom), (right, bottom)]
+    if coords:
+        start = coords[0]
+        end = coords[-1]
+        return [start, end]
+    return [(0, 0), (0, 0)]
+
+
+def _write_fallback_pagexml(
+    image_path: Path,
+    segmentation: Dict[str, Any],
+    output_path: Path,
+) -> None:
+    lines = segmentation.get("lines", []) or []
+    with Image.open(image_path) as image:
+        width, height = image.size
+
+    ET.register_namespace("", _PAGE_XML_NAMESPACE)
+    root = ET.Element(_pagexml_tag("PcGts"))
+
+    metadata = ET.SubElement(root, _pagexml_tag("Metadata"))
+    ET.SubElement(metadata, _pagexml_tag("Creator")).text = "Standup-OCR"
+    ET.SubElement(metadata, _pagexml_tag("Created")).text = datetime.utcnow().isoformat()
+
+    page = ET.SubElement(
+        root,
+        _pagexml_tag("Page"),
+        {
+            "imageFilename": image_path.name,
+            "imageWidth": str(width),
+            "imageHeight": str(height),
+        },
+    )
+    region = ET.SubElement(page, _pagexml_tag("TextRegion"), {"id": "r1"})
+
+    for index, line in enumerate(lines, start=1):
+        original_id = line.get("id")
+        if isinstance(original_id, str) and original_id.strip():
+            line_id = original_id.strip()
+        elif original_id is not None:
+            line_id = str(original_id)
+        else:
+            line_id = f"l{index:03d}"
+
+        coord_points = (
+            _coerce_points(line.get("boundary"))
+            or _coerce_points(line.get("polygon"))
+            or _coerce_points(line.get("bbox"))
+        )
+        bbox = _line_bbox(line, padding=0)
+        if not coord_points and bbox is not None:
+            left, top, right, bottom = bbox
+            coord_points = [
+                (left, top),
+                (right, top),
+                (right, bottom),
+                (left, bottom),
+            ]
+        if not coord_points:
+            coord_points = [
+                (0, 0),
+                (width, 0),
+                (width, height),
+                (0, height),
+            ]
+            bbox = (0, 0, width, height)
+
+        coords_clamped = _clamp_points(coord_points, (width, height))
+        if bbox is None and coords_clamped:
+            bbox = _bbox_from_points(coords_clamped, padding=0)
+
+        baseline_points = _fallback_baseline(line, bbox, coords_clamped)
+        baseline_clamped = _clamp_points(baseline_points, (width, height))
+
+        text_line = ET.SubElement(region, _pagexml_tag("TextLine"), {"id": line_id})
+        ET.SubElement(
+            text_line,
+            _pagexml_tag("Coords"),
+            {"points": _format_pagexml_points(coords_clamped)},
+        )
+        ET.SubElement(
+            text_line,
+            _pagexml_tag("Baseline"),
+            {"points": _format_pagexml_points(baseline_clamped)},
+        )
+        text_equiv = ET.SubElement(text_line, _pagexml_tag("TextEquiv"))
+        unicode_el = ET.SubElement(text_equiv, _pagexml_tag("Unicode"))
+        unicode_el.text = line.get("text") or ""
+
+    ET.ElementTree(root).write(output_path, encoding="utf-8", xml_declaration=True)
+
+
 def _bbox_from_points(
     points: list[tuple[float, float]],
     *,
@@ -421,12 +746,32 @@ def _get_segmentation(
 
     if out_pagexml is not None:
         try:
-            from kraken.serialization import serialize  # type: ignore
-
-            xml_bytes = serialize(segmentation=segmentation)
+            # Supply image size and filename to Kraken serialization for correct PAGE metadata.
+            try:
+                with Image.open(image_path) as _im:
+                    _w, _h = _im.size
+            except Exception:
+                _w, _h = 0, 0
+            xml_bytes = _serialize_with_kraken(
+                segmentation,
+                image_size=(_w, _h),
+                imagename=image_path.name,
+            )
             out_pagexml.write_bytes(xml_bytes)
         except Exception as exc:  # pragma: no cover - serialisation is best-effort
-            log.warning("Failed to serialise PAGE-XML via Kraken: %s", exc)
+            log.warning(
+                "Failed to serialise PAGE-XML via Kraken for %s: %s. Falling back to internal exporter.",
+                image_path,
+                exc,
+            )
+            try:
+                _write_fallback_pagexml(image_path, segmentation, out_pagexml)
+            except Exception as fallback_exc:  # pragma: no cover - defensive fallback
+                log.error(
+                    "Fallback PAGE-XML export also failed for %s: %s",
+                    image_path,
+                    fallback_exc,
+                )
 
     return segmentation
 
@@ -462,6 +807,12 @@ def segment_pages_with_kraken(
     min_height: int = 12,
     global_cli_args: Optional[Sequence[str]] = None,
     segment_cli_args: Optional[Sequence[str]] = None,
+    filter_config: ForegroundFilterConfig | None = None,
+    filter_use_gpt: bool = False,
+    filter_gpt_model: Optional[str] = None,
+    filter_gpt_prompt: Optional[str] = None,
+    filter_gpt_cache_dir: Optional[Path] = None,
+    deskew_config: DeskewConfig | None = None,
 ) -> KrakenSegmentationStats:
     """Segment ``images`` with Kraken and export individual line crops."""
 
@@ -475,6 +826,17 @@ def segment_pages_with_kraken(
 
     stats = KrakenSegmentationStats()
 
+    apply_filter = filter_config is not None
+    gpt_verifier: GPTForegroundVerifier | None = None
+    if filter_use_gpt and not apply_filter:
+        log.warning("--filter-use-gpt requested but no filter configuration was provided; ignoring GPT checks.")
+    elif filter_use_gpt and filter_config is not None:
+        gpt_verifier = GPTForegroundVerifier(
+            model=filter_gpt_model or DEFAULT_GPT_FILTER_MODEL,
+            prompt=filter_gpt_prompt or DEFAULT_GPT_FILTER_PROMPT,
+            cache_dir=filter_gpt_cache_dir,
+        )
+
     for image_path in images:
         image_path = Path(image_path)
         if not image_path.exists() or not image_path.is_file():
@@ -485,12 +847,15 @@ def segment_pages_with_kraken(
             log.debug("Skipping %s (unsupported extension)", image_path)
             continue
 
+        normalized_path, cleanup, normalization_meta = _prepare_image_for_segmentation(
+            image_path, deskew_config
+        )
         stats.pages += 1
         pagexml_path = pagexml_dir / f"{image_path.stem}.xml" if pagexml_dir else None
 
         try:
             segmentation = _get_segmentation(
-                image_path,
+                normalized_path,
                 model=model,
                 out_pagexml=pagexml_path,
                 global_cli_args=global_cli_args,
@@ -499,15 +864,22 @@ def segment_pages_with_kraken(
         except Exception as exc:  # pragma: no cover - runtime Kraken failures
             log.error("Kraken segmentation failed for %s: %s", image_path, exc)
             stats.errors += 1
+            if cleanup is not None:
+                cleanup()
             continue
 
         lines = segmentation.get("lines", []) or []
         if not lines:
             log.warning("No lines detected in %s", image_path)
+            if cleanup is not None:
+                cleanup()
             continue
 
         try:
-            with Image.open(image_path) as im:
+            # Capture original image size (after EXIF transpose) for accurate denormalization metadata
+            with Image.open(image_path) as orig_im:
+                orig_w, orig_h = orig_im.size
+            with Image.open(normalized_path) as im:
                 grayscale = im.convert("L")
                 width, height = grayscale.size
                 for index, line in enumerate(lines, start=1):
@@ -525,6 +897,22 @@ def segment_pages_with_kraken(
                         continue
 
                     crop = grayscale.crop((left, top, right, bottom))
+                    if apply_filter and filter_config is not None:
+                        measurements = compute_foreground_stats(crop)
+                        keep, borderline = analyze_foreground(measurements, filter_config)
+                        if borderline and gpt_verifier is not None:
+                            gpt_decision = gpt_verifier.decide(crop)
+                            if gpt_decision is not None:
+                                keep = gpt_decision
+                        if not keep:
+                            stats.skipped += 1
+                            log.debug(
+                                "Dropping %s line %03d due to weak foreground stats: %s",
+                                image_path.name,
+                                index,
+                                measurements,
+                            )
+                            continue
                     out_name = f"{image_path.stem}_line{index:03d}.png"
                     out_image = output_dir / out_name
                     crop.save(out_image)
@@ -532,6 +920,57 @@ def segment_pages_with_kraken(
                     label_path = out_image.with_suffix(".gt.txt")
                     if not label_path.exists():
                         label_path.write_text("", encoding="utf8")
+
+                    # Denormalize bbox and baseline to original image space if normalization was applied
+                    denormalized_bbox = None
+                    denormalized_baseline = None
+                    if normalization_meta is not None and normalization_meta.applied:
+                        # Denormalize bbox corners
+                        bbox_corners = [
+                            (float(left), float(top)),
+                            (float(right), float(bottom)),
+                        ]
+                        denorm_corners = denormalize_coordinates(
+                            bbox_corners,
+                            (orig_w, orig_h),  # true original size
+                            (width, height),  # normalized size
+                            normalization_meta,
+                        )
+                        if denorm_corners and len(denorm_corners) == 2:
+                            x_vals = [p[0] for p in denorm_corners]
+                            y_vals = [p[1] for p in denorm_corners]
+                            denormalized_bbox = {
+                                "left": int(min(x_vals)),
+                                "top": int(min(y_vals)),
+                                "right": int(max(x_vals)),
+                                "bottom": int(max(y_vals)),
+                            }
+                        
+                        # Denormalize baseline if present
+                        baseline_raw = line.get("baseline")
+                        if baseline_raw:
+                            baseline_points = _coerce_points(baseline_raw)
+                            if baseline_points:
+                                denorm_baseline = denormalize_coordinates(
+                                    baseline_points,
+                                    (orig_w, orig_h),
+                                    (width, height),
+                                    normalization_meta,
+                                )
+                                denormalized_baseline = [[int(p[0]), int(p[1])] for p in denorm_baseline]
+                    elif normalization_meta is not None and not normalization_meta.applied:
+                        # No rotation/deskew applied; keep original bbox as-is for convenience
+                        denormalized_bbox = {
+                            "left": left,
+                            "top": top,
+                            "right": right,
+                            "bottom": bottom,
+                        }
+                        baseline_raw = line.get("baseline")
+                        if baseline_raw:
+                            baseline_points = _coerce_points(baseline_raw)
+                            if baseline_points:
+                                denormalized_baseline = [[int(p[0]), int(p[1])] for p in baseline_points]
 
                     metadata = {
                         "source_image": str(image_path),
@@ -546,6 +985,24 @@ def segment_pages_with_kraken(
                         "boundary": line.get("boundary"),
                         "id": line.get("id"),
                     }
+                    
+                    # Add denormalized coordinates if available
+                    if denormalized_bbox is not None:
+                        metadata["bbox_original"] = denormalized_bbox
+                    if denormalized_baseline is not None:
+                        metadata["baseline_original"] = denormalized_baseline
+                    
+                    if normalization_meta is not None:
+                        metadata["normalization"] = {
+                            "angle": normalization_meta.angle,
+                            "rotated_quadrants": normalization_meta.rotated_quadrants,
+                            "flipped": normalization_meta.flipped,
+                            # Store both original and normalized sizes explicitly
+                            "original_width": orig_w,
+                            "original_height": orig_h,
+                            "normalized_width": width,
+                            "normalized_height": height,
+                        }
                     metadata_path = out_image.with_suffix(".boxes.json")
                     metadata_path.write_text(
                         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
@@ -556,6 +1013,9 @@ def segment_pages_with_kraken(
         except Exception as exc:  # pragma: no cover - image IO failures
             log.error("Failed to crop lines from %s: %s", image_path, exc)
             stats.errors += 1
+        finally:
+            if cleanup is not None:
+                cleanup()
 
     return stats
 
@@ -771,3 +1231,55 @@ def ocr_to_string(image_path: Path, model_path: Path) -> str:
             out_path.unlink()
         except OSError:  # pragma: no cover - file may already be gone
             pass
+
+
+@lru_cache(maxsize=8)
+def _load_kraken_recognizer(model_path: str):
+    """Load and cache a Kraken recognition model."""
+
+    from kraken.lib import models  # type: ignore
+
+    return models.load_any(model_path)
+
+
+def ocr_line_to_string(image_path: Path, model_path: Path) -> str:
+    """Run Kraken recognition on a *single line crop* and return text.
+
+    This prefers Kraken's in-process Python API (avoids Windows temp-file
+    cleanup issues observed when shelling out to ``kraken.exe``). If the
+    Python API is unavailable, falls back to ``ocr_to_string``.
+    """
+
+    try:
+        from kraken.containers import BBoxLine, Segmentation  # type: ignore
+        from kraken.rpred import rpred  # type: ignore
+    except Exception:
+        return ocr_to_string(image_path, model_path)
+
+    try:
+        with Image.open(image_path) as im:
+            # Kraken can operate on grayscale images; keep it simple.
+            gray = im.convert("L")
+            width, height = gray.size
+
+            seg = Segmentation(
+                type="bbox",
+                imagename=str(image_path),
+                text_direction="horizontal-lr",
+                script_detection=False,
+                lines=[BBoxLine(id="line", bbox=(0, 0, width, height))],
+            )
+
+            recognizer = _load_kraken_recognizer(str(model_path))
+            records = list(rpred(recognizer, gray, seg))
+            if not records:
+                return ""
+            prediction = getattr(records[0], "prediction", "") or ""
+            return str(prediction).strip()
+    except Exception as exc:  # pragma: no cover - best-effort runtime path
+        log.debug("Kraken in-process OCR failed for %s: %s", image_path, exc)
+        # Fallback to CLI path if we can.
+        try:
+            return ocr_to_string(image_path, model_path)
+        except Exception:
+            return ""

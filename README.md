@@ -68,6 +68,23 @@ Advanced runners can fine-tune Kraken by passing `--segment-device` (to select
 or `--segment-strategy baseline`. Use `--segment-global-arg` / `--segment-cli-arg`
 when you need raw pass-through arguments that are not exposed directly.
 
+By default `kraken-segment` now runs a deskew/orientation normalization pass on
+each page before invoking Kraken. This PCA/Hough-style rotation makes sideways
+or upside-down scans land "top-to-bottom, left-to-right" without losing the
+original metadata: the `.boxes.json` sidecar records which transforms were
+applied so later steps can recover the source orientation. Tune or disable the
+behaviour with:
+
+* `--no-deskew` – keep the original image untouched.
+* `--deskew-max-angle` – clamp the maximum absolute angle (default 25°).
+* `--deskew-allow-portrait` – skip the auto-rotate-to-landscape step.
+* `--deskew-allow-upside-down` – let pages remain upside-down when the heuristic
+  detects mirrored ink.
+
+The standalone helper `python scripts/normalize_lines_orientation.py train/lines`
+now shares the exact same logic, so you can reprocess historical crops with the
+deskew settings that work best for your handwriting.
+
 During training, `python main.py train --engine kraken --train-dir train/kraken_lines \
   --model models/handwriting.mlmodel --kraken-progress plain` forces Kraken to use a
 plain-text progress bar. The CLI now defaults to that safer renderer on Windows,
@@ -101,6 +118,10 @@ Key behaviour:
   transcription so each snippet defaults to coherent text. Pass
   `--no-full-image-gpt` to skip that pass or `--full-image-gpt` to force it
   when disabled globally.
+* Pass `--gui` to launch the new Tkinter-based reviewer. It renders the current
+  line crop, shows a page thumbnail with the Kraken polygon highlighted, and
+  surfaces Tesseract/GPT suggestions inline so you can accept, edit, skip, or
+  quit using buttons instead of the console prompt.
 
 During review you can:
 

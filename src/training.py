@@ -70,32 +70,46 @@ def _bootstrap_sample_training_image(train_dir: Path) -> Path:
 
 
 def _discover_images(train_dir: Path) -> List[Path]:
-    """Find all images with paired .gt.txt files in train_dir and common subdirectories."""
+    """Find all viable handwriting samples for training.
+
+    Respects the preferred ``lines/`` layout but gracefully falls back to
+    ``images/`` or the train root directory. When no samples exist, a bootstrap
+    image is generated to help first-time users run through the pipeline.
+    """
+
     train_dir.mkdir(parents=True, exist_ok=True)
-    supported = lambda p: p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
 
-    # Scan root
-    root_images = [p for p in train_dir.iterdir() if supported(p)]
+    def supported(path: Path) -> bool:
+        return path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
 
-    # Scan common subdirectories: lines/, images/
-    candidate_images = set(root_images)
+    def extend_unique(paths: Iterable[Path], store: list[Path], seen: set[Path]) -> None:
+        for candidate in paths:
+            resolved = candidate.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            store.append(candidate)
+
+    collected: list[Path] = []
+    seen: set[Path] = set()
+
     for subdir_name in ("lines", "images"):
         subdir = train_dir / subdir_name
-        if subdir.exists():
-            candidate_images.update(p for p in subdir.rglob("*") if supported(p))
+        if not subdir.exists():
+            continue
+        extend_unique((p for p in subdir.rglob("*") if supported(p)), collected, seen)
 
-    # ...existing code for filtering by .gt.txt...
-    images_with_gt = []
-    for img in candidate_images:
-        gt_path = img.with_suffix(".gt.txt")
-        if gt_path.exists():
-            images_with_gt.append(img)
-        else:
-            logging.warning(
-                f"Skipping {img.name}: no paired .gt.txt file"
-            )
+    extend_unique((p for p in train_dir.iterdir() if supported(p)), collected, seen)
 
-    return sorted(images_with_gt)
+    if not collected:
+        sample = _bootstrap_sample_training_image(train_dir)
+        return [sample]
+
+    has_real_samples = any(path.name != "word_sample.png" for path in collected)
+    if has_real_samples:
+        collected = [path for path in collected if path.name != "word_sample.png"]
+
+    return sorted(collected)
 
 
 def _ensure_directory(path: Path) -> Path:

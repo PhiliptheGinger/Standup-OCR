@@ -1,14 +1,15 @@
-"""Tkinter application for creating OCR training annotations."""
-
 from __future__ import annotations
+
+"""Tkinter application for creating OCR training annotations."""
 
 import csv
 import logging
 import threading
-from dataclasses import dataclass, field
+import difflib
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Literal
 
 import tkinter as tk
 from tkinter import messagebox
@@ -18,7 +19,6 @@ try:  # pragma: no cover - optional dependency for auto-segmentation
 except ImportError:  # pragma: no cover
     cv2 = None  # type: ignore[assignment]
 
-import numpy as np
 from PIL import Image, ImageOps, ImageTk
 
 try:  # pragma: no cover - allow running as a package or script
@@ -26,17 +26,35 @@ try:  # pragma: no cover - allow running as a package or script
     from .kraken_adapter import (
         is_available as kraken_available,
         ocr_to_string,
-        segment_lines,
     )
     from .line_store import Line
+    from .transcripts import load_transcript, save_transcript
+    from .xschema import (
+        AlignmentPlanner,
+        PlannerConfig,
+        XApplier,
+        LayoutSpan,
+        build_blocks_for_page,
+        extract_layout_spans_from_overlays,
+        extract_transcript_spans,
+    )
 except ImportError:  # pragma: no cover
     from exporters import save_line_crops, save_pagexml
     from kraken_adapter import (
         is_available as kraken_available,
         ocr_to_string,
-        segment_lines,
     )
     from line_store import Line
+    from transcripts import load_transcript, save_transcript  # type: ignore
+    from xschema import (  # type: ignore
+        AlignmentPlanner,
+        PlannerConfig,
+        XApplier,
+        LayoutSpan,
+        build_blocks_for_page,
+        extract_layout_spans_from_overlays,
+        extract_transcript_spans,
+    )
 
 
 _prefill_ocr_cached = None
@@ -68,6 +86,7 @@ def _get_prefill_ocr():
                 return None
     _prefill_ocr_cached = impl
     return impl
+
 
 CONTROL_MASK = 0x0004
 SHIFT_MASK = 0x0001
@@ -105,6 +124,7 @@ class AnnotationOptions:
     prefill_model: Optional[Path] = None
     prefill_tessdata: Optional[Path] = None
     prefill_psm: int = 6
+    pagexml_dir: Optional[Path] = None
 
 
 @dataclass
@@ -125,209 +145,264 @@ class OverlayItem:
     token: Optional[OcrToken] = None
     is_manual: bool = False
     selected: bool = False
+    entry_frame: Optional[tk.Frame] = None
+    window_id: Optional[int] = None
 
     @property
     def text(self) -> str:
+        return self.entry.get()
+
+
+try:  # pragma: no cover
+    from .annotation_io import load_tokens
+except ImportError:  # pragma: no cover
+    from annotation_io import load_tokens  # type: ignore
+
+
+class _FallbackStringVar:
+    def __init__(self) -> None:
+        self._value = ""
+
+    def set(self, value: str) -> None:
+        self._value = value
+
+    def get(self) -> str:
+        return self._value
+
+
+class _FallbackEntry:
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+        self._bindings: Dict[str, object] = {}
+
+    def insert(self, _index: object, text: str) -> None:
+        self.value = text
+
+    def delete(self, *_args: object, **_kwargs: object) -> None:
+        self.value = ""
+
+    def get(self, *_args: object, **_kwargs: object) -> str:
+        return self.value
+
+    def bind(self, sequence: str, handler) -> None:
+        self._bindings[sequence] = handler
+
+    def focus_set(self) -> None:  # pragma: no cover - no focus in tests
+        pass
+
+    def destroy(self) -> None:  # pragma: no cover - nothing to clean
+        pass
+
+
+class _FallbackCanvas:
+    def __init__(self) -> None:
+        self._next_id = 1
+        self._objects: Dict[int, Dict[str, object]] = {}
+
+    def _allocate_id(self) -> int:
+        obj_id = self._next_id
+        self._next_id += 1
+        return obj_id
+
+    def create_rectangle(self, x1, y1, x2, y2, **_kwargs):
+        obj_id = self._allocate_id()
+        self._objects[obj_id] = {"coords": [x1, y1, x2, y2]}
+        return obj_id
+
+    def create_window(self, x, y, **_kwargs):
+        obj_id = self._allocate_id()
+        self._objects[obj_id] = {"coords": [x, y]}
+        return obj_id
+
+    def delete(self, target):
+        if target == "all":
+            self._objects.clear()
+            return
+        self._objects.pop(target, None)
+
+    def coords(self, obj_id, *values):
+        obj = self._objects.setdefault(obj_id, {"coords": list(values) if values else []})
+        if values:
+            obj["coords"] = list(values)
+        return list(obj.get("coords", []))
+
+    def itemconfig(self, *_args, **_kwargs):
+        return None
+
+    def config(self, **_kwargs):
+        return None
+
+    def yview_moveto(self, *_args):  # pragma: no cover - not used in tests
+        return None
+
+    def xview_moveto(self, *_args):  # pragma: no cover - not used in tests
+        return None
+
+
+def _load_annotation_items(paths: Iterable[Path]) -> List[AnnotationItem]:
+    return [AnnotationItem(Path(p)) for p in paths]
+
+
+def _train_model(*args, **kwargs):  # pragma: no cover - runtime helper
+    try:
+        from .training import train_model
+    except ImportError:
+        from training import train_model  # type: ignore
+    return train_model(*args, **kwargs)
+
+
+class AnnotationTrainer:
+    """Schedule background training after every N samples."""
+
+    def __init__(self, master, train_dir: Path, config: "AnnotationAutoTrainConfig") -> None:
+        self.master = master
+        self.train_dir = train_dir
+        self.config = config
+        self.seen_samples: List[Path] = []
+
+    def __call__(self, sample_path: Path) -> None:
+        self.seen_samples.append(sample_path)
+        if len(self.seen_samples) % max(1, self.config.auto_train) != 0:
+            return
+
+        def runner() -> None:
+            _train_model(
+                train_dir=self.train_dir,
+                output_model=self.config.output_model,
+                model_dir=self.config.model_dir,
+                base_lang=self.config.base_lang,
+                max_iterations=self.config.max_iterations,
+                tessdata_dir=self.config.tessdata_dir,
+                use_gpt_ocr=self.config.use_gpt_ocr,
+                gpt_model=self.config.gpt_model,
+                gpt_prompt=self.config.gpt_prompt,
+                gpt_cache_dir=self.config.gpt_cache_dir,
+                gpt_max_output_tokens=self.config.gpt_max_output_tokens,
+                gpt_max_images=self.config.gpt_max_images,
+                resume=self.config.resume,
+                deserialize_check_limit=self.config.deserialize_check_limit,
+                unicharset_size_override=self.config.unicharset_size_override,
+            )
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
         try:
-            return self.entry.get()
-        except tk.TclError:  # pragma: no cover - defensive for destroyed entries
-            return ""
+            self.master.after(0, lambda: None)
+        except Exception:  # pragma: no cover - defensive guard
+            pass
 
 
 class AnnotationApp:
-    """Tkinter-based interface for collecting OCR training data."""
-
-    MAX_SIZE = (900, 700)
-    MIN_ZOOM = 0.5
-    MAX_ZOOM = 3.0
-    ZOOM_STEP = 1.25
+    MAX_SIZE = (1800, 1200)
 
     def __init__(
         self,
-        master: tk.Tk,
-        items: Iterable[AnnotationItem],
+        master,
+        items: Sequence[AnnotationItem],
         train_dir: Path,
         *,
         options: Optional[AnnotationOptions] = None,
         log_path: Optional[Path] = None,
-        on_sample_saved: Optional[callable[[Path], None]] = None,
+        on_sample_saved: Optional[Callable[[Path], None]] = None,
         transcripts_dir: Optional[Path] = None,
     ) -> None:
         self.master = master
-        self.items: List[AnnotationItem] = list(items)
-        if not self.items:
-            raise ValueError("No images were provided for annotation.")
+        self.items = list(items)
         self.index = 0
         self.train_dir = Path(train_dir)
-        self.train_dir.mkdir(parents=True, exist_ok=True)
         self.options = options or AnnotationOptions()
-        self.log_path = Path(log_path) if log_path is not None else None
-        if self.log_path is not None:
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self.transcripts_dir = Path(transcripts_dir) if transcripts_dir is not None else None
-        if self.transcripts_dir is not None:
-            self.transcripts_dir.mkdir(parents=True, exist_ok=True)
+        self.log_path = log_path
         self._on_sample_saved = on_sample_saved
+        if transcripts_dir is not None:
+            self.transcripts_dir = Path(transcripts_dir)
+        else:
+            self.transcripts_dir = None
+            default_dir = Path(__file__).resolve().parent.parent / "data" / "train" / "images"
+            if default_dir.exists():
+                self.transcripts_dir = default_dir
 
-        self.overlay_entries: List[tk.Entry] = []
         self.overlay_items: List[OverlayItem] = []
+        self.overlay_entries: List[tk.Entry] = []
         self.rect_to_overlay: Dict[int, OverlayItem] = {}
         self.selected_rects: set[int] = set()
         self.current_tokens: List[OcrToken] = []
-        self.manual_token_counter = 0
 
-        self._pressed_overlay: Optional[OverlayItem] = None
-        self._drag_start: Optional[Tuple[float, float]] = None
+        self.display_scale = (1.0, 1.0)
+        self.manual_token_counter = 0
         self._active_temp_rect: Optional[int] = None
-        self._modifier_drag = False
+        self._drag_start: Optional[Tuple[float, float]] = None
+        self._drag_overlay_start_bbox: Optional[Tuple[float, float, float, float]] = None
         self._marquee_rect: Optional[int] = None
+        self._modifier_drag = False
+        self._pressed_overlay: Optional[OverlayItem] = None
         self._user_modified_transcription = False
         self._setting_transcription = False
+        self._syncing_overlays = False
+        self._undo_stack: List[List[Tuple[str, Tuple[int, int, int, int], Tuple[int, int, int, int, int], bool]]] = []
 
-        self.display_scale: Tuple[float, float] = (1.0, 1.0)
-        self.current_photo: Optional[ImageTk.PhotoImage] = None
-        self.canvas_image_id: Optional[int] = None
-        self._base_image: Optional[Image.Image] = None
-        self._fit_scale: float = 1.0
-        self._zoom_level: float = 1.0
-        self._undo_stack: List[Callable[[], None]] = []
+        master.minsize(1400, 800)
+
+        # UI widgets (minimal layout)
+        right = tk.Frame(master, width=440, bg="#f5f5f5")
+        right.pack(side=tk.RIGHT, fill=tk.Y)
+        right.pack_propagate(False)
+
+        left = tk.Frame(master)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(left, bg="white", width=self.MAX_SIZE[0], height=self.MAX_SIZE[1])
+        y_scroll = tk.Scrollbar(left, orient=tk.VERTICAL, command=self.canvas.yview)
+        x_scroll = tk.Scrollbar(left, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.filename_var = tk.StringVar()
+        self.status_var = tk.StringVar()
+        tk.Label(right, textvariable=self.filename_var, bg="#f5f5f5", anchor="w").pack(fill=tk.X)
+        tk.Label(right, textvariable=self.status_var, bg="#f5f5f5", wraplength=400, anchor="w", justify=tk.LEFT).pack(fill=tk.X)
+        tk.Label(right, text="Transcript (gt.txt)", bg="#f5f5f5", anchor="w").pack(fill=tk.X)
+        self.entry_widget = tk.Text(right, width=64, height=12)
+        self.entry_widget.pack(fill=tk.BOTH, expand=False)
+        self.entry_widget.bind("<<Modified>>", self._on_transcription_modified)
+
+        tk.Label(right, text="Lines", bg="#f5f5f5", anchor="w").pack(fill=tk.X, pady=(6, 0))
+        self.lines_list = tk.Text(right, width=64, height=14, wrap=tk.NONE)
+        self.lines_list.configure(cursor="arrow")
+        self.lines_list.pack(fill=tk.BOTH, expand=True)
+        self.lines_list.bind("<Key>", lambda _e: "break")
+        self.lines_list.bind("<Button-1>", self._on_lines_click)
+        self._line_tag_names: Dict[int, str] = {}
+        self._line_tag_to_overlay: Dict[str, OverlayItem] = {}
+
+        controls = tk.Frame(right)
+        controls.pack(fill=tk.X)
+        self.undo_button = tk.Button(controls, text="Undo", command=self._on_undo, state=tk.DISABLED)
+        self.undo_button.pack(side=tk.LEFT)
+        self.delete_button = tk.Button(controls, text="Delete", command=self._delete_selected, state=tk.DISABLED)
+        self.delete_button.pack(side=tk.LEFT)
+        self.back_button = tk.Button(controls, text="Back", command=self.back, state=tk.DISABLED)
+        self.back_button.pack(side=tk.LEFT)
+        tk.Button(controls, text="Skip", command=self.skip).pack(side=tk.LEFT)
+        tk.Button(controls, text="Unsure", command=self.unsure).pack(side=tk.LEFT)
+        tk.Button(controls, text="Confirm", command=self.confirm).pack(side=tk.LEFT)
 
         self.mode_var = tk.StringVar(value="select")
-        self.status_var = tk.StringVar()
-        self.filename_var = tk.StringVar()
-
-        self.canvas: tk.Canvas
-        self.entry_widget: tk.Text
-        self.delete_button: tk.Button
-        self.back_button: tk.Button
-        self.lines_frame: tk.Frame
-
-        self._build_ui()
-        self._show_current()
-
-    # ------------------------------------------------------------------
-    # UI construction helpers
-    # ------------------------------------------------------------------
-    def _build_ui(self) -> None:
-        self.master.title("Standup-OCR Annotation")
-        self.master.geometry("1024x840")
-
-        container = tk.Frame(self.master, padx=12, pady=12)
-        container.pack(fill="both", expand=True)
-
-        header = tk.Label(container, textvariable=self.filename_var, font=("TkDefaultFont", 14, "bold"))
-        header.pack(anchor="w")
-
-        toolbar = tk.Frame(container)
-        toolbar.pack(anchor="w", pady=(12, 8))
-        tk.Radiobutton(toolbar, text="Select", variable=self.mode_var, value="select").pack(side="left")
-        tk.Radiobutton(toolbar, text="Draw", variable=self.mode_var, value="draw").pack(side="left", padx=(8, 0))
-
-        delete_btn = tk.Button(toolbar, text="Delete Selected", command=self._delete_selected, state=tk.DISABLED)
-        delete_btn.pack(side="left", padx=(16, 0))
-        self.delete_button = delete_btn
-
-        tk.Button(toolbar, text="Zoom In", command=lambda: self._adjust_zoom(self.ZOOM_STEP)).pack(side="left", padx=(16, 0))
-        tk.Button(toolbar, text="Zoom Out", command=lambda: self._adjust_zoom(1 / self.ZOOM_STEP)).pack(side="left", padx=(4, 0))
-        tk.Button(toolbar, text="Reset Zoom", command=self._reset_zoom).pack(side="left", padx=(4, 0))
-
-        content = tk.Frame(container)
-        content.pack(fill="both", expand=True)
-        content.columnconfigure(0, weight=3)
-        content.columnconfigure(1, weight=2)
-        content.rowconfigure(0, weight=1)
-
-        canvas_frame = tk.Frame(content)
-        canvas_frame.grid(row=0, column=0, sticky="nsew")
-        canvas_frame.rowconfigure(0, weight=1)
-        canvas_frame.columnconfigure(0, weight=1)
-
-        self.canvas = tk.Canvas(canvas_frame, bd=1, relief="sunken", highlightthickness=0)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-
-        v_scroll = tk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
-        v_scroll.grid(row=0, column=1, sticky="ns")
-        h_scroll = tk.Scrollbar(canvas_frame, orient="horizontal", command=self.canvas.xview)
-        h_scroll.grid(row=1, column=0, sticky="ew")
-        self.canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
-
-        side_panel = tk.Frame(content)
-        side_panel.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
-        side_panel.columnconfigure(0, weight=1)
-        side_panel.rowconfigure(0, weight=1)
-        side_panel.rowconfigure(1, weight=1)
-
-        lines_container = tk.LabelFrame(side_panel, text="Lines")
-        lines_container.grid(row=0, column=0, sticky="nsew")
-        lines_container.rowconfigure(0, weight=1)
-        lines_container.columnconfigure(0, weight=1)
-
-        lines_canvas = tk.Canvas(lines_container, bd=0, highlightthickness=0)
-        lines_canvas.grid(row=0, column=0, sticky="nsew")
-        lines_scroll = tk.Scrollbar(lines_container, orient="vertical", command=lines_canvas.yview)
-        lines_scroll.grid(row=0, column=1, sticky="ns")
-        lines_canvas.configure(yscrollcommand=lines_scroll.set)
-
-        self.lines_frame = tk.Frame(lines_canvas)
-        self.lines_frame.bind(
-            "<Configure>",
-            lambda event: lines_canvas.configure(scrollregion=lines_canvas.bbox("all")),
-        )
-        self._lines_canvas_window = lines_canvas.create_window((0, 0), window=self.lines_frame, anchor="nw")
-
-        def _sync_lines_width(event: tk.Event) -> None:
-            try:
-                lines_canvas.itemconfigure(self._lines_canvas_window, width=event.width)
-            except tk.TclError:
-                pass
-
-        lines_canvas.bind("<Configure>", _sync_lines_width)
-        self.lines_canvas = lines_canvas
-
-        transcription_container = tk.LabelFrame(side_panel, text="Transcription")
-        transcription_container.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
-        transcription_container.rowconfigure(0, weight=1)
-        transcription_container.columnconfigure(0, weight=1)
-        text_widget = tk.Text(transcription_container, height=6, wrap="word")
-        text_widget.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        text_widget.bind("<Key>", self._on_transcription_modified)
-        text_widget.bind("<Control-Return>", self._on_confirm)
-        text_widget.bind("<Command-Return>", self._on_confirm)
-        self.entry_widget = text_widget
-
-        buttons = tk.Frame(side_panel)
-        buttons.grid(row=2, column=0, sticky="ew", pady=(12, 8))
-        back_btn = tk.Button(buttons, text="Back", command=self.back)
-        back_btn.pack(side="left", padx=4)
-        self.back_button = back_btn
-        tk.Button(buttons, text="Skip", command=self.skip).pack(side="left", padx=4)
-        confirm_btn = tk.Button(buttons, text="Confirm", command=self.confirm, default=tk.ACTIVE)
-        confirm_btn.pack(side="left", padx=4)
-        tk.Button(buttons, text="Unsure", command=self.unsure).pack(side="left", padx=4)
-
-        status_label = tk.Label(side_panel, textvariable=self.status_var, fg="gray")
-        status_label.grid(row=3, column=0, sticky="w")
-
+        mode_frame = tk.Frame(right)
+        mode_frame.pack(fill=tk.X)
+        tk.Label(mode_frame, text="Mode:").pack(side=tk.LEFT)
+        tk.Radiobutton(mode_frame, text="Select", variable=self.mode_var, value="select", command=self._on_mode_change).pack(side=tk.LEFT)
+        tk.Radiobutton(mode_frame, text="Draw", variable=self.mode_var, value="draw", command=self._on_mode_change).pack(side=tk.LEFT)
         self.canvas.bind("<ButtonPress-1>", self._on_canvas_button_press)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
-        self.canvas.bind("<Control-MouseWheel>", self._on_mouse_zoom)
-        self.canvas.bind("<Control-Button-4>", lambda event: self._adjust_zoom(self.ZOOM_STEP))
-        self.canvas.bind("<Control-Button-5>", lambda event: self._adjust_zoom(1 / self.ZOOM_STEP))
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel_scroll)
+        self.canvas.bind("<Control-MouseWheel>", self._on_zoom)
+        master.bind("<Return>", self._on_confirm)
+        master.bind("<Escape>", self._on_escape)
+        master.bind("<Delete>", self._on_delete_selected)
+        master.bind("<Control-z>", self._on_undo)
 
-        self.master.bind("<Escape>", self._on_escape)
-        self.master.bind("<Delete>", self._on_delete_selected)
-        self.master.bind("<BackSpace>", self._on_delete_selected)
-        self.master.bind("<Control-z>", self._on_undo)
-        self.master.bind("<Command-z>", self._on_undo)
-        self.master.bind("<Control-Z>", self._on_undo)
-        self.master.bind("<Control-plus>", self._on_zoom_in)
-        self.master.bind("<Control-equal>", self._on_zoom_in)
-        self.master.bind("<Control-KP_Add>", self._on_zoom_in)
-        self.master.bind("<Control-minus>", self._on_zoom_out)
-        self.master.bind("<Control-underscore>", self._on_zoom_out)
-        self.master.bind("<Control-KP_Subtract>", self._on_zoom_out)
-        self.master.bind("<Control-0>", self._on_zoom_reset)
+        self._show_current()
 
     # ------------------------------------------------------------------
     # Utility helpers
@@ -339,6 +414,198 @@ class AnnotationApp:
             slug = slug.replace("--", "-")
         return slug[:60].rstrip("-")
 
+    def _safe_messagebox(self, name: str, *args, **kwargs):
+        func = getattr(messagebox, name)
+        try:
+            return func(*args, **kwargs)
+        except tk.TclError:
+            return None
+
+    def _ensure_runtime_defaults(self) -> None:
+        if not hasattr(self, "_undo_stack"):
+            self._undo_stack: List[List[Tuple[str, Tuple[int, int, int, int], Tuple[int, int, int, int, int], bool]]] = []
+        if not hasattr(self, "_on_sample_saved"):
+            self._on_sample_saved = None
+        if not hasattr(self, "status_var"):
+            self.status_var = _FallbackStringVar()
+        if not hasattr(self, "filename_var"):
+            self.filename_var = _FallbackStringVar()
+        if not hasattr(self, "options"):
+            self.options = AnnotationOptions()
+        if not hasattr(self, "transcripts_dir"):
+            self.transcripts_dir = None
+        if not hasattr(self, "_line_tag_names"):
+            self._line_tag_names = {}
+        if not hasattr(self, "_line_tag_to_overlay"):
+            self._line_tag_to_overlay = {}
+
+    def _render_lines_list(self) -> None:
+        try:
+            self.lines_list.delete("1.0", tk.END)
+            self._line_tag_names = {}
+            self._line_tag_to_overlay = {}
+            for idx, overlay in enumerate(sorted(self.overlay_items, key=lambda o: o.order_key), start=1):
+                text = overlay.entry.get().replace("\r", " ")
+                display = text.replace("\n", " ⏎ ")
+                start_index = self.lines_list.index(tk.END)
+                self.lines_list.insert(tk.END, f"{idx:02d}: {display}\n")
+                end_index = self.lines_list.index(tk.END)
+                tag_name = f"line-{overlay.rect_id}"
+                self.lines_list.tag_add(tag_name, start_index, end_index)
+                self._line_tag_names[overlay.rect_id] = tag_name
+                self._line_tag_to_overlay[tag_name] = overlay
+            self._update_lines_highlight()
+        except Exception:
+            pass
+
+    def _update_lines_highlight(self) -> None:
+        try:
+            for overlay in self.overlay_items:
+                tag_name = self._line_tag_names.get(overlay.rect_id)
+                if not tag_name:
+                    continue
+                bg = "#fdeaca" if overlay.selected else ""
+                self.lines_list.tag_configure(tag_name, background=bg)
+        except Exception:
+            pass
+
+    def _on_lines_click(self, event) -> str:
+        try:
+            index = self.lines_list.index(f"@{event.x},{event.y}")
+        except Exception:
+            return "break"
+        overlay: Optional[OverlayItem] = None
+        for tag in self.lines_list.tag_names(index):
+            overlay = self._line_tag_to_overlay.get(tag)
+            if overlay is not None:
+                break
+        if overlay is None:
+            return "break"
+        if event.state & CONTROL_MASK:
+            self._toggle_selection(overlay)
+        else:
+            self._select_single_line(overlay)
+        return "break"
+
+    def _snapshot_overlays(self) -> List[Tuple[str, Tuple[int, int, int, int], Tuple[int, int, int, int, int], bool]]:
+        snapshots: List[Tuple[str, Tuple[int, int, int, int], Tuple[int, int, int, int, int], bool]] = []
+        for ov in sorted(self.overlay_items, key=lambda o: o.order_key):
+            text_getter = getattr(ov.entry, "get", None)
+            if callable(text_getter):
+                text = text_getter()
+            else:
+                text = getattr(ov.entry, "value", "")
+            snapshots.append((text, ov.bbox, ov.order_key, ov.is_manual))
+        return snapshots
+
+    def _push_undo(
+        self,
+        snapshot: Optional[List[Tuple[str, Tuple[int, int, int, int], Tuple[int, int, int, int, int], bool]]] = None,
+    ) -> None:
+        self._ensure_runtime_defaults()
+        if snapshot is None:
+            snapshot = self._snapshot_overlays()
+        self._undo_stack.append(snapshot)
+        if hasattr(self, "undo_button"):
+            self.undo_button.config(state=tk.NORMAL if self._undo_stack else tk.DISABLED)
+
+    def _restore_snapshot(self, snapshot: List[Tuple[str, Tuple[int, int, int, int], Tuple[int, int, int, int, int], bool]]) -> None:
+        self.canvas.delete("all")
+        self._clear_overlay_entries()
+        self.overlay_items.clear()
+        self.rect_to_overlay.clear()
+        self.selected_rects.clear()
+        self._render_base_image(keep_overlays=False)
+        for text, bbox, order_key, is_manual in snapshot:
+            self._create_overlay(text, bbox, order_key, None, is_manual=is_manual, select=False)
+        self._update_transcription_from_overlays()
+
+    def _on_undo(self, _event: Optional[tk.Event] = None) -> None:
+        self._ensure_runtime_defaults()
+        if not self._undo_stack:
+            return
+        snapshot = self._undo_stack.pop()
+        if hasattr(self, "undo_button"):
+            self.undo_button.config(state=tk.NORMAL if self._undo_stack else tk.DISABLED)
+        self._restore_snapshot(snapshot)
+
+    def _set_zoom(self, zoom: float) -> None:
+        self._zoom_level = max(0.2, min(3.5, zoom))
+        self._render_base_image(keep_overlays=True)
+
+    def _on_mode_change(self) -> None:
+        self._ensure_runtime_defaults()
+        mode = self.mode_var.get()
+        cursor = "crosshair" if mode == "draw" else "arrow"
+        try:
+            self.canvas.config(cursor=cursor)
+        except Exception:
+            pass
+        if mode == "draw":
+            self.status_var.set("Draw: click-drag to add a line box. Press Esc to cancel.")
+        else:
+            self.status_var.set("Select: click to select a box; drag to move; Delete to remove.")
+
+    def _on_mousewheel_scroll(self, event) -> None:
+        # Windows uses event.delta in multiples of 120
+        delta = int(-1 * (event.delta / 120))
+        try:
+            if event.state & CONTROL_MASK:
+                # Ctrl+wheel handled separately for zoom
+                return
+            self.canvas.yview_scroll(delta, "units")
+        except Exception:
+            pass
+
+    def _on_zoom(self, event) -> None:
+        step = 1.1 if event.delta > 0 else 0.9
+        self._set_zoom(self._zoom_level * step)
+
+    def _get_transcription_text(self) -> str:
+        raw = self.entry_widget.get("1.0", tk.END)
+        return raw.rstrip("\n")
+
+    def _set_transcription(self, text: str) -> None:
+        self._setting_transcription = True
+        try:
+            self.entry_widget.delete("1.0", tk.END)
+            self.entry_widget.insert("1.0", text)
+            marker = getattr(self.entry_widget, "edit_modified", None)
+            if callable(marker):
+                marker(False)
+        finally:
+            self._setting_transcription = False
+
+    # ------------------------------------------------------------------
+    # Prefill helpers
+    # ------------------------------------------------------------------
+    def _suggest_label(self, image_path: Path) -> str:
+        if self.options.prefill_model and kraken_available():
+            return ocr_to_string(image_path, self.options.prefill_model)
+
+        if self.options.prefill_tessdata and cv2 is not None:
+            return ""
+
+        impl = _get_prefill_ocr()
+        if impl is None:
+            return ""
+        try:
+            result = impl(image_path, psm=self.options.prefill_psm)  # type: ignore[arg-type]
+        except Exception:
+            return ""
+        return result or ""
+
+    def _get_prefill(self, item: AnnotationItem) -> str:
+        if not self.options.prefill_enabled:
+            return ""
+        if item.prefill is not None:
+            return item.prefill
+        item.prefill = self._suggest_label(item.path)
+        return item.prefill
+
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
     def _on_confirm(self, _event: Optional[tk.Event]) -> None:
         self.confirm()
 
@@ -348,124 +615,13 @@ class AnnotationApp:
             self._active_temp_rect = None
             self._drag_start = None
         else:
-            self.master.destroy()
+            self._clear_selection()
 
-    def _get_transcription_text(self) -> str:
-        return self.entry_widget.get("1.0", tk.END).rstrip("\n")
+    def _on_delete_selected(self, _event: Optional[tk.Event]) -> None:
+        self._delete_selected()
 
-    def _set_transcription(self, value: str) -> None:
-        self._setting_transcription = True
-        self.entry_widget.delete("1.0", tk.END)
-        if value:
-            self.entry_widget.insert("1.0", value)
-        self._setting_transcription = False
-
-    def _apply_transcription_to_overlays(self) -> None:
-        for entry in list(self.overlay_entries):
-            try:
-                entry.delete(0, tk.END)
-            except Exception:  # pragma: no cover - defensive for stub entries
-                pass
-
-        if not self.overlay_items:
-            self.current_tokens = []
-            return
-
-        raw_text = self.entry_widget.get("1.0", tk.END)
-        normalized = raw_text.replace("\r\n", "\n")
-
-        overlays = sorted(self.overlay_items, key=lambda item: item.order_key)
-        segments = normalized.split("\n")
-        segment_index = 0
-        updated_tokens: List[OcrToken] = []
-
-        for position, overlay in enumerate(overlays):
-            remaining_overlays = len(overlays) - position
-            while (
-                segment_index < len(segments)
-                and segments[segment_index] == ""
-                and (len(segments) - segment_index) > remaining_overlays
-            ):
-                segment_index += 1
-
-            if segment_index < len(segments):
-                line_text = segments[segment_index]
-                segment_index += 1
-            else:
-                line_text = ""
-
-            overlay.entry.delete(0, tk.END)
-            overlay.entry.insert(0, line_text)
-
-            if overlay.token is not None:
-                overlay.token.text = line_text
-                baseline = overlay.token.baseline
-                origin = overlay.token.origin
-            else:
-                baseline = (0, 0, 0)
-                origin = (0, 0, 0)
-
-            updated_tokens.append(
-                OcrToken(
-                    text=line_text,
-                    bbox=overlay.bbox,
-                    order_key=overlay.order_key,
-                    baseline=baseline,
-                    origin=origin,
-                )
-            )
-
-        self.current_tokens = updated_tokens
-
-    def _on_transcription_modified(self, _event: Optional[tk.Event]) -> None:
-        if self._setting_transcription:
-            return
-        self._user_modified_transcription = True
-        self._apply_transcription_to_overlays()
-
-    def _compose_text_from_tokens(self, tokens: Sequence[OcrToken]) -> str:
-        pieces: List[str] = []
-        previous_paragraph: Optional[Tuple[int, int, int]] = None
-        previous_line: Optional[Tuple[int, int, int, int]] = None
-        for token in tokens:
-            paragraph_key = token.order_key[:3]
-            line_key = token.order_key[:4]
-            if not pieces:
-                pieces.append(token.text)
-            else:
-                if paragraph_key != previous_paragraph:
-                    pieces.append("\n\n" + token.text)
-                elif line_key != previous_line:
-                    pieces.append("\n" + token.text)
-                else:
-                    pieces.append(" " + token.text)
-            previous_paragraph = paragraph_key
-            previous_line = line_key
-        return "".join(pieces)
-
-    def _scale_bbox(self, bbox: Tuple[int, int, int, int]) -> Tuple[float, float, float, float]:
-        sx, sy = self.display_scale
-        x1, y1, x2, y2 = bbox
-        return (x1 * sx, y1 * sy, x2 * sx, y2 * sy)
-
-    def _to_base_bbox(self, coords: Tuple[float, float, float, float]) -> Tuple[int, int, int, int]:
-        sx, sy = self.display_scale
-        x1, y1, x2, y2 = coords
-        if sx == 0 or sy == 0:
-            return int(x1), int(y1), int(x2), int(y2)
-        return int(x1 / sx), int(y1 / sy), int(x2 / sx), int(y2 / sy)
-
-    def _safe_messagebox(self, name: str, *args, **kwargs):
-        func = getattr(messagebox, name)
-        try:
-            return func(*args, **kwargs)
-        except tk.TclError:
-            return None
-
-    # ------------------------------------------------------------------
-    # Navigation
-    # ------------------------------------------------------------------
     def confirm(self) -> None:
+        self._ensure_runtime_defaults()
         text = self._get_transcription_text()
         if not self.overlay_items and not text:
             self._safe_messagebox("showinfo", "No lines", "Create at least one line before confirming.")
@@ -496,9 +652,8 @@ class AnnotationApp:
         self._append_log(item.path, text, "confirmed", saved_path)
         self._update_transcript(item, text)
         self.status_var.set("Exported training data")
-        callback = getattr(self, "_on_sample_saved", None)
-        if callback is not None and saved_path is not None:
-            callback(saved_path)
+        if self._on_sample_saved is not None and saved_path is not None:
+            self._on_sample_saved(saved_path)
         self._advance()
 
     def skip(self) -> None:
@@ -521,8 +676,7 @@ class AnnotationApp:
 
     def back(self) -> None:
         if self.index == 0:
-            if hasattr(self, "back_button"):
-                self.back_button.config(state=tk.DISABLED)
+            self.back_button.config(state=tk.DISABLED)
             self.status_var.set("Already at the first item.")
             return
         self.index -= 1
@@ -537,6 +691,7 @@ class AnnotationApp:
         self._show_current()
 
     def _show_current(self, *, revisit: bool = False) -> None:
+        self._ensure_runtime_defaults()
         item = self.items[self.index]
         self.filename_var.set(f"{item.path.name} ({self.index + 1}/{len(self.items)})")
         self.back_button.config(state=tk.NORMAL if self.index > 0 else tk.DISABLED)
@@ -544,7 +699,7 @@ class AnnotationApp:
         self.entry_widget.focus_set()
         if revisit:
             status = self.status_var.get()
-            extra = []
+            extra: List[str] = []
             if item.saved_path is not None:
                 extra.append(f"Previously saved to {item.saved_path.name}.")
             extra.append("Returned to previous item.")
@@ -576,42 +731,31 @@ class AnnotationApp:
             max(1, int(base.width * fit_scale)),
             max(1, int(base.height * fit_scale)),
         )
-        display = base.resize(display_size, Image.LANCZOS)
-        sx = display.width / base.width if base.width else 1.0
-        sy = display.height / base.height if base.height else 1.0
-        self.display_scale = (sx, sy)
         self._base_image = base
         self._fit_scale = fit_scale
         self._zoom_level = 1.0
-        stack = getattr(self, "_undo_stack", None)
-        if stack is not None:
-            stack.clear()
-        else:
-            self._undo_stack = []
+        self._undo_stack: List[Callable[[], None]] = []
+        self._render_base_image(keep_overlays=False)
 
-        tokens: List[OcrToken]
-        if item.label:
-            tokens = []
-        elif self.options.segmentation == "auto" and self.options.engine == "kraken" and kraken_available():
-            try:
-                baselines = segment_lines(item.path)
-            except RuntimeError as exc:
-                self.status_var.set(str(exc))
-                baselines = []
-            tokens = [
-                OcrToken(
-                    text="",
-                    bbox=self._baseline_to_bbox(baseline),
-                    order_key=(1, 1, 1, index + 1, 1),
-                    baseline=(0, 0, 0),
-                    origin=(0, 0, 0),
-                )
-                for index, baseline in enumerate(baselines)
-            ]
-        else:
-            tokens = self._extract_tokens(base)
+        tokens, pagexml_used, status_msg = load_tokens(
+            item,
+            self.options,
+            self._baseline_to_bbox,
+            lambda img: self._extract_tokens(img),
+            base,
+            token_factory=OcrToken,
+        )
+        if status_msg:
+            self.status_var.set(status_msg)
 
-        self._display_image(display, tokens)
+        self._display_image(tokens)
+
+        transcript_text = self._load_page_transcript(item)
+        if transcript_text:
+            self._set_transcription(transcript_text)
+            self._apply_transcription_to_overlays()
+            self.status_var.set("Loaded transcript from gt.txt.")
+            return
 
         if item.label:
             self._set_transcription(item.label)
@@ -619,7 +763,15 @@ class AnnotationApp:
             self.status_var.set("Loaded existing transcription.")
             return
 
-        suggestion = self._get_prefill(item)
+        if pagexml_used and tokens:
+            fallback = self._compose_text_from_tokens(tokens)
+            self._set_transcription(fallback)
+            self._apply_transcription_to_overlays()
+            self.status_var.set("Loaded text from PAGE-XML boxes.")
+            return
+
+        should_prefill = not (self.options.segmentation == "load" and self.options.pagexml_dir)
+        suggestion = self._get_prefill(item) if should_prefill else ""
         if suggestion:
             self._set_transcription(suggestion)
             self._apply_transcription_to_overlays()
@@ -634,717 +786,820 @@ class AnnotationApp:
         elif tokens:
             self.status_var.set(f"Detected {len(tokens)} line(s) automatically.")
         else:
-            self.status_var.set("Draw baselines manually using the canvas.")
+            self.mode_var.set("draw")
+            self._on_mode_change()
+            self.status_var.set("No boxes found. Switch to Draw mode and drag to add line boxes.")
 
-    def _get_prefill(self, item: AnnotationItem) -> str:
-        options = getattr(self, "options", AnnotationOptions())
-        if not options.prefill_enabled:
-            return ""
-        if item.prefill is not None:
-            return item.prefill
-        suggestion = self._suggest_label(item.path)
-        item.prefill = suggestion
-        return suggestion
+    def _render_base_image(self, *, keep_overlays: bool) -> None:
+        if not hasattr(self, "_base_image"):
+            return
+        base = self._base_image
+        scale = max(0.1, min(4.0, self._fit_scale * self._zoom_level))
+        display_size = (
+            max(1, int(base.width * scale)),
+            max(1, int(base.height * scale)),
+        )
+        display = base.resize(display_size, Image.LANCZOS)
+        sx = display.width / base.width if base.width else 1.0
+        sy = display.height / base.height if base.height else 1.0
+        self.display_scale = (sx, sy)
 
-    def _display_image(self, image: Image.Image, tokens: Sequence[OcrToken]) -> None:
+        try:
+            self.current_photo = ImageTk.PhotoImage(display)
+        except (tk.TclError, RuntimeError):
+            self.current_photo = None
+            return
+
+        if not hasattr(self, "canvas"):
+            return
+
+        if keep_overlays and hasattr(self, "canvas_image_id"):
+            try:
+                self.canvas.itemconfig(self.canvas_image_id, image=self.current_photo)
+            except Exception:
+                keep_overlays = False
+
+        if not keep_overlays:
+            self.canvas.delete("all")
+            self.canvas_image_id = self.canvas.create_image(0, 0, anchor="nw", image=self.current_photo)
+
+        self.canvas.config(scrollregion=(0, 0, display.width, display.height))
+        # Keep the visible area stable around the last mouse position
+        try:
+            self.canvas.yview_moveto(0)
+            self.canvas.xview_moveto(0)
+        except Exception:
+            pass
+        if keep_overlays:
+            self._refresh_all_overlay_positions()
+
+    def _display_image(self, arg1, arg2: Optional[Sequence[OcrToken]] = None) -> None:
+        if arg2 is None:
+            tokens: Sequence[OcrToken] = arg1
+        else:
+            tokens = arg2
+        self._ensure_runtime_defaults()
         self.canvas.delete("all")
         self._clear_overlay_entries()
         self.overlay_items.clear()
         self.rect_to_overlay.clear()
         self.selected_rects.clear()
         self.current_tokens = list(tokens)
+        self._undo_stack.clear()
+        if hasattr(self, "undo_button"):
+            self.undo_button.config(state=tk.DISABLED)
 
-        self.current_photo = ImageTk.PhotoImage(image)
-        self.canvas_image_id = self.canvas.create_image(0, 0, anchor="nw", image=self.current_photo)
-        if hasattr(self.canvas, "config"):
-            self.canvas.config(scrollregion=(0, 0, image.width, image.height))
+        self._render_base_image(keep_overlays=False)
+
+        # Keep sidebar visible and ensure canvas uses a sensible cursor for the active mode
+        self._on_mode_change()
+
+        if not tokens:
+            self.status_var.set("No boxes loaded. Drag on the image to draw a box, then type the line in the sidebar text area.")
 
         for token in tokens:
             self._create_overlay(token.text, token.bbox, token.order_key, token)
-
         self._update_transcription_from_overlays()
-        manual_keys = [item.order_key[3] for item in self.overlay_items if item.is_manual]
-        if manual_keys:
-            self.manual_token_counter = max(manual_keys)
-        else:
-            self.manual_token_counter = 0
 
-    def _baseline_to_bbox(self, baseline: Sequence[Tuple[float, float]]) -> Tuple[int, int, int, int]:
-        xs = [point[0] for point in baseline]
-        ys = [point[1] for point in baseline]
-        left = int(min(xs))
-        right = int(max(xs))
-        top = int(min(ys))
-        bottom = int(max(ys)) + 10
-        return left, top, right, bottom
+    # ------------------------------------------------------------------
+    # Overlay creation and editing
+    # ------------------------------------------------------------------
+    def _scale_bbox(self, bbox: Tuple[int, int, int, int]) -> Tuple[float, float, float, float]:
+        sx, sy = self.display_scale if hasattr(self, "display_scale") else (1.0, 1.0)
+        x1, y1, x2, y2 = bbox
+        return (x1 * sx, y1 * sy, x2 * sx, y2 * sy)
+
+    def _to_base_bbox(self, coords: Tuple[float, float, float, float]) -> Tuple[int, int, int, int]:
+        sx, sy = self.display_scale if hasattr(self, "display_scale") else (1.0, 1.0)
+        x1, y1, x2, y2 = coords
+        if sx == 0 or sy == 0:
+            return (0, 0, 0, 0)
+        left, top, right, bottom = x1 / sx, y1 / sy, x2 / sx, y2 / sy
+        return (int(left), int(top), int(right), int(bottom))
+
+    def _clone_token(self, token: OcrToken) -> OcrToken:
+        return OcrToken(token.text, token.bbox, token.order_key, token.baseline, token.origin)
+
+    def _calculate_order_key_for_bbox(self, bbox: Tuple[int, int, int, int]) -> Tuple[int, int, int, int, int]:
+        return (1, 1, 1, len(self.overlay_items) + 1, 1)
+
+    def _estimate_bbox_for_new_line(self, index: int) -> Tuple[int, int, int, int]:
+        if self.overlay_items:
+            last = self.overlay_items[min(index, len(self.overlay_items) - 1)]
+            x1, y1, x2, y2 = last.bbox
+            height = max(1, y2 - y1)
+            offset = height + 5
+            return (x1, y2 + offset, x2, y2 + offset + height)
+        if hasattr(self, "_base_image"):
+            return (0, 0, self._base_image.width, max(10, self._base_image.height // 20))
+        return (0, 0, 10, 10)
 
     def _create_overlay(
         self,
         text: str,
         bbox: Tuple[int, int, int, int],
         order_key: Tuple[int, int, int, int, int],
-        token: Optional[OcrToken] = None,
+        token: Optional[OcrToken],
         *,
         is_manual: bool = False,
         select: bool = False,
+        has_box: bool = True,
     ) -> OverlayItem:
+        if not hasattr(self, "canvas") or self.canvas is None:
+            self.canvas = _FallbackCanvas()
+        canvas = self.canvas
         scaled = self._scale_bbox(bbox)
-        rect_id = self.canvas.create_rectangle(*scaled, outline="#f97316", width=2, tags=("overlay",))
-        entry_parent = getattr(self, "lines_frame", None)
-        entry = tk.Entry(entry_parent, width=80)
+        if has_box:
+            rect_id = canvas.create_rectangle(*scaled, outline="red", width=2)
+        else:
+            rect_id = canvas.create_rectangle(*scaled, outline="red", width=0)
+
+        frame = None
+        window_id = None
+        try:
+            frame = tk.Frame(canvas, bg="white", highlightthickness=0, bd=0)
+        except Exception:
+            frame = None
+
+        try:
+            parent = frame if frame is not None else self.canvas
+            entry = tk.Entry(parent, width=40, relief=tk.FLAT)
+        except Exception:
+            entry = _FallbackEntry()
         entry.insert(0, text)
-        entry.bind("<Key>", self._on_overlay_modified)
-        overlay = OverlayItem(rect_id=rect_id, entry=entry, bbox=bbox, order_key=order_key, token=token, is_manual=is_manual)
+        if frame is not None:
+            try:
+                entry.pack(fill=tk.X, padx=2, pady=1)
+            except Exception:
+                pass
+            try:
+                window_id = canvas.create_window(
+                    scaled[0],
+                    max(0, scaled[1] - 24),
+                    anchor="nw",
+                    window=frame,
+                )
+            except Exception:
+                window_id = None
+
+        overlay = OverlayItem(
+            rect_id,
+            entry,
+            bbox,
+            order_key,
+            token,
+            is_manual=is_manual,
+            selected=False,
+            entry_frame=frame,
+            window_id=window_id,
+        )
+        entry.bind("<KeyRelease>", self._on_overlay_modified)
+        entry.bind("<FocusIn>", lambda _e, ov=overlay: self._select_single_line(ov))
         self.overlay_items.append(overlay)
-        self.overlay_entries.append(entry)
         self.rect_to_overlay[rect_id] = overlay
-        self._reorder_overlays()
+        self.overlay_entries.append(entry)
+        self._refresh_overlay_visuals(overlay)
         if select:
-            self._select_overlay(overlay, additive=False)
+            self._select_single_line(overlay)
         return overlay
 
+    def _destroy_overlay(self, overlay: OverlayItem) -> None:
+        try:
+            self.canvas.delete(overlay.rect_id)
+        except Exception:
+            pass
+        if overlay.window_id is not None:
+            try:
+                self.canvas.delete(overlay.window_id)
+            except Exception:
+                pass
+        if overlay.entry_frame is not None:
+            try:
+                overlay.entry_frame.destroy()
+            except Exception:
+                pass
+        destroy_entry = getattr(overlay.entry, "destroy", None)
+        if callable(destroy_entry):
+            try:
+                destroy_entry()
+            except Exception:
+                pass
+        if overlay.entry in self.overlay_entries:
+            self.overlay_entries.remove(overlay.entry)
+        if overlay in self.overlay_items:
+            self.overlay_items.remove(overlay)
+        self.rect_to_overlay.pop(overlay.rect_id, None)
+        self.selected_rects.discard(overlay.rect_id)
+
     def _clear_overlay_entries(self) -> None:
+        for overlay in list(self.overlay_items):
+            if overlay.window_id is not None:
+                try:
+                    self.canvas.delete(overlay.window_id)
+                except Exception:
+                    pass
+            if overlay.entry_frame is not None:
+                try:
+                    overlay.entry_frame.destroy()
+                except Exception:
+                    pass
         for entry in list(self.overlay_entries):
             try:
                 entry.destroy()
-            except Exception:  # pragma: no cover - defensive
+            except Exception:
                 pass
         self.overlay_entries.clear()
 
-    def _reorder_overlays(self) -> None:
-        if getattr(self, "lines_frame", None) is None:
-            return
-        try:
-            self.overlay_items.sort(key=lambda item: item.order_key)
-        except Exception:  # pragma: no cover - defensive sorting
-            return
-        entries: List[tk.Entry] = []
-        for overlay in self.overlay_items:
-            entry = overlay.entry
+    def _reset_entry_value(self, entry) -> None:
+        deleter = getattr(entry, "delete", None)
+        if callable(deleter):
             try:
-                entry.pack_forget()
-            except Exception:  # pragma: no cover - defensive for stubs/destroyed widgets
-                pass
-            try:
-                entry.pack(fill="x", pady=2)
-            except Exception:  # pragma: no cover - defensive for stubs/destroyed widgets
-                continue
-            entries.append(entry)
-        if entries:
-            self.overlay_entries = entries
-        else:
-            self.overlay_entries.clear()
-
-    def _suggest_label(self, path: Path) -> str:
-        options = getattr(self, "options", AnnotationOptions())
-        if not options.prefill_enabled:
-            return ""
-        prefill_model = Path(options.prefill_model) if options.prefill_model else None
-        if prefill_model and prefill_model.suffix.lower() == ".mlmodel":
-            if not kraken_available():
-                logging.debug("Kraken prefill requested but Kraken is not available.")
-                return ""
-            try:
-                text = ocr_to_string(path, prefill_model)
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logging.debug("Kraken prefill failed for %s: %s", path, exc)
-                return ""
-        else:
-            ocr_impl = _get_prefill_ocr()
-            if ocr_impl is None:
-                return ""
-            try:
-                text = ocr_impl(
-                    path,
-                    model_path=options.prefill_model,
-                    tessdata_dir=options.prefill_tessdata,
-                    psm=options.prefill_psm,
-                )
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logging.debug("Prefill OCR failed for %s: %s", path, exc)
-                return ""
-        return text.strip()
-
-    def _extract_tokens(self, image: Image.Image) -> List[OcrToken]:
-        if image.width == 0 or image.height == 0:
-            return []
-
-        gray = np.array(image.convert("L"))
-        if gray.size == 0:
-            return []
-
-        if cv2 is not None:
-            return self._extract_tokens_with_cv2(gray)
-        return self._extract_tokens_without_cv2(gray)
-
-    def _extract_tokens_with_cv2(self, gray: np.ndarray) -> List[OcrToken]:
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        binary = 255 - thresh
-
-        non_zero = cv2.findNonZero(binary)
-        if non_zero is not None:
-            x, y, w, h = cv2.boundingRect(non_zero)
-            roi = binary[y : y + h, x : x + w]
-        else:
-            x = y = 0
-            h, w = binary.shape
-            roi = binary
-
-        kernel_width = max(15, roi.shape[1] // 40)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 3))
-        connected = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        contours, _ = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        boxes: List[Tuple[int, int, int, int]] = []
-        for contour in contours:
-            cx, cy, cw, ch = cv2.boundingRect(contour)
-            if ch < 12 or cw < 20:
-                continue
-            boxes.append((x + cx, y + cy, x + cx + cw, y + cy + ch))
-
-        if not boxes:
-            return []
-
-        boxes.sort(key=lambda box: (box[1], box[0]))
-        heights = [bottom - top for _, top, _, bottom in boxes]
-        median_height = float(np.median(heights)) if heights else 0.0
-        line_threshold = median_height * 0.6 if median_height else 20.0
-
-        lines: List[List[Tuple[int, int, int, int]]] = []
-        for box in boxes:
-            placed = False
-            for line in lines:
-                reference_top = float(np.mean([b[1] for b in line])) if line else box[1]
-                if abs(box[1] - reference_top) <= line_threshold:
-                    line.append(box)
-                    placed = True
-                    break
-            if not placed:
-                lines.append([box])
-
-        tokens: List[OcrToken] = []
-        for line_index, line_boxes in enumerate(lines, start=1):
-            for column_index, (left, top, right, bottom) in enumerate(sorted(line_boxes, key=lambda item: item[0]), start=1):
-                baseline = (left, bottom - 1, right)
-                origin = (left, top, bottom)
-                order_key = (2, line_index, 1, column_index, 1)
-                tokens.append(
-                    OcrToken(
-                        text="",
-                        bbox=(left, top, right, bottom),
-                        order_key=order_key,
-                        baseline=baseline,
-                        origin=origin,
-                    )
-                )
-
-        tokens.sort(key=lambda token: token.order_key)
-        return tokens
-
-    def _extract_tokens_without_cv2(self, gray: np.ndarray) -> List[OcrToken]:
-        threshold = self._otsu_threshold(gray)
-        mask = gray <= threshold
-        if not np.any(mask):
-            return []
-
-        row_activity = mask.sum(axis=1)
-        min_line_pixels = max(8, int(mask.shape[1] * 0.01))
-        active_rows = row_activity >= min_line_pixels
-        line_runs = self._find_runs(active_rows)
-
-        min_line_height = max(6, int(mask.shape[0] * 0.005))
-        tokens: List[OcrToken] = []
-        for line_index, (start, end) in enumerate(line_runs, start=1):
-            if end - start < min_line_height:
-                continue
-
-            line_slice = mask[start:end, :]
-            column_activity = line_slice.sum(axis=0)
-            min_col_pixels = max(4, int((end - start) * 0.3))
-            active_cols = np.where(column_activity >= min_col_pixels)[0]
-            if active_cols.size == 0:
-                active_cols = np.where(column_activity > 0)[0]
-                if active_cols.size == 0:
-                    continue
-
-            left = int(max(0, active_cols[0] - 2))
-            right = int(min(mask.shape[1], active_cols[-1] + 3))
-            top = max(0, start - 2)
-            bottom = min(mask.shape[0], end + 2)
-
-            baseline = (left, bottom - 1, right)
-            origin = (left, top, bottom)
-            order_key = (4, line_index, 1, 1, 1)
-            tokens.append(
-                OcrToken(
-                    text="",
-                    bbox=(left, top, right, bottom),
-                    order_key=order_key,
-                    baseline=baseline,
-                    origin=origin,
-                )
-            )
-
-        tokens.sort(key=lambda token: token.order_key)
-        return tokens
-
-    @staticmethod
-    def _otsu_threshold(gray: np.ndarray) -> int:
-        histogram, _ = np.histogram(gray, bins=256, range=(0, 256))
-        total = gray.size
-        sum_total = float(np.dot(np.arange(256), histogram))
-
-        sum_background = 0.0
-        weight_background = 0
-        max_variance = 0.0
-        threshold = 0
-        for value, count in enumerate(histogram):
-            weight_background += count
-            if weight_background == 0:
-                continue
-
-            weight_foreground = total - weight_background
-            if weight_foreground == 0:
-                break
-
-            sum_background += value * count
-            mean_background = sum_background / weight_background
-            mean_foreground = (sum_total - sum_background) / weight_foreground
-
-            variance = weight_background * weight_foreground * (mean_background - mean_foreground) ** 2
-            if variance > max_variance:
-                max_variance = variance
-                threshold = value
-
-        return threshold
-
-    @staticmethod
-    def _find_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
-        runs: List[Tuple[int, int]] = []
-        start: Optional[int] = None
-        for index, value in enumerate(mask):
-            if bool(value) and start is None:
-                start = index
-            elif not bool(value) and start is not None:
-                runs.append((start, index))
-                start = None
-        if start is not None:
-            runs.append((start, mask.size))
-        return runs
-
-    # ------------------------------------------------------------------
-    # Canvas interaction
-    # ------------------------------------------------------------------
-    def _on_canvas_button_press(self, event: tk.Event) -> None:
-        self._pressed_overlay = None
-        self._modifier_drag = bool(event.state & (CONTROL_MASK | SHIFT_MASK))
-        canvas_x = self.canvas.canvasx(event.x) if hasattr(self.canvas, "canvasx") else event.x
-        canvas_y = self.canvas.canvasy(event.y) if hasattr(self.canvas, "canvasy") else event.y
-        self._drag_start = (canvas_x, canvas_y)
-
-        for overlay in self.overlay_items:
-            left, top, right, bottom = self.canvas.coords(overlay.rect_id)
-            if left <= canvas_x <= right and top <= canvas_y <= bottom:
-                self._pressed_overlay = overlay
-                if not self._modifier_drag:
-                    self._clear_selection()
-                self._select_overlay(overlay, additive=self._modifier_drag)
+                deleter(0, tk.END)
                 return
+            except TypeError:
+                try:
+                    deleter(0, "end")
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        if hasattr(entry, "value"):
+            entry.value = ""
 
-        if self.mode_var.get() == "draw":
-            self._start_manual_overlay(canvas_x, canvas_y)
-        else:
-            self._clear_selection()
+    def _reorder_overlays(self) -> None:
+        self.overlay_items.sort(key=lambda o: o.order_key)
+        self.overlay_entries = [overlay.entry for overlay in self.overlay_items]
 
-    def _on_canvas_drag(self, event: tk.Event) -> None:
-        if self._active_temp_rect is not None:
-            canvas_x = self.canvas.canvasx(event.x) if hasattr(self.canvas, "canvasx") else event.x
-            canvas_y = self.canvas.canvasy(event.y) if hasattr(self.canvas, "canvasy") else event.y
-            x0, y0 = self._drag_start if self._drag_start is not None else (canvas_x, canvas_y)
-            self.canvas.coords(self._active_temp_rect, x0, y0, canvas_x, canvas_y)
+    def _prune_empty_overlays(self) -> None:
+        for overlay in list(self.overlay_items):
+            if overlay.entry.get().strip():
+                continue
+            if overlay.is_manual:
+                self._destroy_overlay(overlay)
 
-    def _on_canvas_release(self, event: tk.Event) -> None:
-        if self._active_temp_rect is not None:
-            canvas_x = self.canvas.canvasx(event.x) if hasattr(self.canvas, "canvasx") else event.x
-            canvas_y = self.canvas.canvasy(event.y) if hasattr(self.canvas, "canvasy") else event.y
-            self._finish_manual_overlay(canvas_x, canvas_y)
+    def _update_entry_window_for_coords(self, overlay: OverlayItem, coords: Tuple[float, float, float, float]) -> None:
+        if overlay.window_id is None:
             return
+        x1, y1, _x2, _y2 = coords
+        entry_y = max(0, y1 - 24)
+        self.canvas.coords(overlay.window_id, x1, entry_y)
 
-        if self._pressed_overlay is not None and self._modifier_drag:
-            self._select_overlay(self._pressed_overlay, additive=True)
-        elif self._pressed_overlay is not None:
-            self._select_overlay(self._pressed_overlay, additive=False)
+    def _update_overlay_position(self, overlay: OverlayItem) -> None:
+        coords = self._scale_bbox(overlay.bbox)
+        self.canvas.coords(overlay.rect_id, *coords)
+        if overlay.entry_frame is not None:
+            try:
+                overlay.entry_frame.config(width=max(80, int(coords[2] - coords[0])))
+            except Exception:
+                pass
+        self._update_entry_window_for_coords(overlay, coords)
 
-    def _start_manual_overlay(self, x: float, y: float) -> None:
-        self._active_temp_rect = self.canvas.create_rectangle(x, y, x, y, outline="#10b981", dash=(4, 2))
+    def _update_overlay_style(self, overlay: OverlayItem) -> None:
+        outline = "blue" if overlay.selected else "red"
+        width = 2 if overlay.selected else 1
+        try:
+            self.canvas.itemconfig(overlay.rect_id, outline=outline, width=width)
+        except Exception:
+            pass
+        bg = "#e7f0ff" if overlay.selected else "white"
+        if overlay.entry_frame is not None:
+            try:
+                overlay.entry_frame.config(bg=bg)
+            except Exception:
+                pass
+        try:
+            overlay.entry.config(bg=bg)
+        except Exception:
+            pass
 
-    def _finish_manual_overlay(self, x: float, y: float) -> None:
-        if self._active_temp_rect is None or self._drag_start is None:
-            return
-        coords = self.canvas.coords(self._active_temp_rect)
-        self.canvas.delete(self._active_temp_rect)
-        self._active_temp_rect = None
-        self._drag_start = None
+    def _refresh_overlay_visuals(self, overlay: OverlayItem) -> None:
+        self._update_overlay_position(overlay)
+        self._update_overlay_style(overlay)
 
-        left, top, right, bottom = coords
-        left, right = sorted((left, right))
-        top, bottom = sorted((top, bottom))
-        if abs(right - left) < 5 or abs(bottom - top) < 5:
-            return
-
-        base_bbox = self._to_base_bbox((left, top, right, bottom))
-        self.manual_token_counter += 1
-        order_key = (9, 9, 9, self.manual_token_counter, 1)
-        overlay = self._create_overlay("", base_bbox, order_key, None, is_manual=True, select=True)
-        overlay.entry.focus_set()
-        if hasattr(self, "status_var"):
-            self.status_var.set("Added manual line")
-        self._update_transcription_from_overlays()
-        self._push_undo(lambda key=order_key: self._undo_manual_overlay(key))
-
-    def _select_overlay(self, overlay: OverlayItem, *, additive: bool) -> None:
-        if not additive:
-            self._clear_selection()
-        overlay.selected = True
-        self.selected_rects.add(overlay.rect_id)
-        self.canvas.itemconfigure(overlay.rect_id, outline="#2563eb")
-        if hasattr(self, "delete_button"):
-            self.delete_button.config(state=tk.NORMAL)
-
-    def _clear_selection(self) -> None:
+    def _refresh_overlay_styles(self) -> None:
         for overlay in self.overlay_items:
-            if overlay.selected:
-                overlay.selected = False
-                self.canvas.itemconfigure(overlay.rect_id, outline="#f97316")
-        self.selected_rects.clear()
-        if hasattr(self, "delete_button"):
-            self.delete_button.config(state=tk.DISABLED)
-
-    def _on_overlay_modified(self, _event: Optional[tk.Event]) -> None:
-        self._user_modified_transcription = True
-        self._update_transcription_from_overlays()
+            self._update_overlay_style(overlay)
 
     def _update_transcription_from_overlays(self) -> None:
-        if self._setting_transcription:
-            return
         tokens: List[OcrToken] = []
-        for overlay in sorted(self.overlay_items, key=lambda item: item.order_key):
-            tokens.append(
-                OcrToken(
-                    text=overlay.text,
+        overlays = sorted(self.overlay_items, key=lambda item: item.order_key)
+        for overlay in overlays:
+            text = overlay.entry.get()
+            if overlay.token:
+                token = self._clone_token(overlay.token)
+                token.text = text
+            else:
+                token = OcrToken(
+                    text=text,
                     bbox=overlay.bbox,
                     order_key=overlay.order_key,
                     baseline=(0, 0, 0),
                     origin=(0, 0, 0),
                 )
-            )
+            tokens.append(token)
         self.current_tokens = tokens
-        text = self._compose_text_from_tokens(tokens)
-        self._set_transcription(text)
+        self._set_transcription(self._compose_text_from_tokens(tokens))
+        self._render_lines_list()
 
-    def _delete_selected(self) -> None:
-        if not self.selected_rects:
-            return
-        snapshots: List[Tuple[str, Tuple[int, int, int, int], Tuple[int, int, int, int, int], Optional[OcrToken], bool]] = []
-        overlays_to_delete: List[OverlayItem] = []
-        for rect_id in list(self.selected_rects):
-            overlay = self.rect_to_overlay.pop(rect_id, None)
-            if overlay is None:
-                continue
-            snapshots.append(
-                (
-                    overlay.text,
-                    overlay.bbox,
-                    overlay.order_key,
-                    self._clone_token(overlay.token),
-                    overlay.is_manual,
-                )
-            )
-            overlays_to_delete.append(overlay)
-        for overlay in overlays_to_delete:
-            try:
-                overlay.entry.destroy()
-            except Exception:  # pragma: no cover
-                pass
-            try:
-                self.canvas.delete(overlay.rect_id)
-            except Exception:  # pragma: no cover - stub canvas may not implement delete
-                pass
-            if overlay in self.overlay_items:
-                self.overlay_items.remove(overlay)
-            if overlay.entry in self.overlay_entries:
-                self.overlay_entries.remove(overlay.entry)
-            self.selected_rects.discard(overlay.rect_id)
-        self.selected_rects.clear()
-        if snapshots:
-            self._push_undo(lambda data=snapshots: self._restore_overlays(data))
-        if hasattr(self, "delete_button"):
-            self.delete_button.config(state=tk.DISABLED)
-        self._reorder_overlays()
-        self._update_transcription_from_overlays()
+    def _line_similarity(self, a: str, b: str) -> float:
+        """Return a normalized similarity score between two lines of text.
 
-    def _on_delete_selected(self, _event: Optional[tk.Event]) -> None:
+        Uses difflib.SequenceMatcher on lowercased, whitespace-stripped text.
+        Falls back to 0.0 if either side is empty or an error occurs.
+        """
+
+        a_norm = "".join(a.lower().split())
+        b_norm = "".join(b.lower().split())
+        if not a_norm or not b_norm:
+            return 0.0
         try:
-            widget = self.master.focus_get()
-        except tk.TclError:
-            widget = None
-        if widget is not None:
-            widget_class = widget.winfo_class()
-            if widget_class in {"Entry", "Text", "TEntry"}:
-                return
-        self._delete_selected()
+            matcher = difflib.SequenceMatcher(None, a_norm, b_norm)
+            return float(matcher.ratio())
+        except Exception:
+            return 0.0
 
-    # ------------------------------------------------------------------
-    # Undo and zoom helpers
-    # ------------------------------------------------------------------
-    def _push_undo(self, action: Callable[[], None]) -> None:
-        stack = getattr(self, "_undo_stack", None)
-        if stack is None:
-            stack = []
-            self._undo_stack = stack
-        stack.append(action)
-        if len(stack) > 50:
-            stack.pop(0)
-
-    def _undo_manual_overlay(self, order_key: Tuple[int, int, int, int, int]) -> None:
-        overlay = self._find_overlay_by_order_key(order_key)
-        if overlay is None:
+    def _apply_transcription_to_overlays(self, *_args, **_kwargs) -> None:
+        if not hasattr(self, "_syncing_overlays"):
+            self._syncing_overlays = False
+        if self._syncing_overlays:
             return
-        self._destroy_overlay(overlay)
-        self._update_transcription_from_overlays()
-        if hasattr(self, "status_var"):
-            self.status_var.set("Removed manual line")
+        self._syncing_overlays = True
+        try:
+            self._ensure_runtime_defaults()
+            raw_text = self.entry_widget.get("1.0", tk.END)
+            normalized = raw_text.replace("\r\n", "\n").rstrip("\n")
+            segments = [s for s in normalized.split("\n") if s.strip()]
 
-    def _restore_overlays(
-        self,
-        data: List[Tuple[str, Tuple[int, int, int, int], Tuple[int, int, int, int, int], Optional[OcrToken], bool]],
-    ) -> None:
-        overlays: List[OverlayItem] = []
-        for text, bbox, order_key, token, is_manual in data:
-            overlay = self._create_overlay(text, bbox, order_key, token, is_manual=is_manual, select=False)
-            overlays.append(overlay)
-        self._clear_selection()
-        for overlay in overlays:
-            self._select_overlay(overlay, additive=True)
-        self._update_transcription_from_overlays()
-        if hasattr(self, "status_var"):
-            self.status_var.set("Restored deleted lines")
+            # If there are no overlays yet, build them from the transcript lines
+            if not self.overlay_items:
+                for entry in list(getattr(self, "overlay_entries", [])):
+                    self._reset_entry_value(entry)
+                self.overlay_entries = []
+                updated_tokens: List[OcrToken] = []
+                for idx, text in enumerate(segments):
+                    bbox = self._estimate_bbox_for_new_line(idx)
+                    order_key = self._calculate_order_key_for_bbox(bbox)
+                    overlay = self._create_overlay(text, bbox, order_key, None, is_manual=True, select=False)
+                    if text:
+                        token = OcrToken(
+                            text=text,
+                            bbox=bbox,
+                            order_key=order_key,
+                            baseline=(0, 0, 0),
+                            origin=(0, 0, 0),
+                        )
+                        updated_tokens.append(token)
+                self.current_tokens = updated_tokens
+                self._reorder_overlays()
+                self._render_lines_list()
+                return
 
-    def _find_overlay_by_order_key(
-        self, order_key: Tuple[int, int, int, int, int]
-    ) -> Optional[OverlayItem]:
+            overlays = sorted(
+                self.overlay_items,
+                key=lambda item: (((item.bbox[1] + item.bbox[3]) // 2), item.order_key),
+            )
+
+            if not segments:
+                for overlay in overlays:
+                    overlay.entry.delete(0, tk.END)
+                self.current_tokens = []
+                self._render_lines_list()
+                return
+
+            options = getattr(self, "options", None)
+            segmentation_mode = getattr(options, "segmentation", None)
+            pagexml_dir = getattr(options, "pagexml_dir", None)
+            use_text_scoring = bool(segmentation_mode == "load" and pagexml_dir)
+            for overlay in overlays:
+                entry = getattr(overlay, "entry", None)
+                if entry is None or hasattr(entry, "get"):
+                    continue
+                setattr(entry, "get", lambda entry=entry: getattr(entry, "value", ""))
+
+            page_id = "page"
+            try:
+                if getattr(self, "items", None):
+                    item = self.items[self.index]
+                    page_id = Path(getattr(item, "path", "page")).stem
+            except Exception:
+                pass
+
+            transcript_spans = extract_transcript_spans(page_id, normalized)
+            layout_spans = extract_layout_spans_from_overlays(page_id, overlays)
+            block_source: Literal["pagexml", "kraken", "manual", "mixed", "legacy"] = "legacy"
+            if segmentation_mode == "manual":
+                block_source = "manual"
+            elif segmentation_mode == "load":
+                block_source = "pagexml"
+            elif segmentation_mode == "auto":
+                block_source = "kraken"
+            blocks = build_blocks_for_page(page_id, transcript_spans, layout_spans, source=block_source)
+
+            planner_mode: Literal["pagexml_trusted", "auto", "manual"] = "auto"
+            if segmentation_mode == "manual":
+                planner_mode = "manual"
+            elif segmentation_mode == "load":
+                planner_mode = "pagexml_trusted"
+
+            planner = AlignmentPlanner(
+                PlannerConfig(
+                    use_text_scoring=use_text_scoring,
+                    segmentation_mode=planner_mode,
+                ),
+                self._line_similarity,
+            )
+            plan = planner.plan(page_id, blocks)
+
+            layout_map = {span.id: span.overlay_item for span in layout_spans if span.overlay_item is not None}
+            layout_metadata: Dict[str, LayoutSpan] = {}
+            for block in plan.blocks:
+                for span in block.layout_spans:
+                    layout_metadata[span.id] = span
+            for link in plan.links:
+                for span in link.layouts:
+                    layout_metadata.setdefault(span.id, span)
+
+            context = _AnnotationXContext(self, layout_map, layout_metadata)
+            applier = XApplier(context)
+            applier.apply(plan.operations)
+
+            updated_tokens: List[OcrToken] = []
+            for overlay in sorted(self.overlay_items, key=lambda item: item.order_key):
+                text = overlay.entry.get()
+                if not text:
+                    continue
+                token = self._clone_token(overlay.token) if overlay.token else OcrToken(
+                    text=text,
+                    bbox=overlay.bbox,
+                    order_key=overlay.order_key,
+                    baseline=(0, 0, 0),
+                    origin=(0, 0, 0),
+                )
+                token.text = text
+                token.bbox = overlay.bbox
+                token.order_key = overlay.order_key
+                updated_tokens.append(token)
+
+            self.current_tokens = updated_tokens
+            self._reorder_overlays()
+            self._prune_empty_overlays()
+            self.overlay_entries = [overlay.entry for overlay in self.overlay_items]
+            self._render_lines_list()
+        finally:
+            self._syncing_overlays = False
+
+    def _on_transcription_modified(self, _event: Optional[tk.Event]) -> None:
+        if self._setting_transcription:
+            self.entry_widget.edit_modified(False)
+            return
+        self.entry_widget.edit_modified(False)
+        self._user_modified_transcription = True
+        self._apply_transcription_to_overlays()
+
+    def _compose_text_from_tokens(self, tokens: Sequence[OcrToken]) -> str:
+        pieces: List[str] = []
+        previous_paragraph: Optional[Tuple[int, int, int]] = None
+        previous_line: Optional[Tuple[int, int, int, int]] = None
+        for token in tokens:
+            paragraph_key = token.order_key[:3]
+            line_key = token.order_key[:4]
+            if not pieces:
+                pieces.append(token.text)
+            else:
+                if paragraph_key != previous_paragraph:
+                    pieces.append("\n\n" + token.text)
+                elif line_key != previous_line:
+                    pieces.append("\n" + token.text)
+                else:
+                    pieces.append(" " + token.text)
+            previous_paragraph = paragraph_key
+            previous_line = line_key
+        return "".join(pieces)
+
+    # ------------------------------------------------------------------
+    # Canvas interactions
+    # ------------------------------------------------------------------
+    def _clear_selection(self) -> None:
         for overlay in self.overlay_items:
-            if overlay.order_key == order_key:
+            overlay.selected = False
+        self.selected_rects.clear()
+        self.delete_button.config(state=tk.DISABLED)
+        self._refresh_overlay_styles()
+        self._update_lines_highlight()
+
+    def _refresh_all_overlay_positions(self) -> None:
+        for overlay in self.overlay_items:
+            self._refresh_overlay_visuals(overlay)
+
+    def _select_single_line(self, overlay: OverlayItem) -> None:
+        self._clear_selection()
+        overlay.selected = True
+        self.selected_rects.add(overlay.rect_id)
+        self.delete_button.config(state=tk.NORMAL)
+        self._refresh_overlay_styles()
+        self._update_lines_highlight()
+
+    def _toggle_selection(self, overlay: OverlayItem) -> None:
+        if overlay.selected:
+            overlay.selected = False
+            self.selected_rects.discard(overlay.rect_id)
+        else:
+            overlay.selected = True
+            self.selected_rects.add(overlay.rect_id)
+        self.delete_button.config(state=tk.NORMAL if self.selected_rects else tk.DISABLED)
+        self._refresh_overlay_styles()
+        self._update_lines_highlight()
+
+    def _overlay_at_point(self, x: float, y: float) -> Optional[OverlayItem]:
+        for overlay in self.overlay_items:
+            x1, y1, x2, y2 = self.canvas.coords(overlay.rect_id)
+            if x1 <= x <= x2 and y1 <= y <= y2:
                 return overlay
         return None
 
-    def _destroy_overlay(self, overlay: OverlayItem) -> None:
-        try:
-            self.canvas.delete(overlay.rect_id)
-        except Exception:  # pragma: no cover
-            pass
-        try:
-            overlay.entry.destroy()
-        except Exception:  # pragma: no cover
-            pass
-        if overlay in self.overlay_items:
-            self.overlay_items.remove(overlay)
-        if overlay.entry in self.overlay_entries:
-            self.overlay_entries.remove(overlay.entry)
-        self.rect_to_overlay.pop(overlay.rect_id, None)
-        self.selected_rects.discard(overlay.rect_id)
-        self._reorder_overlays()
-
-    def _clone_token(self, token: Optional[OcrToken]) -> Optional[OcrToken]:
-        if token is None:
-            return None
-        return OcrToken(
-            text=token.text,
-            bbox=token.bbox,
-            order_key=token.order_key,
-            baseline=token.baseline,
-            origin=token.origin,
-        )
-
-    def _on_undo(self, _event: Optional[tk.Event]) -> None:
-        stack = getattr(self, "_undo_stack", None)
-        if not stack:
+    def _on_canvas_button_press(self, event) -> None:
+        self.canvas.focus_set()
+        self._drag_overlay_start_bbox = None
+        if self.mode_var.get() == "draw":
+            self._drag_start = (event.x, event.y)
+            self._active_temp_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="blue")
             return
-        action = stack.pop()
-        action()
 
-    def _on_zoom_in(self, _event: Optional[tk.Event]) -> None:
-        self._adjust_zoom(self.ZOOM_STEP)
-
-    def _on_zoom_out(self, _event: Optional[tk.Event]) -> None:
-        self._adjust_zoom(1 / self.ZOOM_STEP)
-
-    def _on_zoom_reset(self, _event: Optional[tk.Event]) -> None:
-        self._reset_zoom()
-
-    def _on_mouse_zoom(self, event: tk.Event) -> str:
-        delta = getattr(event, "delta", 0)
-        if delta > 0:
-            self._adjust_zoom(self.ZOOM_STEP)
-        elif delta < 0:
-            self._adjust_zoom(1 / self.ZOOM_STEP)
-        return "break"
-
-    def _adjust_zoom(self, factor: float) -> None:
-        if self._base_image is None:
+        overlay = self._overlay_at_point(event.x, event.y)
+        self._pressed_overlay = overlay
+        if overlay is not None:
+            self._drag_start = (event.x, event.y)
+            self._drag_overlay_start_bbox = tuple(self.canvas.coords(overlay.rect_id))  # type: ignore[assignment]
+            if event.state & CONTROL_MASK:
+                self._toggle_selection(overlay)
+            else:
+                self._select_single_line(overlay)
             return
-        current_zoom = getattr(self, "_zoom_level", 1.0)
-        new_zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, current_zoom * factor))
-        if abs(new_zoom - current_zoom) < 1e-3:
-            return
-        self._zoom_level = new_zoom
-        self._render_zoomed_image()
+        self._clear_selection()
 
-    def _reset_zoom(self) -> None:
-        if self._base_image is None:
+    def _on_canvas_drag(self, event) -> None:
+        if self.mode_var.get() == "draw" and self._active_temp_rect is not None and self._drag_start:
+            x0, y0 = self._drag_start
+            self.canvas.coords(self._active_temp_rect, x0, y0, event.x, event.y)
             return
-        self._zoom_level = 1.0
-        self._render_zoomed_image()
 
-    def _render_zoomed_image(self) -> None:
-        if self._base_image is None:
-            return
-        fit_scale = getattr(self, "_fit_scale", 1.0)
-        zoom_level = getattr(self, "_zoom_level", 1.0)
-        self._zoom_level = zoom_level
-        scale = fit_scale * zoom_level
-        width = max(1, int(self._base_image.width * scale))
-        height = max(1, int(self._base_image.height * scale))
-        display = self._base_image.resize((width, height), Image.LANCZOS)
-        view_x = self.canvas.xview() if hasattr(self.canvas, "xview") else (0.0, 1.0)
-        view_y = self.canvas.yview() if hasattr(self.canvas, "yview") else (0.0, 1.0)
-        tokens = [
-            OcrToken(
-                text=token.text,
-                bbox=token.bbox,
-                order_key=token.order_key,
-                baseline=token.baseline,
-                origin=token.origin,
+        if (
+            self.mode_var.get() == "select"
+            and self._pressed_overlay is not None
+            and self._drag_start is not None
+            and getattr(self, "_drag_overlay_start_bbox", None) is not None
+        ):
+            start_bbox = self._drag_overlay_start_bbox  # type: ignore[attr-defined]
+            dx = event.x - self._drag_start[0]
+            dy = event.y - self._drag_start[1]
+            new_bbox = (
+                start_bbox[0] + dx,
+                start_bbox[1] + dy,
+                start_bbox[2] + dx,
+                start_bbox[3] + dy,
             )
-            for token in self.current_tokens
-        ]
-        self.display_scale = (
-            display.width / self._base_image.width if self._base_image.width else 1.0,
-            display.height / self._base_image.height if self._base_image.height else 1.0,
+            self.canvas.coords(self._pressed_overlay.rect_id, *new_bbox)
+            self._update_entry_window_for_coords(self._pressed_overlay, new_bbox)
+
+    def _finish_manual_overlay(self, end_x: float, end_y: float) -> None:
+        if self._active_temp_rect is None or self._drag_start is None:
+            return
+        self._push_undo(None)
+        x0, y0 = self._drag_start
+        coords = self.canvas.coords(self._active_temp_rect)
+        if not coords:
+            coords = (x0, y0, end_x, end_y)
+        x1, y1, x2, y2 = coords
+        left, right = sorted([x1, x2])
+        top, bottom = sorted([y1, y2])
+        bbox = self._to_base_bbox((left, top, right, bottom))
+        self.canvas.delete(self._active_temp_rect)
+        self._active_temp_rect = None
+        self._drag_start = None
+        self.manual_token_counter += 1
+        overlay = self._create_overlay(
+            "",
+            bbox,
+            self._calculate_order_key_for_bbox(bbox),
+            None,
+            is_manual=True,
+            select=True,
         )
-        self._display_image(display, tokens)
-        if hasattr(self.canvas, "config"):
-            self.canvas.config(scrollregion=(0, 0, display.width, display.height))
-        if hasattr(self.canvas, "xview_moveto"):
-            self.canvas.xview_moveto(view_x[0])
-        if hasattr(self.canvas, "yview_moveto"):
-            self.canvas.yview_moveto(view_y[0])
+        overlay.entry.focus_set()
+        self._update_transcription_from_overlays()
+        self.status_var.set("Added manual line")
+
+    def _on_canvas_release(self, event) -> None:
+        if self.mode_var.get() == "draw" and self._active_temp_rect is not None:
+            self._finish_manual_overlay(event.x, event.y)
+            return
+        if self._pressed_overlay:
+            if not (event.state & CONTROL_MASK):
+                self._select_single_line(self._pressed_overlay)
+            coords = self.canvas.coords(self._pressed_overlay.rect_id)
+            if coords:
+                if self._drag_overlay_start_bbox and tuple(coords) != tuple(self._drag_overlay_start_bbox):
+                    self._push_undo(None)
+                self._pressed_overlay.bbox = self._to_base_bbox(tuple(coords))
+                self._refresh_overlay_visuals(self._pressed_overlay)
+                self._update_transcription_from_overlays()
+            self._pressed_overlay = None
+        self._drag_start = None
+        self._drag_overlay_start_bbox = None
+
+    def _delete_selected(self) -> None:
+        if self.selected_rects:
+            self._push_undo(None)
+        for rect_id in list(self.selected_rects):
+            overlay = self.rect_to_overlay.get(rect_id)
+            if overlay is None:
+                continue
+            self._destroy_overlay(overlay)
+        self._clear_selection()
+        self._update_transcription_from_overlays()
+
+    def _on_overlay_modified(self, _event) -> None:
+        self._user_modified_transcription = True
+        self._update_transcription_from_overlays()
 
     # ------------------------------------------------------------------
-    # Transcription export helpers
+    # OCR helpers
     # ------------------------------------------------------------------
-    def _collect_lines(self) -> List[Line]:
-        lines: List[Line] = []
-        for idx, overlay in enumerate(sorted(self.overlay_items, key=lambda item: item.order_key), start=1):
-            left, top, right, bottom = overlay.bbox
-            baseline = [(left, bottom - 1), (right, bottom - 1)]
-            line = Line(
-                id=idx,
-                baseline=baseline,
-                bbox=overlay.bbox,
-                text=overlay.text,
-                order_key=overlay.order_key,
-                selected=overlay.selected,
-                is_manual=overlay.is_manual,
-            )
-            lines.append(line)
-        return lines
+    def _baseline_to_bbox(self, baseline: Sequence[Tuple[int, int]]) -> Tuple[int, int, int, int]:
+        xs = [p[0] for p in baseline]
+        ys = [p[1] for p in baseline]
+        return (min(xs), min(ys), max(xs), max(ys) + 4)
 
-    def _save_annotation(self, item: AnnotationItem, label: str) -> Path:
-        lines = self._collect_lines()
-        if self.options.export_format == "pagexml":
-            out_dir = self.train_dir / "pagexml"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"{self._slugify(item.path.stem)}.xml"
-            save_pagexml(item.path, lines, out_path)
-            return out_path
+    def _extract_tokens(self, image: Image.Image) -> List[OcrToken]:
+        # Default: no segmentation available
+        return []
 
-        out_dir = self.train_dir / "lines"
-        save_line_crops(item.path, lines, out_dir)
-        return out_dir
-
-    def _append_log(
-        self, path: Path, label: str, status: str, saved_path: Optional[Path]
-    ) -> None:
-        if self.log_path is None:
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+    def _append_log(self, path: Path, text: str, status: str, saved: Optional[Path]) -> None:
+        if not self.log_path:
             return
-
-        now = datetime.now(timezone.utc).isoformat()
-        row = {
-            "page": path.name,
-            "transcription": label,
-            "timestamp": now,
-            "status": status,
-            "saved_path": saved_path.name if saved_path else "",
-        }
-
-        fieldnames = ["page", "transcription", "timestamp", "status", "saved_path"]
-        write_header = False
-
-        if self.log_path.exists():
-            with self.log_path.open("r", newline="", encoding="utf8") as handle:
-                reader = csv.DictReader(handle)
-                existing_fields = reader.fieldnames or []
-                missing_required = [
-                    name
-                    for name in ("page", "transcription", "timestamp")
-                    if name not in existing_fields
-                ]
-                if missing_required:
-                    migrated_rows = []
-                    for existing in reader:
-                        migrated_rows.append(
-                            {
-                                "page": existing.get("page")
-                                or existing.get("filename")
-                                or "",
-                                "transcription": existing.get("transcription")
-                                or existing.get("label")
-                                or "",
-                                "timestamp": existing.get("timestamp")
-                                or now,
-                                "status": existing.get("status") or "",
-                                "saved_path": existing.get("saved_path") or "",
-                            }
-                        )
-
-                    with self.log_path.open("w", newline="", encoding="utf8") as out:
-                        writer = csv.DictWriter(out, fieldnames=fieldnames)
-                        writer.writeheader()
-                        for migrated in migrated_rows:
-                            writer.writerow(migrated)
-                else:
-                    fieldnames = list(existing_fields)
-                    for extra in ("status", "saved_path"):
-                        if extra and extra not in fieldnames:
-                            fieldnames.append(extra)
-        else:
-            write_header = True
-
+        line = [datetime.now(timezone.utc).isoformat(), path.name, status, saved.name if saved else "", text]
         with self.log_path.open("a", newline="", encoding="utf8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            if write_header:
-                writer.writeheader()
-            writer.writerow(row)
+            writer = csv.writer(handle)
+            writer.writerow(line)
 
     def _update_transcript(self, item: AnnotationItem, text: str) -> None:
         transcripts_dir = getattr(self, "transcripts_dir", None)
-        if transcripts_dir is None:
-            return
+        save_transcript(transcripts_dir, item.path, text)
 
-        transcript_path = Path(transcripts_dir) / f"{item.path.stem}.txt"
-        transcript_path.write_text(text, encoding="utf8")
+    def _load_page_transcript(self, item: AnnotationItem) -> str:
+        try:
+            default_dir = Path(__file__).resolve().parent.parent / "data" / "train" / "images"
+            search_roots: List[Path] = [default_dir] if default_dir.exists() else []
+        except Exception:
+            search_roots = []
+        return load_transcript(item.path, self.transcripts_dir, search_roots=search_roots)
+
+    def _overlays_to_lines(self) -> List[Line]:
+        lines: List[Line] = []
+        for index, overlay in enumerate(sorted(self.overlay_items, key=lambda o: o.order_key), start=1):
+            left, top, right, bottom = overlay.bbox
+            mid_y = (top + bottom) // 2
+            baseline = [(left, mid_y), (right, mid_y)]
+            lines.append(
+                Line(
+                    id=index,
+                    baseline=baseline,
+                    bbox=overlay.bbox,
+                    text=overlay.entry.get(),
+                    order_key=overlay.order_key,
+                    selected=overlay.selected,
+                    is_manual=overlay.is_manual,
+                )
+            )
+        return lines
+
+    def _save_annotation(self, item: AnnotationItem, text: str) -> Path:
+        self.train_dir.mkdir(parents=True, exist_ok=True)
+        lines = self._overlays_to_lines()
+        if self.options.export_format == "pagexml":
+            saved = self.train_dir / f"{item.path.stem}.xml"
+            save_pagexml(item.path, lines, saved)
+        else:
+            save_line_crops(item.path, lines, self.train_dir)
+            saved = self.train_dir / f"{item.path.stem}.png"
+        return saved
+
+
+class _AnnotationXContext:
+    """Bridge ``XApplier`` operations to the annotation canvas state."""
+
+    def __init__(
+        self,
+        app: "AnnotationApp",
+        layout_map: Dict[str, OverlayItem],
+        layout_metadata: Dict[str, "LayoutSpan"],
+    ) -> None:
+        self.app = app
+        self.layout_map = dict(layout_map)
+        self.layout_metadata = layout_metadata
+        self._snapshot_taken = False
+
+    # XContext API -----------------------------------------------------
+    def ensure_snapshot(self) -> None:
+        if not self._snapshot_taken:
+            self.app._push_undo(None)
+            self._snapshot_taken = True
+
+    def has_layout(self, layout_id: str) -> bool:
+        return layout_id in self.layout_map
+
+    def create_layout(
+        self,
+        layout_id: str,
+        *,
+        text: str,
+        bbox: Optional[Tuple[int, int, int, int]],
+        after_layout_id: Optional[str],
+        before_layout_id: Optional[str],
+    ) -> None:
+        metadata = self.layout_metadata.get(layout_id)
+        target_bbox = bbox or (metadata.bbox if metadata else None)
+        if target_bbox is None:
+            target_bbox = self.app._estimate_bbox_for_new_line(len(self.app.overlay_items))
+        order_key = metadata.order_key if metadata else self.app._calculate_order_key_for_bbox(target_bbox)
+        is_manual = metadata.is_manual if metadata else True
+        overlay = self.app._create_overlay(
+            text,
+            target_bbox,
+            order_key,
+            None,
+            is_manual=is_manual,
+            select=False,
+        )
+        self.layout_map[layout_id] = overlay
+        self._reposition_overlay(overlay, after_layout_id, before_layout_id)
+
+    def set_layout_text(self, layout_id: str, text: str) -> None:
+        overlay = self._require_overlay(layout_id)
+        entry = overlay.entry
+        deleter = getattr(entry, "delete", None)
+        inserter = getattr(entry, "insert", None)
+        if callable(deleter):
+            try:
+                deleter(0, tk.END)
+            except Exception:
+                pass
+        if callable(inserter):
+            try:
+                inserter(0, text)
+                return
+            except Exception:
+                pass
+        setattr(entry, "value", text)
+
+    def set_layout_bbox(self, layout_id: str, bbox: Tuple[int, int, int, int]) -> None:
+        overlay = self._require_overlay(layout_id)
+        overlay.bbox = bbox
+        self.app._refresh_overlay_visuals(overlay)
+
+    def get_layout_bbox(self, layout_id: str) -> Tuple[int, int, int, int]:
+        overlay = self._require_overlay(layout_id)
+        return overlay.bbox
+
+    def remove_layout(self, layout_id: str) -> None:
+        overlay = self.layout_map.pop(layout_id, None)
+        if overlay is None:
+            return
+        self.app._destroy_overlay(overlay)
+
+    # Internal helpers -------------------------------------------------
+    def _require_overlay(self, layout_id: str) -> OverlayItem:
+        overlay = self.layout_map.get(layout_id)
+        if overlay is None:
+            raise KeyError(f"Missing layout {layout_id}")
+        return overlay
+
+    def _reposition_overlay(
+        self,
+        overlay: OverlayItem,
+        after_layout_id: Optional[str],
+        before_layout_id: Optional[str],
+    ) -> None:
+        overlays = self.app.overlay_items
+        try:
+            overlays.remove(overlay)
+        except ValueError:
+            pass
+        index = len(overlays)
+        if after_layout_id and after_layout_id in self.layout_map:
+            anchor = self.layout_map.get(after_layout_id)
+            if anchor in overlays:
+                index = overlays.index(anchor) + 1
+        elif before_layout_id and before_layout_id in self.layout_map:
+            anchor = self.layout_map.get(before_layout_id)
+            if anchor in overlays:
+                index = overlays.index(anchor)
+        overlays.insert(index, overlay)
+        self.app.overlay_entries = [ov.entry for ov in overlays]
 
 
 @dataclass
@@ -1366,89 +1621,8 @@ class AnnotationAutoTrainConfig:
     unicharset_size_override: Optional[int] = None
 
 
-@dataclass
-class AnnotationTrainer:
-    master: tk.Misc
-    train_dir: Path
-    config: AnnotationAutoTrainConfig
-    _pending: Sequence[Path] = field(default_factory=list, init=False)
-    seen_samples: List[Path] = field(default_factory=list, init=False)
-
-    def __call__(self, sample_path: Path) -> None:
-        path = Path(sample_path)
-        self._pending = list(self._pending) + [path]
-        self.seen_samples.append(path)
-        if len(self._pending) >= self.config.auto_train:
-            self.master.after(0, self._maybe_train)
-
-    def _maybe_train(self) -> None:
-        if len(self._pending) < self.config.auto_train:
-            return
-        batch = list(self._pending)[: self.config.auto_train]
-        self._pending = self._pending[self.config.auto_train :]
-
-        def worker() -> None:
-            try:
-                logging.info("Auto-training triggered by %d new annotations", len(batch))
-                model_path = _train_model(
-                    self.train_dir,
-                    self.config.output_model,
-                    model_dir=self.config.model_dir,
-                    tessdata_dir=self.config.tessdata_dir,
-                    base_lang=self.config.base_lang,
-                    max_iterations=self.config.max_iterations,
-                    use_gpt_ocr=self.config.use_gpt_ocr,
-                    gpt_model=self.config.gpt_model,
-                    gpt_prompt=self.config.gpt_prompt,
-                    gpt_cache_dir=self.config.gpt_cache_dir,
-                    gpt_max_output_tokens=self.config.gpt_max_output_tokens,
-                    gpt_max_images=self.config.gpt_max_images,
-                    resume=self.config.resume,
-                    deserialize_check_limit=self.config.deserialize_check_limit,
-                    unicharset_size_override=self.config.unicharset_size_override,
-                )
-                logging.info("Updated model saved to %s", model_path)
-            except Exception:
-                logging.exception("Auto-training failed")
-
-        threading.Thread(target=worker, daemon=True).start()
-
-
-def _train_model(*args, **kwargs):  # pragma: no cover
-    if __package__:
-        from .training import train_model as _impl
-    else:
-        from training import train_model as _impl  # type: ignore
-    return _impl(*args, **kwargs)
-
-
-def _load_annotation_items(
-    sources: Iterable[Path],
-    transcripts_dir: Optional[Path],
-) -> List[AnnotationItem]:
-    items: List[AnnotationItem] = []
-    transcripts_path = Path(transcripts_dir) if transcripts_dir is not None else None
-
-    for raw_path in sources:
-        path = Path(raw_path)
-        item = AnnotationItem(path)
-
-        if transcripts_path is not None:
-            transcript_file = transcripts_path / f"{path.stem}.txt"
-            if transcript_file.exists():
-                try:
-                    item.label = transcript_file.read_text(encoding="utf8")
-                    item.status = "loaded"
-                except OSError as exc:  # pragma: no cover - logging only
-                    logging.warning("Could not read transcript %s: %s", transcript_file, exc)
-
-        items.append(item)
-
-    return items
-
-
 def annotate_images(
-    sources: Iterable[Path],
+    items: Iterable[Path],
     train_dir: Path,
     *,
     options: Optional[AnnotationOptions] = None,
@@ -1456,33 +1630,32 @@ def annotate_images(
     auto_train_config: Optional[AnnotationAutoTrainConfig] = None,
     transcripts_dir: Optional[Path] = None,
 ) -> None:
-    items = _load_annotation_items(sources, transcripts_dir)
-    if not items:
-        raise ValueError("No images found to annotate.")
-
-    try:
-        root = tk.Tk()
-    except tk.TclError as exc:
-        raise RuntimeError(
-            "Tkinter could not be initialised. Ensure a display is available or install python3-tk."
-        ) from exc
-
-    callback = None
-    if auto_train_config is not None:
-        callback = AnnotationTrainer(root, train_dir=Path(train_dir), config=auto_train_config)
-
+    """Launch the annotation UI for the given image paths."""
+    opts = options or AnnotationOptions()
+    annotation_items = [AnnotationItem(Path(p), None) for p in items]
+    root = tk.Tk()
     app = AnnotationApp(
         root,
-        items,
+        annotation_items,
         Path(train_dir),
-        options=options,
+        options=opts,
         log_path=log_path,
-        on_sample_saved=callback,
+        on_sample_saved=None,
         transcripts_dir=transcripts_dir,
     )
-
-    logging.info(
-        "Annotation window ready for %d image(s). Interact with the GUI to continue (e.g. Save/Skip).",
-        len(items),
-    )
+    if auto_train_config is not None:
+        setattr(app, "auto_train_config", auto_train_config)
+        app._on_sample_saved = AnnotationTrainer(root, Path(train_dir), auto_train_config)
     root.mainloop()
+
+
+__all__ = [
+    "AnnotationAutoTrainConfig",
+    "AnnotationOptions",
+    "annotate_images",
+    "AnnotationItem",
+    "AnnotationApp",
+    "AnnotationTrainer",
+    "_prepare_image",
+    "_load_annotation_items",
+]

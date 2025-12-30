@@ -9,6 +9,7 @@ import subprocess
 import sys
 import types
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import pytest
 
@@ -360,6 +361,156 @@ def test_segment_pages_with_kraken_exports_crops(monkeypatch, tmp_path):
 
     pagexml_file = xml_dir / "page.xml"
     assert captured_pagexml[-1] == pagexml_file
+
+
+def test_segment_pages_with_kraken_writes_fallback_pagexml(monkeypatch, tmp_path):
+    page = tmp_path / "page.png"
+    Image.new("L", (60, 40), color=180).save(page)
+
+    def fake_segment_via_cli(
+        image_path,
+        *,
+        model=None,
+        global_cli_args=None,
+        segment_cli_args=None,
+    ):
+        return {
+            "lines": [
+                {
+                    "id": "k1",
+                    "boundary": [[5, 5], [55, 5], [55, 18], [5, 18]],
+                    "baseline": [[6, 18], [54, 19]],
+                }
+            ]
+        }
+
+    def raise_serialize(segmentation):  # pragma: no cover - test stub
+        raise RuntimeError("serialize exploded")
+
+    monkeypatch.setattr(kraken_adapter, "_segment_via_cli", fake_segment_via_cli)
+    monkeypatch.setattr(kraken_adapter, "_serialize_with_kraken", raise_serialize)
+    monkeypatch.setattr(kraken_adapter, "_require_kraken", lambda: None)
+
+    out_dir = tmp_path / "lines"
+    xml_dir = tmp_path / "pagexml"
+    stats = kraken_adapter.segment_pages_with_kraken(
+        [page],
+        out_dir,
+        pagexml_dir=xml_dir,
+        padding=4,
+        min_width=5,
+        min_height=5,
+    )
+
+    assert stats.lines == 1
+    xml_file = xml_dir / "page.xml"
+    assert xml_file.exists()
+
+    tree = ET.parse(xml_file)
+    ns = {"pg": "http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15"}
+    lines = tree.findall(".//pg:TextLine", ns)
+    assert len(lines) == 1
+    assert lines[0].attrib["id"] == "k1"
+    coords = lines[0].find("pg:Coords", ns)
+    assert coords is not None and "5,5" in coords.attrib["points"]
+    baseline = lines[0].find("pg:Baseline", ns)
+    assert baseline is not None and baseline.attrib["points"]
+
+
+def test_serialize_with_kraken_converts_cli_payload(monkeypatch):
+    import kraken.serialization as serialization_mod
+    from kraken.containers import Segmentation
+
+    captured: list[Segmentation] = []
+
+    def fake_serialize(*args, **kwargs):
+        container = kwargs.get("segmentation") or args[0]
+        assert isinstance(container, Segmentation)
+        captured.append(container)
+        return "<PcGts/>"
+
+    monkeypatch.setattr(serialization_mod, "serialize", fake_serialize)
+
+    payload = {
+        "lines": [
+            {
+                "id": "l1",
+                "bbox": [0, 0, 42, 12],
+            }
+        ],
+    }
+
+    result = kraken_adapter._serialize_with_kraken(payload)
+
+    assert result == b"<PcGts/>"
+    assert captured and captured[0].type == "bbox"
+    assert captured[0].imagename == "page"
+    assert len(captured[0].lines or []) == 1
+
+
+def test_serialize_with_kraken_handles_newer_signature(monkeypatch):
+    import kraken.serialization as serialization_mod
+
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_serialize(*args, **kwargs):
+        calls.append((args, kwargs))
+        if "segmentation" in kwargs:
+            raise TypeError("serialize() got an unexpected keyword argument 'segmentation'")
+        return "<PcGts/>"
+
+    monkeypatch.setattr(serialization_mod, "serialize", fake_serialize)
+
+    payload = {
+        "type": "bbox",
+        "imagename": "sample.png",
+        "text_direction": "horizontal-lr",
+        "script_detection": False,
+        "lines": [
+            {
+                "id": "l1",
+                "bbox": [0, 0, 10, 10],
+            }
+        ],
+    }
+
+    result = kraken_adapter._serialize_with_kraken(payload)
+
+    assert result == b"<PcGts/>"
+    assert len(calls) == 2
+    assert "segmentation" in calls[0][1]
+    assert "segmentation" not in calls[1][1]
+
+
+def test_serialize_with_kraken_falls_back_to_pagexml_template(monkeypatch):
+    import kraken.serialization as serialization_mod
+    from jinja2 import TemplateNotFound
+
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_serialize(*args, **kwargs):
+        calls.append((args, kwargs))
+        if kwargs.get("template") == "page":
+            raise TemplateNotFound("page")
+        return "<PcGts/>"
+
+    monkeypatch.setattr(serialization_mod, "serialize", fake_serialize)
+
+    payload = {
+        "lines": [
+            {
+                "id": "l1",
+                "bbox": [0, 0, 10, 10],
+            }
+        ],
+    }
+
+    result = kraken_adapter._serialize_with_kraken(payload)
+
+    assert result == b"<PcGts/>"
+    assert len(calls) == 2
+    assert calls[0][1]["template"] == "page"
+    assert calls[1][1]["template"] == "pagexml"
 
 
 def test_segment_via_cli_uses_correct_command(monkeypatch, tmp_path):

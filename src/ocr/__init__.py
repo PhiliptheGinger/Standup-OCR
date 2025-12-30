@@ -91,6 +91,9 @@ def ocr_detailed(
     model_path: Optional[PathLike] = None,
     tessdata_dir: Optional[PathLike] = None,
     psm: int = 6,
+    force_landscape: bool = False,
+    adaptive: bool = True,
+    resize_width: int = 1800,
 ) -> pd.DataFrame:
     """Run OCR on ``image_path`` and return detailed token metadata.
 
@@ -120,7 +123,12 @@ def ocr_detailed(
     image_path = Path(image_path)
     logging.info("Running OCR on %s", image_path)
 
-    processed = preprocess_image(image_path)
+    processed = preprocess_image(
+        image_path,
+        resize_width=resize_width,
+        adaptive=adaptive,
+        force_landscape=force_landscape,
+    )
     pil_image = _array_to_pil(processed)
 
     config_parts = [f"--psm {psm}"]
